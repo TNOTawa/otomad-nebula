@@ -20,7 +20,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from . import EMBEDDING_KINDS
 from .errors import DatabaseError
-from .util import now_utc_iso, normalize_relpath
+from .util import normalize_relpath, now_utc_iso
 
 SCHEMA_VERSION = "1"
 
@@ -505,6 +505,32 @@ class Catalog:
         if stage not in ("downloading", "encoding"):
             raise DatabaseError(f"未知处理阶段: {stage}")
         return self.set_status(work_id, stage)
+
+    def reopen(self, work_id: int, *, reason: str | None = None) -> str:
+        """把已结束/中断的作品重置为 pending。
+
+        用途：1) 模型或采样参数变化后需要为老作品生成新版本向量；
+        2) 失败作品重试；3) 上次进程中断留下 downloading/encoding 残留。
+        正常的状态迁移仍由 set_status 严格校验；此方法单独记录 reopen 事件。
+        """
+
+        now = now_utc_iso()
+        with self.transaction() as conn:
+            row = conn.execute("SELECT status FROM works WHERE id = ?", (work_id,)).fetchone()
+            if row is None:
+                raise DatabaseError(f"作品不存在: {work_id}")
+            old = str(row["status"])
+            if old == "pending":
+                return old
+            if old not in ("completed", "failed", "downloading", "encoding"):
+                raise DatabaseError(f"不能 reopen 状态为 {old} 的作品 (work {work_id})")
+            conn.execute(
+                "UPDATE works SET status = 'pending', error = NULL, updated_at = ? WHERE id = ?",
+                (now, work_id),
+            )
+            detail = f"{old}->pending" + (f" | {reason}" if reason else "")
+            self._event(conn, work_id, "reopen", detail)
+            return old
 
     def fail(self, work_id: int, message: str) -> str:
         text = (message or "未知错误").strip()

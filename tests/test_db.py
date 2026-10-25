@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 
 from nebula.db import (
-    Catalog,
     TRANSITIONS,
+    Catalog,
     work_key_for_bilibili,
     work_key_for_local,
 )

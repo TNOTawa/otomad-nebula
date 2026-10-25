@@ -40,7 +40,7 @@ def test_clips_stay_inside_video_and_are_sorted():
     for duration in [1.0, 2.5, 8.5, 9.0, 15.99, 16.1, 30.0, 45.7, 90.0, 300.0]:
         plans = plan_clips(duration)
         assert plans, duration
-        assert all(0.0 <= p.start_s for p in plans)
+        assert all(p.start_s >= 0.0 for p in plans)
         assert all(p.start_s + p.duration_s <= duration + 1e-6 for p in plans)
         assert all(p.duration_s > 0 for p in plans)
         assert [p.start_s for p in plans] == sorted(p.start_s for p in plans)

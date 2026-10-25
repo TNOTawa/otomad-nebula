@@ -1,0 +1,21 @@
+# 音MAD星云计划 · 选票 CSV 示例文件
+# 全部数据均为虚构，仅用于演示格式，不是真实榜单。
+#
+# 必填列：bvid（也可写作 BV号 / BV）
+# 可选列：
+#   part       分P，正整数，默认 1（也可写作 分P）
+#   rank       排名，非负整数（也可写作 排名）
+#   votes      得票数，非负整数（也可写作 得票数 / 票数）
+#   author_uid 作者 UID，字符串（也可写作 UID / UP主UID）
+#   note       备注（也可写作 备注）
+#
+# 以 # 开头的行是注释，导入时会被忽略；同 (bvid, part) 的重复行以后者为准。
+#
+# 导入命令示例：
+#   python ingest.py import-votes input/lists/votes_2025.example.csv --year 2025
+bvid,part,rank,votes,author_uid,note
+BV1demo00001,1,1,1234,10001,示例数据-第一名
+BV1demo00002,1,2,987,10002,示例数据-第二名
+BV1demo00003,1,3,654,10003,示例数据-第三名
+BV1demo00004,2,4,321,10004,示例数据-分P示例
+BV1demo00005,1,5,100,10005,示例数据-第五名
