@@ -43,6 +43,13 @@
   区分“整体平均向量相近”与“局部片段相近”；
 - **音画错位实验（A6，v0.2.x）**：离线证据工具，对比原始 / 轻画质退化 / 音频偏移 / 换音频后的
   `Δ=1-cos`；只写日志，不改主向量与星云。
+- **全片时序表征（v0.4）**：序列层覆盖整条时间轴（无片段数上限，末尾锚定、权重归一），
+  事件层扫描音频 100Hz/视频 30fps 高频结构；表征层用 Full Mean / Temporal Stats 聚合，
+  聚合器变化不重新编码 PE-AV；
+- **三种表征空间切换（v0.4）**：Legacy（旧 5 片段平均）/ Full Mean（全片平均）/
+  Temporal Stats（时间结构），各自独立地图，坐标不可跨空间比较；
+- **邻域迁移分析（v0.4）**：`tools/compare_spaces.py` 比较两个表征空间的 Top-k 重合率、
+  稳定对、被替换作品、余弦矩阵相关与 hubness 变化，输出 JSON/CSV。
 
 ## 环境要求
 
@@ -139,11 +146,14 @@ otomad-nebula/
 ├── logs/                      # 运行日志
 ├── nebula/                    # 核心库：config/db/sampling/media/embed/pipeline/
 │                              #   similarity(近邻/解释/片段) identity(身份关联) stability(稳定性)
-│                              #   avsync(错位实验) mapplot/appdata
+│                              #   avsync(错位实验) events(事件扫描) temporal(表征聚合)
+│                              #   representations(表征注册/加载) mapplot/appdata
 ├── tools/                     # 证据/报告工具：clip_stability.py、desync_experiment.py、
-│                              #   preflight_works.py、bench_ffmpeg/preprocess/peav、verify_peav
+│                              #   preflight_works.py、build_representation.py、compare_spaces.py、
+│                              #   events_probe.py、bench_ffmpeg/preprocess/peav、verify_peav
 ├── tests/                     # pytest 测试（含 tests/fixtures 合成视频工厂）
-├── docs/                      # 契约（CONTRACTS/CONTRACTS_V2）、ADR、质量规范
+├── docs/                      # 契约（CONTRACTS/CONTRACTS_V2）、ADR、质量规范、
+│                              #   执行方案、reports（全片表征分析等）
 ├── ingest.py                  # 导入本地视频 / 选票 / 周报 / link-local 身份关联
 ├── pipeline.py                # 下载 → 切片 → 推理 → 保存 → 清理（含分阶段耗时）
 ├── map.py                     # 生成/更新 2D/3D 星云（build / list / transform / variants）
@@ -162,7 +172,10 @@ otomad-nebula/
 | `project` | `name` | 项目名，仅用于展示 |
 | `paths` | `input_local` / `input_lists` / `data` / `temp` / `logs` | 数据目录布局 |
 | `database` | `filename` | SQLite 文件名（位于 data 目录内，不能带子目录） |
-| `media` | `clip_seconds` / `clips_per_work` / `min_duration_seconds` / `audio_sample_rate` 等 | 采样与切片参数；改动会改变向量版本 |
+| `media` | `clip_seconds` / `clips_per_work` / `min_duration_seconds` / `audio_sample_rate` / `clip_height` / `long_video_seconds` | 采样与切片参数；改动会改变向量版本；`clip_height: 336` 生成 `_h336` 实验版本 |
+| `sampling` | `mode` / `overlap_seconds` | v0.4：`legacy`（旧 5 片段）或 `full_coverage`（全片覆盖）；overlap 必须小于片段长度 |
+| `events` | `enabled` / `audio_rate_hz` / `video_fps` / `version` | v0.4.1 高频事件扫描参数（音频 100Hz、视频 30fps） |
+| `temporal` | `stages` | v0.4.2 Temporal Stats 的相对时间阶段数（默认 4） |
 | `model` | `checkpoint` / `revision` / `version` / `frames` / `device` / `local_files_only` 等 | PE-AV 模型；`revision` 固定版本便于复现 |
 | `umap` | `metric` / `n_neighbors` / `min_dist` / `random_state` / `n_jobs` / `dimensions` | 降维参数；固定 `random_state`、`n_jobs: 1` 保证可复现 |
 | `download` | `yt_dlp_format` / `max_height` / `cookies_file` / `proxy` / `retries` | Bilibili 下载；登录可见视频需 cookies |
@@ -172,10 +185,15 @@ otomad-nebula/
 
 两个自动派生的版本号**不要手工修改**：
 
-- `embedding_version`：由模型版本 + 帧数 + 片段长度/数量 + 音频采样率组成，
-  例如 `peav-small-16f__f16_clip8s_x5_48k`。模型或采样参数变化会自动得到新版本，
-  旧向量文件保留、不覆盖。
-- `map_version`：例如 `map_v001`，每次生成/更新星云自动递增。
+- `embedding_version`（当前激活的**序列版本**）：
+  - legacy（默认）：由模型版本 + 帧数 + 片段长度/数量 + 音频采样率组成，
+    例如 `peav-small-16f__f16_clip8s_x5_48k`；
+  - full_coverage：例如 `peav-small-16f__f16_full8s_ov0_48k`（`_h336` 表示 336p 实验）。
+  模型或采样参数变化会自动得到新版本，旧向量文件保留、不覆盖；
+- `representation`：`legacy_5clip_mean` / `full_mean_v1` / `temporal_stats_v1`；
+  聚合器变化只新增表征（`data/representations/...`），**不会重新编码 PE-AV**；
+- `map_version`：例如 `map_v001`，每次生成/更新星云自动递增；地图绑定表征，
+  不同表征/不同序列的地图坐标不可直接比较。
 
 ## 使用流程
 
@@ -448,6 +466,69 @@ python map.py list
 > 实时数据状态以 `pipeline.py status` 输出为准；本仓库不提交实时运行数据，
 > 地图版本由 `map.py list` 查看。
 
+### v0.4：全片时序表征与多空间观察
+
+v0.4 把“均匀抽 ≤5×8s 片段再平均”升级为**覆盖整条时间轴**的分层表示，
+同时保留旧数据与旧空间（不迁移、不覆盖）：
+
+- **序列层**：`data/embeddings/<sequence_version>/<work_id>/` 保存 PE-AV 片段序列、
+  `clip_times.npy`（窗口起止/有效时长/权重）、事件文件与 manifest；全片模式没有片段数上限，
+  最后一个窗口结束于视频结尾，任意时间点至少被一个窗口覆盖；
+- **表征层**：`data/representations/<name>/<sequence_version>/<work_id>/` 保存聚合结果
+  （`full_mean_v1` / `temporal_stats_v1`）；改变聚合器只新增表征，绝不重新编码 PE-AV；
+- **三种空间**：Legacy（旧 5 片段平均）、Full Mean（全片平均）、Temporal Stats（时间结构）；
+  各自使用独立地图，坐标不可跨空间比较。
+
+1. 切换采样模式并编码全片序列（先小批量试跑）：
+
+   ```powershell
+   # 覆盖 config.sampling.mode，只处理本地视频前 3 部
+   python pipeline.py process-local --sampling full_coverage --limit 3
+
+   # 336p 对照实验会生成带 _h336 的新序列版本（不覆盖旧版本）
+   python pipeline.py process-local --sampling full_coverage --clip-height 336 --limit 3
+
+   # 超长视频（默认超过 media.long_video_seconds 时拒绝）需显式允许
+   python pipeline.py run-pending --sampling full_coverage --allow-long
+   ```
+
+   - 全片编码按批写入 `.partial/batch_*.npz`；中断后重跑同一命令只补缺失批次；
+   - 事件扫描（v0.4.1）由 `events.enabled` 控制，失败会记失败原因而不是静默写零向量。
+
+2. 从已保存序列构建表征（不下载、不解码、不跑 PE-AV）：
+
+   ```powershell
+   python tools/build_representation.py full_mean --sequence auto
+   python tools/build_representation.py temporal_stats --stages 4 --sequence auto
+   python tools/build_representation.py list
+   ```
+
+3. 按表征生成独立星云（不覆盖旧地图）：
+
+   ```powershell
+   python map.py build --representation full_mean_v1
+   python map.py build --representation temporal_stats_v1
+   python map.py list
+   ```
+
+4. 界面侧栏切换“表征空间”（Legacy / Full Mean / Temporal Stats），选中该空间最新 ready 且无筛选的地图；
+   详情面板增加“完整时间轴/片段窗口”信息（事件曲线与窗口边界，数据缺失时显示提示）。
+
+5. 邻域迁移分析（回答“换空间后哪些作品/作品对变了”）：
+
+   ```powershell
+   python tools/compare_spaces.py --a legacy_5clip_mean --b full_mean_v1 --k 5
+   python tools/compare_spaces.py --a full_mean_v1 --b temporal_stats_v1 --k 5
+   ```
+
+   输出 `logs/space_compare_*.json/.csv`：每作品 Top-k Jaccard、完全稳定作品比例、
+   稳定对比例、被替换案例（新旧邻居）、作品对余弦 Pearson/Spearman、hubness 前后变化。
+   分析报告见 `docs/reports/full-coverage-analysis.md`。
+
+**兼容与边界**：旧 `embedding_version` 目录与旧地图只读保留；legacy 与 full 序列版本号不同，
+地图/近邻/密度都按各自空间计算；全片模式的片段更多，片段级对应面板仍可用；
+PE-AV 仍是 16 帧稀疏采样，事件层补充节奏/运动信息，但**不宣称逐帧语义理解**。
+
 ### 界面使用
 
 - 侧栏：星云版本、2D/3D 切换、染色维度（含“高维近邻密度”）、按文件名/标题/BV 搜索、
@@ -466,8 +547,9 @@ python map.py list
 **永久保存（不要随手删）**：
 
 - `data/catalog.sqlite`：作品、榜单、向量登记、处理状态、星云版本；
-- `data/embeddings/<向量版本>/`：作品级与片段级向量（核心资产，重新生成成本高）；
-- `data/maps/<map_vNNN>/`：UMAP 坐标、模型与参数（可从向量重建，但版本记录珍贵）。
+- `data/embeddings/<sequence_version>/`：序列层片段/事件/时间轴（核心资产，重新编码成本高）；
+- `data/representations/<name>/<sequence_version>/`：派生表征向量（可从序列重建）；
+- `data/maps/<map_vNNN>/`：UMAP 坐标、模型与参数（可从表征重建，但版本记录珍贵）。
 
 **可安全清理**：
 
@@ -525,8 +607,21 @@ python map.py list
   近邻解释字段仅展示、片段级数据层纯净等不变量；
 - `tests/test_e2e.py` 的 v0.2.x 独立验收：全库分位/双向/hubness 与手算矩阵逐项对照、
   片段热图/最高配对 schema、AppTest 枢纽表与片段热图；
+- v0.4 测试覆盖：`tests/test_sampling.py`（plan_full_coverage 覆盖/权重/边界）、
+  `tests/test_pipeline.py`（全片片段数/中断恢复/超长视频）、`tests/test_events.py`
+  （事件扫描确定性/合成闪帧/音脉冲）、`tests/test_temporal.py`（Full Mean/Temporal Stats 数学性质、
+  顺序敏感性）、`tests/test_representations.py`（注册/解析/隔离/legacy 一致性）、
+  `tests/test_core_v04.py`（schema v3 迁移/回填/地图绑定）；
+- v0.4 全链路 E2E（`tests/test_e2e.py -k v04`）：4 部合成视频 → HashTestEmbedder 全片编码 →
+  注入中断 → 只补缺失批 → `tools/build_representation.py full_mean` →
+  `map.py build --representation full_mean_v1` → `appdata.load_nebula_frame` →
+  `tools/compare_spaces.py legacy×full_mean`，并核对覆盖率/版本隔离/地图代表征/输出结构；
+- `tests/test_invariants.py` 的 v0.4 不变量：模式切换与 legacy 公式、full 版本格式、
+  不同表征/序列不混矩阵、地图绑定同序列代表征、旧地图坐标不被覆盖、重复 initialize/登记幂等；
 - QA 的 CLI 冒烟额外覆盖 `map.py variants`、`ingest.py link-local`、
-  `tools/clip_stability.py`、`tools/desync_experiment.py`、`tools/preflight_works.py`。
+  `tools/clip_stability.py`、`tools/desync_experiment.py`、`tools/preflight_works.py`；
+  v0.4 新 CLI（`build_representation.py` / `compare_spaces.py` / `events_probe.py`）
+  由各自测试的 `--help` 与端到端用例覆盖。
 
 ## 常见问题
 
@@ -562,6 +657,16 @@ python map.py list
 UMAP 是非线性降维，训练集变化会让整个布局重新排布：筛选星云与全量星云、不同筛选星云、
 不同 `n_neighbors` 变体之间的坐标都不可直接比较。请只在“同一 map 版本内”比较位置；
 需要对比不同数据子集时，分别生成版本，在侧栏切换查看。
+
+**Legacy 和 Full Mean 的星云坐标能直接比较吗？**
+不能。两种空间来自不同序列版本与不同聚合器，地图分别训练；坐标绝对位置不可比，
+但可用于各自空间内的近邻/密度观察。跨空间比较请用 `tools/compare_spaces.py`
+的 Top-k 重合率、稳定对比例与余弦矩阵相关等指标，而不是直接看坐标。
+
+**切换到 full_coverage 会重新下载视频吗？**
+会。全片模式需要从视频开头到结尾的完整时间轴，Bilibili 作品必须重新下载（低分辨率格式）
+再编码；这是预期的，旧 5 片段向量与旧地图仍保留、不覆盖。只有从已保存序列构建
+Full Mean / Temporal Stats 表征时不需要重新下载或编码。
 
 **做了身份关联后，旧的星云会变吗？**
 不会。星云是构建时的快照：关联之前生成的旧版本（如 P0 的 `map_v001`）保留当时的作品集合，

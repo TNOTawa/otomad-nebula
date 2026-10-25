@@ -1,9 +1,11 @@
-# 迭代 v0.2/v0.3 契约（内部约定）
+# 迭代 v0.2–v0.4 契约（内部约定）
 
 > 在 v0.1 的 docs/CONTRACTS.md 基础上新增。共享文件仍归 Lead；本文件是新增模块的接口依据。
 >
 > **阅读提示**：本文件最初写于 v0.2 实现之前，正文中“将新增 / 追加 / 待实现”等未来时措辞
 > 属于历史设计记录；当前真实行为以下方“实现状态”表与实际代码为准。
+> v0.4 全片时序表征（config/db v3/representations/sampling/events/temporal/map/compare_spaces）
+> 的接口与状态见文末 §10。
 
 ## 实现状态（v0.2.x）
 
@@ -251,3 +253,104 @@ def write_report(report: dict, *, json_path, csv_path) -> None
 .\\.venv\\Scripts\\python.exe -m pytest tests -q
 .\\.venv\\Scripts\\ruff.exe check nebula tests
 ~~~
+
+## 10. v0.4 全片时序表征（新增，2026-10-25）
+
+设计契约全文见 `docs/plans/v0.4-full-coverage-design.md`；本节只列接口与验收状态。
+核心原则：**序列层（PE-AV 片段/事件）只编码一次；聚合器变化只新增 representation，绝不重新编码；
+不同 sequence/representation 的向量禁止混入同一矩阵；旧数据/旧地图不覆盖。**
+
+### 10.1 状态（2026-10-25，实现完成；真实数据阶段2 回填）
+
+| 项 | 状态 | 实现位置 | 证据 |
+| --- | --- | --- | --- |
+| config sampling/events/temporal 段与版本属性 | ✅ 基础层已提交 `55b01f7` | `nebula/config.py`、`config.yaml` | `tests/test_core_v04.py` 10 项、`tests/test_invariants.py` 版本不变量 |
+| DB schema v3（representations/representation_vectors/sequence_states、clips 5 元组、map_runs.representation_id、work_timings.events_s） | ✅ 基础层已提交 `55b01f7` | `nebula/db.py`（v2→v3 自动迁移 + legacy 表征回填） | `tests/test_core_v04.py` 迁移/登记/序列状态/地图绑定；invariants schema 不变量 |
+| 表征注册/加载骨架 | ✅ 基础层已提交 `55b01f7`（t5 扩展构建 CLI） | `nebula/representations.py`：resolve/list/save/load matrix；legacy 走 embeddings，派生走 representation_vectors | `tests/test_representations.py` 18 项；invariants 隔离测试；compare_spaces 合成验收 |
+| 全片采样 `plan_full_coverage` | ✅ t1 完成 | `nebula/sampling.py` | `tests/test_sampling.py` 58 项（覆盖/末尾锚定/权重/边界/确定性） |
+| 全片编码流水线与片段级恢复 | ✅ t1 完成 | `nebula/pipeline.py`、`nebula/media.py`、`nebula/embed.py`、`pipeline.py` | `tests/test_pipeline.py` 26 项（4s/12s/17s/40s/180s、超长视频、批文件恢复、legacy 回归）；E2E 注入中断→只补缺失批 |
+| 高频事件扫描 | ✅ t3 完成 | `nebula/events.py`、`tools/events_probe.py` | `tests/test_events.py` 20 项（合成闪帧/音脉冲/确定性/无音轨/无视频流） |
+| Full Mean / Temporal Stats 聚合 | ✅ t5 完成 | `nebula/temporal.py` | `tests/test_temporal.py` 17 项（与旧聚合公式等价、顺序敏感性、维度/分组约束） |
+| 构建 CLI | ✅ t5 完成 | `tools/build_representation.py` | CLI --help（qa.py 冒烟）+ 构建/增量/--force/事件变体；E2E 从已保存序列构建 full_mean |
+| 地图/空间切换/时间轴/近邻集成 | ✅ t2 完成 | `map.py` `--representation`/`--sequence-version`、`nebula/mapplot.py`、`app.py`（表征空间 + 完整时间轴）、`nebula/similarity.py`、`nebula/appdata.py` | t2 测试（mapplot/app/appdata/similarity）+ E2E 地图代表征绑定/AppTest |
+| 邻域迁移对比工具 | ✅ t4 完成 | `tools/compare_spaces.py` | 合成数据手算 Jaccard/hubness/Pearson + CLI；E2E 全链路 |
+| 独立验收 E2E / 不变量 | ✅ t4 完成（真实数据待阶段2） | `tests/test_e2e.py`、`tests/test_invariants.py` | invariants 55 项；E2E 27 项（v0.4 全链路 3 项） |
+| 文档与报告 | ✅ t4 完成骨架（真实数字待阶段2） | `ARCHITECTURE.md`、`README.md`、`AGENTS.md`、`docs/reports/full-coverage-analysis.md` | 本文件 §10 + 报告骨架（阶段2 回填真实数据/地图/迁移数字） |
+
+**当前门禁（v0.4 实现完成、真实数据未跑）**：仓库内 `python qa.py` = PASS 5/5
+（ruff 全绿；pytest 671 passed + 6 model/network deselected，246s；docs 10 篇 ADR 章节完整；
+CLI 11 个入口 --help；config 含 v0.4 段校验）。
+
+
+### 10.2 版本命名与配置
+
+| 概念 | 规则 |
+| --- | --- |
+| Sequence Version（legacy） | `Config.legacy_embedding_version`：`<slug(model.version)>__f<frames>_clip<clip_seconds>s_x<clips_per_work>_<khz>k[_h<height>]` |
+| Sequence Version（full） | `Config.full_sequence_version`：`<slug>__f<frames>_full<clip_seconds>s_ov<overlap>_<khz>k[_h<height>]` |
+| 当前激活 | `Config.embedding_version`：`sampling.mode` = `legacy` → legacy；`full_coverage` → full |
+| Representation | `legacy_5clip_mean` / `full_mean_v1` / `temporal_stats_v1` / `transformer_v1`（v0.5 预留） |
+| 地图 | `map_vNNN`，每次拟合新版本；`map_runs.representation_id` 绑定表征，`embedding_version` 记录其 sequence version |
+
+`config.yaml` 新增段：
+
+~~~yaml
+sampling:
+  mode: legacy            # legacy | full_coverage
+  overlap_seconds: 0.0
+events:
+  enabled: true
+  audio_rate_hz: 100
+  video_fps: 30
+  version: events_v1
+temporal:
+  stages: 4
+media:
+  clip_height: null       # 336 = 336p 实验；非空时版本号追加 _h336
+  long_video_seconds: 3600
+~~~
+
+### 10.3 数据布局与 DB 表（v3）
+
+```text
+data/embeddings/<sequence_version>/<work_id>/
+  clip_{joint,audio,video}.npy   # (T, dim) 有序片段
+  clip_times.npy                 # (T,4) start_s, duration_s, valid_duration_s, weight
+  work_{joint,audio,video}.npy   # 全片均值（兼容基线）
+  event_scan.npz / event_features.npy / event_manifest.json  # 事件层
+  manifest.json / .partial/      # 参数清单与编码中分批状态
+data/representations/<name>/<sequence_version>/<work_id>/{joint,audio,video}.npy
+~~~
+
+- `representations(id,name,sequence_version,kind,dim,path_prefix,params_json,status,note,...)`，UNIQUE(name,sequence_version)；
+- `representation_vectors(representation_id,work_id,kind,path,dim)`，kind ∈ joint/audio/video；
+- `sequence_states(work_id,version,duration_s,n_clips,n_clips_done,partial_relpath,status)`，status ∈ in_progress/assembled/failed；
+- `clips` 新增 `valid_duration_s / weight`（旧 3 元组写入时记 NULL）；`map_runs` 新增 `representation_id`；`work_timings` 新增 `events_s`。
+
+### 10.4 工具：tools/compare_spaces.py（T4）
+
+~~~powershell
+python tools/compare_spaces.py                              # 默认 legacy × full_mean（需已构建 full_mean_v1）
+python tools/compare_spaces.py --a legacy_5clip_mean --b full_mean_v1
+python tools/compare_spaces.py --a full_mean_v1 --b temporal_stats_v1 --k 5 --top-n 10
+python tools/compare_spaces.py --a legacy_5clip_mean --a-seq <sequence_version> --b-id 7
+~~~
+
+- 每作品 Top-k 邻居 Jaccard/重合数、完全稳定作品比例；
+- 稳定对比例（无序对有向/无序边一致率）、有向边保留率与交并比、互为邻居对交并比；
+- 被替换案例（标题/来源/新旧邻居 lost/gained）；
+- 共同作品上的作品对余弦矩阵 Pearson/Spearman、平均绝对差、Top1 一致率；
+- hubness 前后入度、Top hub、变化最大作品、秩相关；
+- 只读向量、不写 DB、不加载模型/UMAP；输出 `logs/space_compare_<a>_vs_<b>__<seqs>.json/.csv`；
+- 合成数据验收：手算 Jaccard/hubness/Pearson 一致、CLI --help 可跑、默认 space 解析正确。
+
+### 10.5 验收要求（阶段2）
+
+- `python qa.py --full` 通过（ruff + pytest + docs + CLI + config + model/network 标记测试）；
+- 全链路离线 E2E：12s/40s 合成视频 → HashTestEmbedder 全片编码 → 中断恢复 →
+  `tools/build_representation.py full_mean` → `map.py build --representation full_mean_v1` →
+  `appdata.load_nebula_frame` → `tools/compare_spaces.py legacy×full_mean`；
+- 不变量：模式切换/版本格式/legacy 公式、表征与序列隔离、地图绑定代表征且序列一致、
+  schema v3 迁移幂等、旧地图坐标不被覆盖、异空间矩阵不混用；
+- 真实数据：覆盖率、n_clips、恢复、336p 对照、全量地图（full_mean/temporal_stats）、
+  legacy×full_mean 邻域迁移数字回填到 `docs/reports/full-coverage-analysis.md`。

@@ -25,7 +25,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from .config import Config
-from .db import Catalog, LEGACY_REPRESENTATION_NAME
+from .db import LEGACY_REPRESENTATION_NAME, Catalog
 from .embed import load_vector, save_vector
 from .errors import NebulaError
 
@@ -192,26 +192,34 @@ def resolve_representation(
 
 
 def list_available(catalog: Catalog, config: Config) -> list[dict[str, Any]]:
-    """列出可用于界面切换的表征（ready 状态，按创建时间）。"""
+    """列出可用于界面切换的表征（每个名字取最新一条 ready，附 ready 地图数）。"""
 
-    rows = catalog.list_representations(status="ready")
     legacy_version = config.legacy_embedding_version
     if catalog.get_embedding_version(legacy_version) is not None:
         try:
             catalog.ensure_legacy_representation(legacy_version)
         except Exception:  # noqa: BLE001 - 仅用于界面提示，不阻断
             logger.debug("补登 legacy 表征失败", exc_info=True)
+
     rows = catalog.list_representations(status="ready")
-    labels = {row["name"] for row in rows}
-    if LEGACY_NAME not in labels and catalog.get_embedding_version(legacy_version) is not None:
-        try:
-            catalog.ensure_legacy_representation(legacy_version)
-            rows = catalog.list_representations(status="ready")
-        except Exception:  # noqa: BLE001
-            logger.debug("补登 legacy 表征失败", exc_info=True)
+    latest_by_name: dict[str, dict[str, Any]] = {}
+    for row in reversed(rows):
+        latest_by_name.setdefault(str(row["name"]), row)
+
+    result: list[dict[str, Any]] = []
     for row in rows:
-        row["label"] = representation_label(str(row["name"]))
-    return rows
+        name = str(row["name"])
+        if latest_by_name.get(name) is not row:
+            continue
+        enriched = dict(row)
+        enriched["label"] = representation_label(name)
+        try:
+            maps = catalog.list_maps(representation_id=int(row["id"]))
+        except Exception:  # noqa: BLE001 - 地图查询失败不影响界面
+            maps = []
+        enriched["maps"] = sum(1 for entry in maps if entry.get("status") == "ready")
+        result.append(enriched)
+    return result
 
 
 # --------------------------------------------------------------------------- 路径
@@ -271,9 +279,17 @@ def save_representation_vectors(
 
 
 # --------------------------------------------------------------------------- 加载
+def _row_work_id(row: Mapping[str, Any]) -> int:
+    """兼容两种查询结果：embeddings 联合查询用 works.id，纯向量查询用 work_id。"""
+
+    if "work_id" in row:
+        return int(row["work_id"])
+    return int(row["id"])
+
+
 def _canonical_rows(catalog: Catalog, rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     duplicates = catalog.get_duplicate_work_ids()
-    return [row for row in rows if int(row["work_id"]) not in duplicates]
+    return [row for row in rows if _row_work_id(row) not in duplicates]
 
 
 def load_representation_matrix(
@@ -383,11 +399,10 @@ def load_clip_sequence(
     event_features: np.ndarray | None = None
     event_version: str | None = None
     feature_path = sequence_dir / "event_features.npy"
-    if feature_path.is_file():
-        if joint is not None and feature_path.stat().st_size > 0:
-            array = np.load(feature_path, allow_pickle=False)
-            event_features = np.asarray(array, dtype=np.float32)
-            if joint is not None and event_features.ndim == 2 and event_features.shape[0] != joint.shape[0]:
+    if feature_path.is_file() and joint is not None and feature_path.stat().st_size > 0:
+        array = np.load(feature_path, allow_pickle=False)
+        event_features = np.asarray(array, dtype=np.float32)
+        if event_features.ndim == 2 and event_features.shape[0] != joint.shape[0]:
                 logger.warning(
                     "work_id=%s 事件特征行数 %s 与片段数 %s 不一致，忽略事件特征",
                     work_id,

@@ -4,13 +4,16 @@
 
 1. ruff 静态检查：nebula/、tests/、项目根目录与 tools/ 下的 Python 脚本；
 2. pytest：tests/ 全量测试，默认排除 model / network 标记；
-3. 文档检查：README.md、ARCHITECTURE.md 存在且包含 v0.2 关键内容；docs/adr/ 至少 9 篇
-   （含 0005 身份关联 / 0006 筛选地图 / 0007 高维近邻密度 / 0008 音画错位实验 /
-   0009 近邻解释）并包含 Decision / Why / Options / Chosen / Consequences / How verified 章节；
-4. CLI 入口冒烟：ingest.py、pipeline.py、map.py 及其 v0.2 子命令（map.py variants、
+3. 文档检查：README.md、ARCHITECTURE.md 存在且包含 v0.2.x / v0.4 关键内容；docs/adr/
+   至少 10 篇（含 0005 身份关联 / 0006 筛选地图 / 0007 高维近邻密度 / 0008 音画错位实验 /
+   0009 近邻解释 / 0010 全片序列与表征）并包含
+   Decision / Why / Options / Chosen / Consequences / How verified 章节；
+4. CLI 入口冒烟：ingest.py、pipeline.py、map.py 及其子命令（map.py variants、
    ingest.py link-local）、tools/clip_stability.py、tools/desync_experiment.py、
-   tools/preflight_works.py 的 --help 均能成功运行；
-5. 配置有效性：config.yaml 可加载；可据此生成并加载一份临时隔离配置；ffmpeg/ffprobe 可用。
+   tools/preflight_works.py、tools/build_representation.py、tools/compare_spaces.py、
+   tools/events_probe.py 的 --help 均能成功运行；
+5. 配置有效性：config.yaml 可加载；可据此生成并加载一份临时隔离配置；ffmpeg/ffprobe 可用；
+   v0.4 配置段（sampling/events/temporal 与 representations 目录）有效。
 
 --full 额外运行带 model / network 标记的测试（需要 PE-AV 权重和网络；
        会为子进程设置 NEBULA_MODEL_TESTS=1 / NEBULA_NETWORK_TESTS=1）。
@@ -53,13 +56,30 @@ CLI_CHECKS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("tools/clip_stability.py", ()),
     ("tools/desync_experiment.py", ()),
     ("tools/preflight_works.py", ()),
+    ("tools/build_representation.py", ()),
+    ("tools/compare_spaces.py", ()),
+    ("tools/events_probe.py", ()),
 )
 """必须能以 --help 成功运行的 CLI 入口（脚本, 子命令参数）。"""
 
 REQUIRED_DOC_FILES: tuple[str, ...] = ("README.md", "ARCHITECTURE.md")
 
 V02_DOC_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "README.md": ("v0.2", "近邻", "稳定性", "身份关联", "筛选", "分位", "错位", "片段级"),
+    "README.md": (
+        "v0.2",
+        "近邻",
+        "稳定性",
+        "身份关联",
+        "筛选",
+        "分位",
+        "错位",
+        "片段级",
+        "v0.4",
+        "full_coverage",
+        "representations",
+        "表征空间",
+        "时间轴",
+    ),
     "ARCHITECTURE.md": (
         "work_links",
         "filter_json",
@@ -68,14 +88,20 @@ V02_DOC_KEYWORDS: dict[str, tuple[str, ...]] = {
         "avsync",
         "分位",
         "坐标不可",
+        "representations",
+        "sequence_version",
+        "full_coverage",
+        "representation_id",
+        "events",
+        "sequence_states",
     ),
 }
-"""v0.2 文档必须覆盖的关键内容（存在性检查，不校验具体措辞）。"""
+"""v0.2.x / v0.4 文档必须覆盖的关键内容（存在性检查，不校验具体措辞）。"""
 
-REQUIRED_ADR_PREFIXES: tuple[str, ...] = ("0005", "0006", "0007", "0008", "0009")
-"""v0.2 必需的 ADR 编号前缀（身份关联、筛选地图、高维近邻密度、错位实验、近邻解释）。"""
+REQUIRED_ADR_PREFIXES: tuple[str, ...] = ("0005", "0006", "0007", "0008", "0009", "0010")
+"""必需的 ADR 编号前缀（身份关联、筛选地图、高维近邻密度、错位实验、近邻解释、全片表征）。"""
 
-MIN_ADR_COUNT = 9
+MIN_ADR_COUNT = 10
 ADR_SECTIONS: tuple[str, ...] = (
     "Decision",
     "Why",
@@ -279,7 +305,7 @@ def check_docs(*, verbose: bool = False) -> CheckResult:
             continue
         missing = [keyword for keyword in keywords if keyword.lower() not in lowered]
         if missing:
-            problems.append(f"{name} 缺少 v0.2 内容: {', '.join(missing)}")
+            problems.append(f"{name} 缺少 v0.2.x/v0.4 内容: {', '.join(missing)}")
 
     adr_dir = ROOT / "docs" / "adr"
     adr_files = sorted(path for path in adr_dir.glob("*.md") if path.name[:1].isdigit())
@@ -288,7 +314,7 @@ def check_docs(*, verbose: bool = False) -> CheckResult:
     adr_names = [path.name for path in adr_files]
     for prefix in REQUIRED_ADR_PREFIXES:
         if not any(name.startswith(prefix) for name in adr_names):
-            problems.append(f"docs/adr/ 缺少 {prefix} 开头的 ADR（v0.2 新增决策）")
+            problems.append(f"docs/adr/ 缺少 {prefix} 开头的 ADR（必需决策）")
     for adr in adr_files:
         try:
             text = adr.read_text(encoding="utf-8")
@@ -304,7 +330,7 @@ def check_docs(*, verbose: bool = False) -> CheckResult:
         print(f"  ADR 文件: {[path.name for path in adr_files]}")
     if problems:
         return CheckResult("docs", False, "；".join(problems), duration)
-    detail = f"README/ARCHITECTURE 含 v0.2 内容，ADR {len(adr_files)} 篇且章节完整"
+    detail = f"README/ARCHITECTURE 含 v0.2.x/v0.4 内容，ADR {len(adr_files)} 篇且章节完整"
     return CheckResult("docs", True, detail, duration)
 
 
@@ -343,7 +369,8 @@ def check_cli(*, verbose: bool = False) -> CheckResult:
     detail = (
         f"{len(passed)} 个 CLI 入口 --help 均可运行"
         "（含 map.py variants、ingest.py link-local、tools/clip_stability.py、"
-        "tools/desync_experiment.py、tools/preflight_works.py）"
+        "tools/desync_experiment.py、tools/preflight_works.py、"
+        "tools/build_representation.py、tools/compare_spaces.py、tools/events_probe.py）"
     )
     return CheckResult("cli", True, detail, duration)
 
@@ -362,6 +389,18 @@ def check_config(*, verbose: bool = False) -> CheckResult:
     problems: list[str] = []
     if not cfg.embedding_version:
         problems.append("embedding_version 为空")
+    if cfg.sampling.mode not in ("legacy", "full_coverage"):
+        problems.append(f"sampling.mode 非法: {cfg.sampling.mode!r}")
+    if not cfg.events.version:
+        problems.append("events.version 为空")
+    if not 2 <= cfg.temporal.stages <= 8:
+        problems.append(f"temporal.stages 超出 2..8: {cfg.temporal.stages}")
+    if cfg.sampling.mode == "full_coverage" and cfg.sampling.overlap_seconds >= cfg.media.clip_seconds:
+        problems.append("full_coverage 的 overlap_seconds 必须小于 clip_seconds")
+    if not cfg.paths.representations.is_dir():
+        problems.append(f"representations 目录不存在: {cfg.paths.representations}")
+    if cfg.legacy_embedding_version == cfg.full_sequence_version:
+        problems.append("legacy 与 full 的序列版本号不应相同")
     if not str(cfg.paths.db_path).startswith(str(cfg.paths.data)):
         problems.append("db_path 不在 data 目录内")
     for tool_name in (cfg.media.ffmpeg, cfg.media.ffprobe):

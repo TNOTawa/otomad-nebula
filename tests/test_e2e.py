@@ -18,7 +18,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1858,6 +1861,406 @@ def test_v02_app_hubness_and_clip_explorer(
     at.checkbox(key="show_clip_panel").set_value(False).run()
     assert len(at.exception) == 0
     assert len(at.get("plotly_chart")) == 1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v0.4 全片覆盖 -> Full Mean -> 表征地图 -> 空间对比（离线全链路）
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class V04E2EState:
+    """v0.4 全链路验收环境。"""
+
+    root: Path
+    cfg: Config
+    catalog: Catalog
+    version: str
+    legacy_version: str
+    work_ids: dict[str, int]
+    installed: dict[str, Path]
+    rep_id: int
+    map_version: str
+    failed_work_id: int
+    reused_batches: int
+    report_path: Path
+
+
+def _v04_run_cli(args: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, *args],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=900,
+    )
+
+
+def _expected_full_window_count(duration_s: float, clip_seconds: float = 8.0) -> int:
+    """独立推导全片覆盖窗口数：短视频 1 段，否则 ceil((duration-clip)/clip)+1。"""
+
+    if duration_s <= clip_seconds + 1e-9:
+        return 1
+    return int(math.ceil((duration_s - clip_seconds) / clip_seconds - 1e-12)) + 1
+
+
+class _ScriptedHashEmbedder(HashTestEmbedder):
+    """可控中断的离线嵌入器：在第 N 次 encode_pairs 注入失败，并记录调用批次。"""
+
+    def __init__(self, *, fail_on_call: int | None = None) -> None:
+        super().__init__()
+        self.fail_on_call = fail_on_call
+        self.calls = 0
+        self.batch_sizes: list[int] = []
+
+    def encode_pairs(self, pairs):  # noqa: ANN001 - 与 Embedder 协议一致
+        self.calls += 1
+        self.batch_sizes.append(len(pairs))
+        if self.fail_on_call is not None and self.calls == self.fail_on_call:
+            raise RuntimeError("注入的全片编码中断（验收用）")
+        return super().encode_pairs(pairs)
+
+
+@pytest.fixture(scope="module")
+def v04_e2e(tmp_path_factory: pytest.TempPathFactory) -> V04E2EState:
+    """构建一次 v0.4 全链路环境：4 部合成视频 + 中断恢复 + Full Mean + 表征地图 + 空间对比。"""
+
+    if not media_tools_available():
+        pytest.skip("缺少 ffmpeg/ffprobe，跳过 v0.4 全链路 E2E")
+
+    root = tmp_path_factory.mktemp("v04-e2e")
+    cfg = create_temp_config(
+        root,
+        overrides={
+            "sampling": {"mode": "full_coverage", "overlap_seconds": 0.0},
+            "events": {"enabled": False},
+            "model": {"batch_size": 2},
+            "umap": {"n_jobs": 1, "random_state": 42},
+        },
+    )
+    library = build_video_library(root / "video_cache")
+    names = ["short_4s.mp4", "mid_12s.mp4", "odd_17s.mp4", "long_40s.mp4"]
+    installed: dict[str, Path] = {}
+    for name in names:
+        destination = cfg.paths.input_local / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(library[name], destination)
+        installed[name] = destination
+
+    catalog = Catalog(cfg.paths.db_path)
+    catalog.initialize()
+    try:
+        summary = register_local_videos(catalog, cfg)
+        assert summary.files == len(names)
+        works = {str(work["local_path"]): int(work["id"]) for work in catalog.list_works()}
+        work_ids = {name: works[name] for name in names}
+
+        # 1) 首次全片编码：第 3 次 encode_pairs 注入失败，留下 .partial 批次
+        interrupted = _ScriptedHashEmbedder(fail_on_call=3)
+        first_pipeline = Pipeline(
+            cfg,
+            embedder=interrupted,
+            allow_test_embedder=True,
+        )
+        try:
+            version = first_pipeline.embedding_version
+            expected_full_version = cfg.full_sequence_version.replace(
+                str(cfg.model.version), "test-hash-v1"
+            )
+            assert version == expected_full_version
+            assert "full" in version and "_ov0" in version
+            first_stats = first_pipeline.process_pending(source="local")
+        finally:
+            first_pipeline.close()
+        batch_size = max(1, int(cfg.model.batch_size))
+        expected_total_batches = sum(
+            math.ceil(
+                _expected_full_window_count(probe_duration_s(video_path)) / batch_size
+            )
+            for video_path in installed.values()
+        )
+        assert interrupted.calls == expected_total_batches, interrupted.batch_sizes
+        assert first_stats.failed == 1, first_stats.summary()
+        failed_outcome = next(item for item in first_stats.outcomes if item.status == "failed")
+        failed_work_id = int(failed_outcome.work_id)
+        state = catalog.get_sequence_state(failed_work_id, version=version)
+        assert state is not None and state["status"] == "failed"
+        failed_partial = cfg.paths.embeddings / version / f"{failed_work_id:06d}" / ".partial"
+        reused = sorted(failed_partial.glob("batch_*.npz"))
+        assert reused, "中断后必须保留已完成的批次文件"
+
+        # 2) 重启恢复：只补缺失批次，不重复编码已存在批次
+        resumed = _ScriptedHashEmbedder()
+        resume_pipeline = Pipeline(cfg, embedder=resumed, allow_test_embedder=True)
+        try:
+            assert resume_pipeline.embedding_version == version
+            second_stats = resume_pipeline.process_pending(source="local")
+        finally:
+            resume_pipeline.close()
+        assert second_stats.failed == 0 and second_stats.completed == 1
+        failed_name = next(name for name, work_id in work_ids.items() if work_id == failed_work_id)
+        failed_duration = probe_duration_s(installed[failed_name])
+        expected_failed_windows = _expected_full_window_count(failed_duration)
+        expected_failed_batches = math.ceil(expected_failed_windows / batch_size)
+        assert len(resumed.batch_sizes) == expected_failed_batches - len(reused)
+        assert not failed_partial.exists()
+
+        # 3) 覆盖率/版本隔离/片段序列落库
+        for name, work_id in work_ids.items():
+            work = catalog.get_work(work_id)
+            assert work is not None and work["status"] == "completed"
+            duration_s = probe_duration_s(installed[name])
+            clips = catalog.get_clips(work_id, version=version)
+            expected_windows = _expected_full_window_count(duration_s)
+            assert len(clips) == expected_windows, (name, len(clips), expected_windows)
+            assert [int(row["idx"]) for row in clips] == list(range(expected_windows))
+            ordered = sorted(clips, key=lambda row: int(row["idx"]))
+            assert ordered[0]["start_s"] == pytest.approx(0.0, abs=1e-6)
+            assert ordered[-1]["start_s"] + ordered[-1]["duration_s"] == pytest.approx(
+                duration_s, abs=1e-2
+            )
+            assert sum(float(row["weight"]) for row in clips) == pytest.approx(1.0, abs=1e-6)
+            for row in ordered:
+                assert row["valid_duration_s"] == pytest.approx(row["duration_s"], abs=1e-6)
+                assert row["weight"] is not None and float(row["weight"]) > 0
+            for previous, following in zip(ordered, ordered[1:], strict=False):
+                assert following["start_s"] <= previous["start_s"] + previous["duration_s"] + 1e-9
+            for probe_t in np.linspace(0.0, duration_s - 1e-6, 13):
+                assert any(
+                    float(row["start_s"]) - 1e-9
+                    <= float(probe_t)
+                    <= float(row["start_s"]) + float(row["duration_s"]) + 1e-9
+                    for row in ordered
+                ), (name, probe_t)
+            for kind in ("clip_joint", "clip_audio", "clip_video"):
+                embedding = catalog.get_embedding(work_id, version=version, kind=kind)
+                assert embedding is not None, (name, kind)
+                vector = load_vector(cfg.data_path(str(embedding["path"])))
+                assert vector.shape[0] == expected_windows
+            times = np.load(
+                cfg.paths.embeddings / version / f"{work_id:06d}" / "clip_times.npy"
+            )
+            assert times.shape == (expected_windows, 4)
+            assert float(times[:, 3].sum()) == pytest.approx(1.0, abs=1e-6)
+            sequence_state = catalog.get_sequence_state(work_id, version=version)
+            assert sequence_state is not None
+            assert sequence_state["status"] == "assembled"
+            assert int(sequence_state["n_clips_done"]) == expected_windows
+
+        # 4) 从已保存序列构建 Full Mean 表征（CLI，不重编码）
+        env = os.environ.copy()
+        env.update({"PYTHONIOENCODING": "utf-8", "NEBULA_CONFIG": str(cfg.path)})
+        build = _v04_run_cli(
+            [
+                "tools/build_representation.py",
+                "--config",
+                str(cfg.path),
+                "full_mean",
+                "--sequence",
+                version,
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+        )
+        assert build.returncode == 0, build.stderr[-3000:]
+        representation = catalog.get_representation(
+            name="full_mean_v1", sequence_version=version
+        )
+        assert representation is not None and representation["status"] == "ready"
+        rep_id = int(representation["id"])
+        representation_vectors = catalog.list_representation_vectors(rep_id)
+        joint_works = {
+            int(row["work_id"]) for row in representation_vectors if row["kind"] == "joint"
+        }
+        assert joint_works == set(work_ids.values())
+
+        # 5) 表征地图（CLI），地图必须绑定代表征与同一序列版本
+        map_build = _v04_run_cli(
+            [
+                "map.py",
+                "build",
+                "--config",
+                str(cfg.path),
+                "--representation",
+                "full_mean_v1",
+                "--sequence-version",
+                version,
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+        )
+        assert map_build.returncode == 0, map_build.stderr[-3000:]
+        map_row = catalog.latest_map()
+        assert map_row is not None
+        assert int(map_row["representation_id"]) == rep_id
+        assert map_row["embedding_version"] == version
+        assert int(map_row["n_works"]) == len(work_ids)
+        map_rows = catalog.load_map_rows(str(map_row["version"]))
+        assert {int(row["id"]) for row in map_rows} == set(work_ids.values())
+
+        # 6) 旧序列/legacy 表征与空间隔离（同一批作品、不同空间）
+        legacy_version = cfg.legacy_embedding_version
+        assert legacy_version != version
+        catalog.register_embedding_version(
+            legacy_version,
+            model_checkpoint="synthetic",
+            model_revision=None,
+            frames=16,
+            clip_seconds=cfg.media.clip_seconds,
+            clips_per_work=cfg.media.clips_per_work,
+            audio_sample_rate=cfg.media.audio_sample_rate,
+            params={"test": "v04-e2e-legacy"},
+        )
+        for work_id in work_ids.values():
+            clip_embedding = catalog.get_embedding(work_id, version=version, kind="clip_joint")
+            assert clip_embedding is not None
+            clip_matrix = load_vector(cfg.data_path(str(clip_embedding["path"])))
+            legacy_vector = np.asarray(clip_matrix[0], dtype=np.float32)
+            legacy_path = (
+                cfg.paths.embeddings / legacy_version / f"{work_id:06d}" / "work_joint.npy"
+            )
+            save_vector(legacy_path, legacy_vector)
+            catalog.register_embedding(
+                work_id,
+                version=legacy_version,
+                kind="work_joint",
+                path=cfg.data_relpath(legacy_path),
+                dim=int(legacy_vector.size),
+            )
+        legacy_rep_id = catalog.ensure_legacy_representation(legacy_version)
+        assert legacy_rep_id != rep_id
+        assert catalog.get_representation(legacy_rep_id)["name"] == "legacy_5clip_mean"
+
+        # 7) appdata 默认地图 = 最新表征地图，并带表征空间信息
+        map_info, frame = load_nebula_frame(catalog, cfg)
+        assert len(frame) == len(work_ids)
+        assert map_info["version"] == str(map_row["version"])
+        assert map_info["representation_id"] == rep_id
+        assert map_info["representation_name"] == "full_mean_v1"
+        assert map_info["representation_sequence_version"] == version
+        assert "Full Mean" in str(map_info["representation_label"])
+        if "is_canonical" in frame:
+            assert bool(frame["is_canonical"].all())
+
+        # 8) 邻域迁移对比 CLI：legacy × full_mean 输出 JSON/CSV
+        compare = _v04_run_cli(
+            [
+                "tools/compare_spaces.py",
+                "--config",
+                str(cfg.path),
+                "--a",
+                "legacy",
+                "--a-seq",
+                legacy_version,
+                "--b",
+                "full_mean_v1",
+                "--b-seq",
+                version,
+                "--k",
+                "2",
+                "--out-dir",
+                str(cfg.paths.logs),
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+        )
+        assert compare.returncode == 0, compare.stderr[-3000:]
+        report_files = sorted(cfg.paths.logs.glob("space_compare_*.json"))
+        assert report_files, "compare_spaces 应输出 JSON 报告"
+        report_path = report_files[-1]
+        assert report_path.with_suffix(".csv").is_file()
+
+        yield V04E2EState(
+            root=root,
+            cfg=cfg,
+            catalog=catalog,
+            version=version,
+            legacy_version=legacy_version,
+            work_ids=work_ids,
+            installed=installed,
+            rep_id=rep_id,
+            map_version=str(map_row["version"]),
+            failed_work_id=failed_work_id,
+            reused_batches=len(reused),
+            report_path=report_path,
+        )
+    finally:
+        catalog.close()
+
+
+def test_v04_full_coverage_and_interruption_recovery(v04_e2e: V04E2EState) -> None:
+    """v0.4 全片覆盖：无片段上限、末尾锚定、任意时刻覆盖、中断后只补缺失批。"""
+
+    assert "full" in v04_e2e.version
+    assert v04_e2e.version != v04_e2e.legacy_version
+    assert v04_e2e.reused_batches >= 1
+    work = v04_e2e.catalog.get_work(v04_e2e.failed_work_id)
+    assert work is not None and work["status"] == "completed"
+    state = v04_e2e.catalog.get_sequence_state(
+        v04_e2e.failed_work_id, version=v04_e2e.version
+    )
+    assert state is not None and state["status"] == "assembled"
+    clips = v04_e2e.catalog.get_clips(
+        v04_e2e.failed_work_id, version=v04_e2e.version
+    )
+    assert len(clips) == _expected_full_window_count(probe_duration_s(
+        next(path for name, path in v04_e2e.installed.items()
+             if v04_e2e.work_ids[name] == v04_e2e.failed_work_id)
+    ))
+    assert all(work_id > 0 for work_id in v04_e2e.work_ids.values())
+
+
+def test_v04_full_mean_map_binding_and_appdata(v04_e2e: V04E2EState) -> None:
+    """Full Mean 表征与地图：地图绑定代表征、序列一致、appdata 默认读取该空间。"""
+
+    representation = v04_e2e.catalog.get_representation(v04_e2e.rep_id)
+    assert representation is not None
+    assert representation["name"] == "full_mean_v1"
+    assert representation["sequence_version"] == v04_e2e.version
+    assert representation["status"] == "ready"
+
+    map_row = v04_e2e.catalog.get_map(v04_e2e.map_version)
+    assert map_row is not None
+    assert int(map_row["representation_id"]) == v04_e2e.rep_id
+    assert map_row["embedding_version"] == v04_e2e.version
+
+    map_info, frame = load_nebula_frame(v04_e2e.catalog, v04_e2e.cfg)
+    assert map_info["representation_name"] == "full_mean_v1"
+    assert len(frame) == len(v04_e2e.work_ids)
+
+    # 不同序列/表征的向量不混入同一矩阵：legacy 表征只有手动登记的 work_joint
+    from nebula.representations import load_representation_matrix, resolve_representation
+
+    legacy_rep = resolve_representation(
+        v04_e2e.catalog,
+        v04_e2e.cfg,
+        name="legacy",
+        sequence_version=v04_e2e.legacy_version,
+    )
+    legacy_ids, legacy_matrix = load_representation_matrix(
+        v04_e2e.catalog, v04_e2e.cfg, legacy_rep
+    )
+    assert set(legacy_ids) == set(v04_e2e.work_ids.values())
+    assert legacy_matrix.shape[0] == len(v04_e2e.work_ids)
+
+
+def test_v04_compare_spaces_legacy_vs_full(v04_e2e: V04E2EState) -> None:
+    """空间对比工具：共同作品、序列版本与报告结构正确。"""
+
+    report = json.loads(v04_e2e.report_path.read_text(encoding="utf-8"))
+    assert report["scope"]["n_common"] == len(v04_e2e.work_ids)
+    assert report["a"]["sequence_version"] == v04_e2e.legacy_version
+    assert report["b"]["sequence_version"] == v04_e2e.version
+    assert report["b"]["name"] == "full_mean_v1"
+    assert report["a"]["name"] == "legacy_5clip_mean"
+    assert len(report["works"]) == len(v04_e2e.work_ids)
+    for key in ("topk", "pairs", "cosine", "hubness"):
+        assert key in report
+    assert -1.0 <= float(report["cosine"]["pearson"]) <= 1.0
+    assert 0.0 <= float(report["pairs"]["stable_pair_ratio"]) <= 1.0
 
 
 

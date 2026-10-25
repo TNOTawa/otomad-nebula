@@ -20,9 +20,12 @@ from nebula.db import Catalog
 
 
 # --------------------------------------------------------------------------- 合成数据
-def _ensure_embedding_version(catalog: Catalog, config: Config) -> None:
+def _ensure_embedding_version(
+    catalog: Catalog, config: Config, version: str | None = None
+) -> str:
+    target = version or config.embedding_version
     catalog.register_embedding_version(
-        config.embedding_version,
+        target,
         model_checkpoint=config.model.checkpoint,
         model_revision=config.model.revision,
         frames=config.model.frames,
@@ -31,6 +34,7 @@ def _ensure_embedding_version(catalog: Catalog, config: Config) -> None:
         audio_sample_rate=config.media.audio_sample_rate,
         params={},
     )
+    return target
 
 
 def _add_map_version(
@@ -41,8 +45,10 @@ def _add_map_version(
     *,
     filter_spec: dict | None = None,
     note: str = "AppTest 测试",
+    representation_id: int | None = None,
+    embedding_version: str | None = None,
 ) -> None:
-    """登记一个指定版本/筛选条件的星云（坐标仅用于 AppTest）。"""
+    """登记一个指定版本/筛选条件/表征的星云（坐标仅用于 AppTest）。"""
 
     coords = [
         (
@@ -57,7 +63,7 @@ def _add_map_version(
     ]
     catalog.create_map_run(
         version,
-        embedding_version=config.embedding_version,
+        embedding_version=embedding_version or config.embedding_version,
         params={"metric": "cosine", "random_state": 42},
         coords=coords,
         coords_path=f"maps/{version}/coords.parquet",
@@ -65,6 +71,7 @@ def _add_map_version(
         model_3d_path=f"maps/{version}/map_3d.joblib",
         note=note,
         filter_spec=filter_spec,
+        representation_id=representation_id,
     )
 
 
@@ -712,3 +719,199 @@ def test_app_clip_panel_absent_without_clip_vectors(
     checkbox_keys = [element.key for element in app_test.checkbox]
     assert "show_clip_panel" not in checkbox_keys
     assert len(app_test.get("plotly_chart")) == 1
+
+
+# --------------------------------------------------------------------------- v0.4 表征空间切换与时间轴
+def _add_derived_representation(
+    catalog: Catalog,
+    config: Config,
+    work_ids: list[int],
+    *,
+    name: str = "full_mean_v1",
+    sequence_version: str = "full-seq-v1",
+    kind: str = "full_mean",
+    seed: int = 31,
+    dim: int = 8,
+) -> int:
+    """登记一个只含 joint 向量的 synthetic 派生表征，返回 id。"""
+
+    from nebula import representations
+
+    _ensure_embedding_version(catalog, config, sequence_version)
+    rep_id = catalog.register_representation(
+        name,
+        sequence_version=sequence_version,
+        kind=kind,
+        params={"synthetic": True},
+    )
+    rep = catalog.get_representation(rep_id)
+    assert rep is not None
+    rng = np.random.default_rng(seed)
+    for work_id in work_ids:
+        vector = rng.normal(size=dim).astype(np.float32)
+        vector = (vector / np.linalg.norm(vector)).astype(np.float32)
+        representations.save_representation_vectors(
+            catalog, config, rep, work_id, {"joint": vector}
+        )
+    catalog.set_representation_status(rep_id, "ready", dim=dim)
+    return rep_id
+
+
+def test_app_representation_space_switch(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids = _seed_app_data(catalog, config)  # map_v001：legacy / 6 部
+    derived_ids = work_ids[:4]
+    rep_id = _add_derived_representation(catalog, config, derived_ids)
+    _add_map_version(
+        catalog,
+        config,
+        derived_ids,
+        "map_v002",
+        representation_id=rep_id,
+        embedding_version="full-seq-v1",
+        note="Full Mean 地图",
+    )
+
+    app_test = _run_app(monkeypatch, repo_root, config)
+    assert not app_test.exception
+
+    space_select = app_test.selectbox(key="representation_space")
+    labels = [str(label) for label in space_select.options]
+    full_index = next(index for index, label in enumerate(labels) if "Full Mean" in label)
+    legacy_index = next(index for index, label in enumerate(labels) if "Legacy" in label)
+    # 默认打开最新无筛选地图 map_v002，自动定位到 Full Mean 空间
+    assert space_select.value == full_index
+    assert app_test.selectbox(key="map_version").value == "map_v002"
+    spec = _chart_spec(app_test)
+    assert len(_decode_array(spec["data"][0]["x"])) == len(derived_ids)
+    # 派生表征只有 joint 向量 -> 只有一张近邻表；无片段向量 -> 片段面板禁用
+    assert len(app_test.dataframe) == 1
+    assert "show_clip_panel" not in [element.key for element in app_test.checkbox]
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("Full Mean（全片平均）" in caption for caption in captions)
+
+    # 切回 Legacy 空间 -> 旧地图 map_v001（6 部）
+    app_test.selectbox(key="representation_space").set_value(legacy_index).run()
+    assert not app_test.exception
+    assert app_test.selectbox(key="map_version").value == "map_v001"
+    spec = _chart_spec(app_test)
+    assert len(_decode_array(spec["data"][0]["x"])) == len(work_ids)
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("Legacy（旧 5 片段平均）" in caption for caption in captions)
+
+    # 再切回 Full Mean 空间
+    app_test.selectbox(key="representation_space").set_value(full_index).run()
+    assert not app_test.exception
+    assert app_test.selectbox(key="map_version").value == "map_v002"
+    assert len(_decode_array(_chart_spec(app_test)["data"][0]["x"])) == len(derived_ids)
+
+
+def test_app_timeline_panel(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from types import SimpleNamespace
+
+    from nebula import appdata as appdata_module
+
+    work_ids = _seed_app_data(catalog, config)
+    sequence_version = config.embedding_version
+    catalog.update_work_metadata(work_ids[0], duration_s=24.0)
+    catalog.replace_clips(
+        work_ids[0],
+        version=sequence_version,
+        clips=[(idx, float(idx) * 8.0, 8.0, 8.0, 1.0 / 3.0) for idx in range(3)],
+    )
+    rng = np.random.default_rng(5)
+    stub = SimpleNamespace(
+        audio=rng.normal(size=(100, 6)).astype(np.float32),
+        video=rng.normal(size=(30, 6)).astype(np.float32),
+        av=rng.normal(size=(100, 6)).astype(np.float32),
+        window_features=rng.normal(size=(3, 32)).astype(np.float32),
+        audio_rate_hz=100.0,
+        video_fps=30,
+        video_fps_effective=30.0,
+        duration_s=24.0,
+        version="events_v1",
+    )
+    monkeypatch.setattr(appdata_module, "_load_events_bundle", lambda work_dir: stub)
+
+    app_test = _run_app(monkeypatch, repo_root, config)
+    assert not app_test.exception
+    charts = app_test.get("plotly_chart")
+    assert len(charts) == 2  # 星云主图 + 完整时间轴
+    timeline_spec = json.loads(charts[1].proto.spec)
+    names = [str(trace.get("name") or "") for trace in timeline_spec["data"]]
+    assert any("音频" in name for name in names)
+    assert any("画面" in name for name in names)
+    assert len(timeline_spec["layout"]["shapes"]) == 3  # 3 个片段窗口竖线
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("覆盖 100.0%" in caption for caption in captions)
+    assert any("事件版本 events_v1" in caption for caption in captions)
+
+
+def test_app_timeline_without_events_shows_hint(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _seed_app_data(catalog, config)
+    app_test = _run_app(monkeypatch, repo_root, config)
+
+    assert not app_test.exception
+    assert len(app_test.get("plotly_chart")) == 1
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("暂无事件扫描数据" in caption for caption in captions)
+
+
+def test_app_timeline_chart_count_guard(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """保护：有事件文件时 2 张图（星云+时间轴），没有事件文件时只有 1 张图。
+
+    同一个 AppTest 实例先验证“无事件 -> 1 图”，再补事件数据并清缓存复跑验证“有事件 -> 2 图”。
+    """
+
+    from types import SimpleNamespace
+
+    from streamlit import cache_data as streamlit_cache_data
+
+    from nebula import appdata as appdata_module
+
+    work_ids = _seed_app_data(catalog, config)
+    sequence_version = config.embedding_version
+
+    app_test = _run_app(monkeypatch, repo_root, config)
+    assert not app_test.exception
+    assert len(app_test.get("plotly_chart")) == 1
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("暂无事件扫描数据" in caption for caption in captions)
+
+    # 补 clips 表 + 事件包络 stub，清 cache_data 后用同一实例复跑
+    catalog.update_work_metadata(work_ids[0], duration_s=24.0)
+    catalog.replace_clips(
+        work_ids[0],
+        version=sequence_version,
+        clips=[(idx, float(idx) * 8.0, 8.0, 8.0, 1.0 / 3.0) for idx in range(3)],
+    )
+    rng = np.random.default_rng(11)
+    stub = SimpleNamespace(
+        audio=rng.normal(size=(100, 6)).astype(np.float32),
+        video=rng.normal(size=(30, 6)).astype(np.float32),
+        av=rng.normal(size=(100, 6)).astype(np.float32),
+        window_features=rng.normal(size=(3, 32)).astype(np.float32),
+        audio_rate_hz=100.0,
+        video_fps=30,
+        video_fps_effective=30.0,
+        duration_s=24.0,
+        version="events_v1",
+    )
+    monkeypatch.setattr(appdata_module, "_load_events_bundle", lambda work_dir: stub)
+    streamlit_cache_data.clear()
+    app_test.run()
+    assert not app_test.exception
+    assert len(app_test.get("plotly_chart")) == 2
+    timeline_spec = json.loads(app_test.get("plotly_chart")[1].proto.spec)
+    names = [str(trace.get("name") or "") for trace in timeline_spec["data"]]
+    assert any("音频" in name for name in names)
+    assert any("画面" in name for name in names)
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("覆盖 100.0%" in caption for caption in captions)

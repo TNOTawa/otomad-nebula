@@ -21,7 +21,10 @@ from nebula.appdata import (
     filter_frame,
     hover_text,
     hub_rows,
+    load_event_timeline,
     load_nebula_frame,
+    load_representation_options,
+    map_matches_representation,
     neighbor_rows,
     search_frame,
 )
@@ -32,9 +35,12 @@ from nebula.similarity import load_similarity_index
 
 
 # --------------------------------------------------------------------------- 合成数据
-def _ensure_embedding_version(catalog: Catalog, config: Config) -> str:
+def _ensure_embedding_version(
+    catalog: Catalog, config: Config, version: str | None = None
+) -> str:
+    target = version or config.embedding_version
     catalog.register_embedding_version(
-        config.embedding_version,
+        target,
         model_checkpoint=config.model.checkpoint,
         model_revision=config.model.revision,
         frames=config.model.frames,
@@ -43,7 +49,7 @@ def _ensure_embedding_version(catalog: Catalog, config: Config) -> str:
         audio_sample_rate=config.media.audio_sample_rate,
         params={},
     )
-    return config.embedding_version
+    return target
 
 
 def _seed_works(catalog: Catalog, config: Config, count: int = 6) -> list[int]:
@@ -154,6 +160,8 @@ def _seed_map(
     work_ids: list[int],
     version: str = "map_v001",
     note: str = "测试星云",
+    representation_id: int | None = None,
+    embedding_version: str | None = None,
 ) -> None:
     coords = [
         (
@@ -168,13 +176,14 @@ def _seed_map(
     ]
     catalog.create_map_run(
         version,
-        embedding_version=config.embedding_version,
+        embedding_version=embedding_version or config.embedding_version,
         params={"metric": "cosine", "random_state": 42},
         coords=coords,
         coords_path=f"maps/{version}/coords.parquet",
         model_2d_path=f"maps/{version}/map_2d.joblib",
         model_3d_path=f"maps/{version}/map_3d.joblib",
         note=note,
+        representation_id=representation_id,
     )
 
 
@@ -767,3 +776,187 @@ def test_clip_pair_rows(seeded_with_clips):
             index.clip_similarity(work_ids[1], work_ids[2])[row["a_idx"], row["b_idx"]],
             abs=1e-6,
         )
+
+
+# --------------------------------------------------------------------------- v0.4 表征信息与时间轴
+def _create_representation(
+    catalog: Catalog,
+    config: Config,
+    work_ids: list[int],
+    *,
+    name: str = "full_mean_v1",
+    sequence_version: str = "full-seq-v1",
+    kind: str = "full_mean",
+    seed: int = 21,
+    dim: int = 8,
+) -> int:
+    from nebula import representations
+
+    _ensure_embedding_version(catalog, config, sequence_version)
+    rep_id = catalog.register_representation(
+        name,
+        sequence_version=sequence_version,
+        kind=kind,
+        params={"synthetic": True},
+    )
+    rep = catalog.get_representation(rep_id)
+    assert rep is not None
+    rng = np.random.default_rng(seed)
+    for work_id in work_ids:
+        vector = rng.normal(size=dim).astype(np.float32)
+        vector = (vector / np.linalg.norm(vector)).astype(np.float32)
+        representations.save_representation_vectors(
+            catalog, config, rep, work_id, {"joint": vector}
+        )
+    catalog.set_representation_status(rep_id, "ready", dim=dim)
+    return rep_id
+
+
+def test_load_nebula_frame_representation_info(seeded):
+    config, catalog, work_ids = seeded
+    rep_id = _create_representation(catalog, config, work_ids[:3])
+    _seed_map(
+        catalog,
+        config,
+        work_ids=work_ids[:3],
+        version="map_v002",
+        representation_id=rep_id,
+        embedding_version="full-seq-v1",
+        note="full mean 地图",
+    )
+
+    map_info, frame = load_nebula_frame(catalog, config)
+    assert map_info["version"] == "map_v002"
+    assert map_info["representation_id"] == rep_id
+    assert map_info["representation_name"] == "full_mean_v1"
+    assert map_info["representation_label"] == "Full Mean（全片平均）"
+    assert map_info["representation_sequence_version"] == "full-seq-v1"
+    assert map_info["representation_kind"] == "full_mean"
+    assert len(frame) == 3
+
+    # 旧地图（representation_id=NULL）按 legacy 展示
+    legacy_info, legacy_frame = load_nebula_frame(
+        catalog, config, map_version="map_v001"
+    )
+    assert legacy_info["representation_id"] is None
+    assert legacy_info["representation_name"] == "legacy_5clip_mean"
+    assert legacy_info["representation_label"] == "Legacy（旧 5 片段平均）"
+    assert legacy_info["representation_sequence_version"] == config.embedding_version
+    assert len(legacy_frame) == len(work_ids)
+
+
+def test_load_representation_options(seeded):
+    from nebula import representations
+
+    config, catalog, work_ids = seeded
+    rep_id = _create_representation(catalog, config, work_ids[:3])
+    _seed_map(
+        catalog,
+        config,
+        work_ids=work_ids[:3],
+        version="map_v002",
+        representation_id=rep_id,
+        embedding_version="full-seq-v1",
+    )
+    # 再登记一个没有任何地图的表征
+    _ensure_embedding_version(catalog, config, "temporal-seq-v1")
+    catalog.register_representation(
+        "temporal_stats_v1",
+        sequence_version="temporal-seq-v1",
+        kind="temporal_stats",
+        params={"synthetic": True},
+    )
+    temporal_row = catalog.get_representation(
+        name="temporal_stats_v1", sequence_version="temporal-seq-v1"
+    )
+    assert temporal_row is not None
+    catalog.set_representation_status(int(temporal_row["id"]), "ready", dim=8)
+
+    options = load_representation_options(catalog, config)
+    names = [str(option["representation_name"]) for option in options]
+    assert names[:2] == ["legacy_5clip_mean", "full_mean_v1"]
+    assert "temporal_stats_v1" in names
+    by_name = {str(option["representation_name"]): option for option in options}
+    legacy_option = by_name["legacy_5clip_mean"]
+    assert legacy_option["map_version"] == "map_v001"
+    assert legacy_option["n_maps"] == 1
+    assert legacy_option["label"] == "Legacy（旧 5 片段平均）"
+    full_option = by_name["full_mean_v1"]
+    assert full_option["representation_id"] == rep_id
+    assert full_option["map_version"] == "map_v002"
+    assert full_option["sequence_version"] == "full-seq-v1"
+    assert by_name["temporal_stats_v1"]["map_version"] is None
+    assert by_name["temporal_stats_v1"]["n_maps"] == 0
+
+    maps = {str(row["version"]): row for row in catalog.list_maps()}
+    assert map_matches_representation(maps["map_v001"], legacy_option) is True
+    assert map_matches_representation(maps["map_v001"], full_option) is False
+    assert map_matches_representation(maps["map_v002"], full_option) is True
+    assert map_matches_representation(maps["map_v002"], legacy_option) is False
+    assert (
+        representations.representation_label("full_mean_v1") == "Full Mean（全片平均）"
+    )
+
+
+def test_load_event_timeline(seeded, monkeypatch):
+    from types import SimpleNamespace
+
+    config, catalog, work_ids = seeded
+    work_id = work_ids[1]  # bilibili 作品，带 duration
+    sequence_version = config.embedding_version
+    catalog.update_work_metadata(work_id, duration_s=40.0)
+    catalog.replace_clips(
+        work_id,
+        version=sequence_version,
+        clips=[(idx, float(idx) * 8.0, 8.0, 8.0, 0.2) for idx in range(5)],
+    )
+    rng = np.random.default_rng(3)
+    stub = SimpleNamespace(
+        audio=rng.normal(size=(100, 6)).astype(np.float32),
+        video=rng.normal(size=(30, 6)).astype(np.float32),
+        av=rng.normal(size=(100, 6)).astype(np.float32),
+        window_features=rng.normal(size=(5, 32)).astype(np.float32),
+        audio_rate_hz=100.0,
+        video_fps=30,
+        video_fps_effective=30.0,
+        duration_s=40.0,
+        version="events_v1",
+    )
+    monkeypatch.setattr("nebula.appdata._load_events_bundle", lambda work_dir: stub)
+
+    timeline = load_event_timeline(catalog, config, sequence_version, work_id)
+    assert timeline is not None
+    assert timeline["work_id"] == work_id
+    assert timeline["sequence_version"] == sequence_version
+    assert timeline["event_version"] == "events_v1"
+    assert timeline["duration_s"] == pytest.approx(40.0)
+    assert timeline["n_clips"] == 5
+    assert timeline["coverage_ratio"] == pytest.approx(1.0)
+    assert timeline["coverage_s"] == pytest.approx(40.0)
+    boundaries = timeline["window_boundaries"]
+    assert len(boundaries) == 5
+    assert boundaries[0]["start_s"] == pytest.approx(0.0)
+    assert boundaries[-1]["end_s"] == pytest.approx(40.0)
+    for boundary in boundaries:
+        assert boundary["duration_s"] == pytest.approx(8.0)
+        assert boundary["valid_duration_s"] == pytest.approx(8.0)
+        assert boundary["weight"] == pytest.approx(0.2)
+    series = timeline["series"]
+    assert set(series) == {"audio", "video", "av", "window"}
+    assert len(series["audio"]["time_s"]) == 100
+    assert len(series["video"]["values"]) == 30
+    assert len(series["av"]["values"]) == 100
+    assert len(series["window"]["time_s"]) == 5
+    for key in ("audio", "video", "av", "window"):
+        values = series[key]["values"]
+        assert all(0.0 <= float(value) <= 1.0 for value in values)
+    assert timeline["feature_names"]["audio"]
+    assert timeline["feature_names"]["video"]
+    assert timeline["audio_rate_hz"] == pytest.approx(100.0)
+    assert timeline["video_fps_effective"] == pytest.approx(30.0)
+
+    # 事件文件缺失 -> None
+    monkeypatch.setattr("nebula.appdata._load_events_bundle", lambda work_dir: None)
+    assert load_event_timeline(catalog, config, sequence_version, work_id) is None
+    with pytest.raises(MapError, match="作品不存在"):
+        load_event_timeline(catalog, config, sequence_version, 99999)

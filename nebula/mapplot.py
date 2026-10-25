@@ -30,9 +30,11 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from . import representations
 from .config import Config, load_config
 from .db import Catalog
 from .errors import MapError, NebulaError
+from .representations import LEGACY_NAME, representation_label
 from .util import now_utc_iso
 
 logger = logging.getLogger(__name__)
@@ -70,6 +72,9 @@ class MapBuildResult:
     coords_path: Path
     model_2d_path: Path
     model_3d_path: Path
+    #: v0.4：地图绑定的表征（旧地图/直接调用时可能为 None 或 legacy 表征）
+    representation_id: int | None = None
+    representation_name: str | None = None
 
 
 # --------------------------------------------------------------------------- 向量读取
@@ -227,6 +232,175 @@ def _select_embedding_rows(
         )
         rows = [row for row in rows if int(row["id"]) in allowed]
     return rows
+
+
+
+
+# --------------------------------------------------------------------------- 表征解析与矩阵
+def _representation_info(rep: Mapping[str, Any]) -> dict[str, Any]:
+    """把表征行压成写入 params/meta 的简明信息。"""
+
+    return {
+        "id": int(rep["id"]),
+        "name": str(rep["name"]),
+        "label": representation_label(str(rep["name"])),
+        "sequence_version": str(rep["sequence_version"]),
+        "kind": str(rep["kind"]),
+    }
+
+
+def _resolve_build_representation(
+    cat: Catalog,
+    cfg: Config,
+    *,
+    representation: str | None = None,
+    representation_id: int | None = None,
+    sequence_version: str | None = None,
+    version: str | None = None,
+) -> dict[str, Any]:
+    """解析 build_map 要使用的表征。
+
+    - representation/representation_id 显式指定（可配 sequence_version）；
+    - version 是 legacy 别名（其值即旧 embedding version）；
+    - 都不给时按当前 sampling.mode 选择默认表征（legacy / full_mean_v1）。
+    """
+
+    if representation_id is not None:
+        row = cat.get_representation(int(representation_id))
+        if row is None:
+            raise MapError(f"表征不存在: {representation_id}")
+        if sequence_version is not None and str(row["sequence_version"]) != str(sequence_version):
+            raise MapError(
+                f"表征 {row['name']} 的序列版本是 {row['sequence_version']}，"
+                f"与指定的 {sequence_version} 不一致"
+            )
+        return row
+    if representation is not None:
+        if version is not None:
+            raise MapError("--embedding-version 是 legacy 别名，不能与 --representation 同时使用")
+        try:
+            return representations.resolve_representation(
+                cat, cfg, name=str(representation), sequence_version=sequence_version
+            )
+        except NebulaError as exc:
+            raise MapError(f"无法解析表征 {representation}: {exc}") from exc
+    if version is not None:
+        if sequence_version is not None and str(sequence_version) != str(version):
+            raise MapError(
+                f"--embedding-version={version} 与 --sequence-version={sequence_version} 不一致"
+            )
+        try:
+            return representations.resolve_representation(
+                cat, cfg, name=LEGACY_NAME, sequence_version=str(version)
+            )
+        except NebulaError as exc:
+            raise MapError(f"无法解析 legacy 向量版本 {version}: {exc}") from exc
+    if sequence_version is not None:
+        try:
+            return representations.resolve_representation(
+                cat, cfg, sequence_version=str(sequence_version)
+            )
+        except NebulaError as exc:
+            raise MapError(f"无法解析序列版本 {sequence_version} 的默认表征: {exc}") from exc
+    try:
+        return representations.resolve_representation(cat, cfg)
+    except NebulaError as exc:
+        raise MapError(f"无法确定默认表征（请先构建表征或显式指定 --representation）: {exc}") from exc
+
+
+def _normalize_work_matrix(matrix: np.ndarray, *, where: str) -> np.ndarray:
+    """逐行 L2 归一化表征矩阵并校验。"""
+
+    array = np.asarray(matrix, dtype=np.float32)
+    if array.ndim != 2 or array.size == 0:
+        raise MapError(f"{where} 向量矩阵形状非法: {array.shape}")
+    if not np.all(np.isfinite(array)):
+        raise MapError(f"{where} 向量包含非有限值（NaN/Inf）")
+    norms = np.linalg.norm(array.astype(np.float64), axis=1)
+    zero_rows = np.where(norms <= 0)[0]
+    if zero_rows.size:
+        raise MapError(f"{where} 有 {zero_rows.size} 个零向量，无法做余弦降维")
+    return (array / norms[:, None]).astype(np.float32)
+
+
+def _filter_work_ids(
+    cat: Catalog,
+    work_ids: Sequence[int],
+    filter_spec: Mapping[str, Any] | None,
+) -> list[int]:
+    """按 dataset/list_key/vote_year 过滤 work_id（仅用于派生表征路径）。"""
+
+    spec = _normalize_filter_spec(filter_spec)
+    ids = [int(work_id) for work_id in work_ids]
+    if not spec:
+        return ids
+    if spec.get("dataset"):
+        works = {int(work["id"]): work for work in cat.list_works()}
+        ids = [
+            work_id
+            for work_id in ids
+            if str(works.get(work_id, {}).get("source")) == str(spec["dataset"])
+        ]
+    if spec.get("list_key"):
+        allowed = cat.work_ids_for_list(str(spec["list_key"]), only_canonical=True)
+        ids = [work_id for work_id in ids if work_id in allowed]
+    if spec.get("vote_year") is not None:
+        allowed = cat.work_ids_for_vote_year(
+            int(spec["vote_year"]), only_canonical=True
+        )
+        ids = [work_id for work_id in ids if work_id in allowed]
+    return ids
+
+
+def _load_representation_work_matrix(
+    cat: Catalog,
+    cfg: Config,
+    rep: Mapping[str, Any],
+    filter_spec: Mapping[str, Any] | None,
+) -> tuple[list[int], np.ndarray, dict[str, Any] | None]:
+    """读取某表征用于 UMAP 的作品级矩阵（joint），并应用界面筛选条件。"""
+
+    normalized = _normalize_filter_spec(filter_spec)
+    rep_kind = str(rep.get("kind"))
+    if rep_kind == "legacy":
+        # 旧路径完全保留（legacy 向量的筛选/include_duplicates 语义不变）
+        work_ids, matrix = load_embedding_matrix(
+            cat, cfg, version=str(rep["sequence_version"]), filter_spec=normalized
+        )
+        return work_ids, matrix, normalized
+
+    if normalized and normalized.get("include_duplicates"):
+        raise MapError(
+            "派生表征（非 legacy）默认排除 work_links 重复实体，"
+            "不能使用 include_duplicates=True"
+        )
+    try:
+        ids, matrix = representations.load_representation_matrix(
+            cat, cfg, rep, kind="joint"
+        )
+    except NebulaError as exc:
+        raise MapError(
+            f"读取表征 {rep['name']}@{rep['sequence_version']} 的联合向量失败: {exc}"
+        ) from exc
+    ids_list = [int(work_id) for work_id in ids]
+    if normalized:
+        keep = _filter_work_ids(cat, ids_list, normalized)
+        position = {work_id: index for index, work_id in enumerate(ids_list)}
+        if keep:
+            matrix = np.stack([matrix[position[work_id]] for work_id in keep])
+        else:
+            matrix = np.empty((0, matrix.shape[1]), dtype=np.float32)
+        ids_list = keep
+    if len(ids_list) < MIN_WORKS:
+        raise MapError(
+            f"筛选后作品数量不足: 表征「{representation_label(str(rep['name']))}」"
+            f"在条件「{_describe_filter_spec(normalized)}」下只有 {len(ids_list)} 部作品，"
+            f"至少需要 {MIN_WORKS} 部才能生成星云"
+        )
+    matrix = _normalize_work_matrix(
+        matrix, where=f"表征 {rep['name']}@{rep['sequence_version']}"
+    )
+    return ids_list, matrix, normalized
 
 
 def load_embedding_matrix(
@@ -483,11 +657,19 @@ def build_map(
     note: str | None = None,
     filter_spec: Mapping[str, Any] | None = None,
     n_neighbors: int | None = None,
+    representation: str | None = None,
+    representation_id: int | None = None,
+    sequence_version: str | None = None,
 ) -> MapBuildResult:
     """用作品向量训练 2D/3D 星云并登记为新版本。
 
     参数
     ----
+    representation / representation_id / sequence_version:
+        v0.4 表征空间定位。显式指定时通过 nebula.representations 读取作品级向量；
+        不指定时按当前 sampling.mode 选择默认表征（legacy 或 full_mean_v1）。
+    version:
+        legacy 别名（值即旧 embedding version），仅用于兼容旧命令/测试。
     filter_spec:
         可选筛选条件（dataset / vote_year / list_key / include_duplicates）；
         默认排除 work_links 的 duplicate 实体。筛选条件写入 map_runs.filter_json
@@ -495,20 +677,54 @@ def build_map(
     n_neighbors:
         覆盖配置中的 umap.n_neighbors，并记录到 params（用于变体对比）。
 
-    步骤：读取矩阵 -> 分别训练 2D/3D -> 写入新版本目录 -> 数据库原子登记。
+    步骤：解析表征 -> 读取矩阵 -> 分别训练 2D/3D -> 写入新版本目录 ->
+    数据库原子登记（记录 representation_id 与 sequence version）。
     任意一步失败都会清理本版本目录，数据库不会留下半成品版本。
     """
 
-    embedding_version = version or cfg.embedding_version
     normalized_filter = _normalize_filter_spec(filter_spec)
     override_neighbors = _validate_n_neighbors(n_neighbors)
-    work_ids, matrix = load_embedding_matrix(
-        cat, cfg, version=embedding_version, filter_spec=normalized_filter
+    explicit_representation = (
+        representation is not None
+        or representation_id is not None
+        or sequence_version is not None
+        or version is not None
     )
+    try:
+        rep = _resolve_build_representation(
+            cat,
+            cfg,
+            representation=representation,
+            representation_id=representation_id,
+            sequence_version=sequence_version,
+            version=version,
+        )
+    except MapError:
+        if explicit_representation:
+            raise
+        # 旧行为兼容：数据库尚未登记表征/序列版本时，沿用 embeddings 路径，
+        # 让“作品数量不足”等旧错误信息与旧测试保持稳定。
+        rep = None
+
+    if rep is None:
+        embedding_version = str(version or cfg.legacy_embedding_version)
+        work_ids, matrix = load_embedding_matrix(
+            cat, cfg, version=embedding_version, filter_spec=normalized_filter
+        )
+        rep_info: dict[str, Any] | None = None
+        representation_id_value: int | None = None
+    else:
+        embedding_version = str(rep["sequence_version"])
+        work_ids, matrix, normalized_filter = _load_representation_work_matrix(
+            cat, cfg, rep, normalized_filter
+        )
+        rep_info = _representation_info(rep)
+        representation_id_value = int(rep["id"])
     n_works = len(work_ids)
     actual_neighbors = _effective_neighbors(cfg, n_works, override_neighbors)
     logger.info(
-        "开始训练星云: embedding_version=%s n_works=%d dim=%d filter=%s n_neighbors=%d",
+        "开始训练星云: representation=%s@%s n_works=%d dim=%d filter=%s n_neighbors=%d",
+        rep_info["name"] if rep_info else "legacy(embeddings)",
         embedding_version,
         n_works,
         matrix.shape[1],
@@ -534,6 +750,7 @@ def build_map(
         n_neighbors=actual_neighbors,
         filter_spec=normalized_filter,
     )
+    params["representation"] = rep_info
 
     try:
         out_dir.mkdir(parents=True, exist_ok=False)
@@ -544,6 +761,7 @@ def build_map(
             {
                 "version": map_version,
                 "embedding_version": embedding_version,
+                "representation": rep_info,
                 "n_works": n_works,
                 "dim": int(matrix.shape[1]),
                 "filter_spec": normalized_filter,
@@ -567,6 +785,7 @@ def build_map(
             model_3d_path=cfg.data_relpath(model_3d_path),
             note=note,
             filter_spec=normalized_filter,
+            representation_id=representation_id_value,
         )
     except BaseException as exc:  # noqa: BLE001 - 清理半成品后重抛
         logger.exception("星云构建失败，清理半成品目录: %s", out_dir)
@@ -579,7 +798,12 @@ def build_map(
             raise MapError(f"星云登记失败（{map_version}）: {exc}") from exc
         raise MapError(f"生成星云失败（{map_version}）: {exc}") from exc
 
-    logger.info("星云构建完成: %s，作品数=%d", map_version, n_works)
+    logger.info(
+        "星云构建完成: %s，表征=%s，作品数=%d",
+        map_version,
+        rep_info["name"] if rep_info else "legacy(embeddings)",
+        n_works,
+    )
     return MapBuildResult(
         version=map_version,
         embedding_version=embedding_version,
@@ -587,6 +811,8 @@ def build_map(
         coords_path=coords_path,
         model_2d_path=model_2d_path,
         model_3d_path=model_3d_path,
+        representation_id=representation_id_value,
+        representation_name=None if rep_info is None else rep_info["name"],
     )
 
 
@@ -597,6 +823,10 @@ def build_map_variants(
     n_neighbors_list: Sequence[int] = (8, 15, 30),
     filter_spec: Mapping[str, Any] | None = None,
     note_prefix: str | None = None,
+    representation: str | None = None,
+    representation_id: int | None = None,
+    sequence_version: str | None = None,
+    version: str | None = None,
 ) -> list[MapBuildResult]:
     """依次用不同 n_neighbors 生成多个星云版本，便于对比不同邻域尺度下的结构。
 
@@ -629,6 +859,10 @@ def build_map_variants(
                 filter_spec=filter_spec,
                 n_neighbors=value,
                 note=note,
+                representation=representation,
+                representation_id=representation_id,
+                sequence_version=sequence_version,
+                version=version,
             )
         )
     return results
@@ -701,16 +935,47 @@ def transform_new(
     existing_ids = {int(value) for value in coords_frame["work_id"].tolist()}
     filter_spec = _parse_map_filter(map_row)
 
-    # 筛选生成的星云只接受同样满足筛选条件的新作品
-    rows = _select_embedding_rows(cat, embedding_version, filter_spec)
-    new_rows = [row for row in rows if int(row["id"]) not in existing_ids]
-    if not new_rows:
-        logger.info("星云 %s 没有需要增量加入的新作品", version)
-        return 0
+    representation_id = map_row.get("representation_id")
+    rep_row = (
+        None
+        if representation_id is None
+        else cat.get_representation(int(representation_id))
+    )
+    if representation_id is not None and rep_row is None:
+        raise MapError(f"星云版本 {version} 关联的表征不存在: {representation_id}")
 
-    new_ids = [int(row["id"]) for row in new_rows]
-    logger.info("增量更新星云 %s: 新增作品 %d 部", version, len(new_ids))
-    new_matrix = _read_work_vectors(cfg, new_rows)
+    if rep_row is not None and str(rep_row.get("kind")) != "legacy":
+        # v0.4 派生表征：新作品向量来自 representation_vectors
+        try:
+            vectors = representations.load_representation_vectors(
+                cat, cfg, rep_row, "joint"
+            )
+        except NebulaError as exc:
+            raise MapError(
+                f"读取表征 {rep_row['name']} 的向量失败，无法增量更新: {exc}"
+            ) from exc
+        candidate_ids = _filter_work_ids(cat, sorted(vectors), filter_spec)
+        new_ids = [
+            work_id for work_id in candidate_ids if int(work_id) not in existing_ids
+        ]
+        if not new_ids:
+            logger.info("星云 %s 没有需要增量加入的新作品", version)
+            return 0
+        logger.info("增量更新星云 %s（表征 %s）: 新增作品 %d 部", version, rep_row["name"], len(new_ids))
+        new_matrix = _normalize_work_matrix(
+            np.stack([vectors[work_id] for work_id in new_ids]),
+            where=f"表征 {rep_row['name']}",
+        )
+    else:
+        # legacy 表征 / 旧地图：完全复用旧的 embeddings 路径
+        rows = _select_embedding_rows(cat, embedding_version, filter_spec)
+        new_rows = [row for row in rows if int(row["id"]) not in existing_ids]
+        if not new_rows:
+            logger.info("星云 %s 没有需要增量加入的新作品", version)
+            return 0
+        new_ids = [int(row["id"]) for row in new_rows]
+        logger.info("增量更新星云 %s: 新增作品 %d 部", version, len(new_ids))
+        new_matrix = _read_work_vectors(cfg, new_rows)
     model_2d = _load_model(model_2d_path, "2D")
     model_3d = _load_model(model_3d_path, "3D")
 
@@ -792,9 +1057,14 @@ def _filter_spec_from_args(args: Any) -> dict[str, Any] | None:
 
 
 def _print_build_result(result: MapBuildResult, filter_spec: Mapping[str, Any] | None) -> None:
+    rep_label = (
+        representation_label(result.representation_name)
+        if result.representation_name
+        else "未登记"
+    )
     print(
         f"已生成星云 {result.version}: {result.n_works} 部作品，"
-        f"向量版本 {result.embedding_version}"
+        f"表征={rep_label}，序列版本 {result.embedding_version}"
     )
     print(f"  筛选条件: {_describe_filter_spec(filter_spec)}")
     print(f"  坐标: {result.coords_path}")
@@ -804,6 +1074,14 @@ def _print_build_result(result: MapBuildResult, filter_spec: Mapping[str, Any] |
         print("  注意：筛选后的坐标与总星云坐标不可直接比较绝对位置")
 
 
+def _representation_args_from_cli(args: Any) -> dict[str, Any]:
+    return {
+        "representation": getattr(args, "representation", None),
+        "sequence_version": getattr(args, "sequence_version", None),
+        "version": getattr(args, "embedding_version", None),
+    }
+
+
 def _cmd_build(cfg: Config, args: Any) -> int:
     filter_spec = _filter_spec_from_args(args)
     cat = _open_catalog(cfg)
@@ -811,10 +1089,10 @@ def _cmd_build(cfg: Config, args: Any) -> int:
         result = build_map(
             cat,
             cfg,
-            version=getattr(args, "embedding_version", None),
             note=getattr(args, "note", None),
             filter_spec=filter_spec,
             n_neighbors=getattr(args, "n_neighbors", None),
+            **_representation_args_from_cli(args),
         )
     finally:
         cat.close()
@@ -832,6 +1110,7 @@ def _cmd_variants(cfg: Config, args: Any) -> int:
             n_neighbors_list=tuple(int(value) for value in args.n_neighbors),
             filter_spec=filter_spec,
             note_prefix=getattr(args, "note_prefix", None),
+            **_representation_args_from_cli(args),
         )
     finally:
         cat.close()
@@ -845,6 +1124,9 @@ def _cmd_list(cfg: Config) -> int:
     cat = _open_catalog(cfg)
     try:
         maps = cat.list_maps()
+        representations_by_id = {
+            int(row["id"]): row for row in cat.list_representations()
+        }
     finally:
         cat.close()
     if not maps:
@@ -863,9 +1145,13 @@ def _cmd_list(cfg: Config) -> int:
         except (TypeError, ValueError):
             params = {}
         neighbors = params.get("n_neighbors") if isinstance(params, dict) else None
+        rep = representations_by_id.get(int(row.get("representation_id") or 0))
+        rep_label = (
+            representation_label(str(rep["name"])) if rep is not None else "未登记（旧地图）"
+        )
         print(
             f"  {row['version']}  {int(row.get('n_works') or 0)} 部  "
-            f"向量版本={row['embedding_version']}  状态={row['status']}  "
+            f"表征={rep_label}  序列版本={row['embedding_version']}  状态={row['status']}  "
             f"n_neighbors={neighbors}  筛选={_describe_filter_spec(filter_spec)}  "
             f"创建于 {row['created_at']}{note}"
         )
@@ -884,6 +1170,24 @@ def _cmd_transform(cfg: Config, *, map_version: str | None) -> int:
     else:
         print(f"星云 {version} 增量更新完成: 新增 {added} 部作品（旧作品坐标保持不变）")
     return 0
+
+
+def _add_representation_arguments(parser: Any) -> None:
+    """为 build / variants 子命令添加表征空间参数（v0.4）。"""
+
+    parser.add_argument(
+        "--representation",
+        default=None,
+        help=(
+            "表征名：legacy_5clip_mean / full_mean_v1 / temporal_stats_v1"
+            "（默认按 sampling.mode 选择）"
+        ),
+    )
+    parser.add_argument(
+        "--sequence-version",
+        default=None,
+        help="序列版本（缺省时用表征已登记的版本）",
+    )
 
 
 def _add_filter_arguments(parser: Any) -> None:
@@ -922,12 +1226,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--config", default=None, help="配置文件路径（默认 NEBULA_CONFIG 或 config.yaml）"
     )
     build_parser.add_argument(
-        "--embedding-version", default=None, help="向量版本（默认取配置中的版本）"
+        "--embedding-version",
+        default=None,
+        help="legacy 别名：旧 embedding version（仅用于 legacy 表征，不能与 --representation 同用）",
     )
     build_parser.add_argument("--note", default=None, help="版本备注，写入数据库")
     build_parser.add_argument(
         "--n-neighbors", type=int, default=None, help="覆盖配置中的 UMAP n_neighbors"
     )
+    _add_representation_arguments(build_parser)
     _add_filter_arguments(build_parser)
 
     variants_parser = subparsers.add_parser(
@@ -937,7 +1244,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--config", default=None, help="配置文件路径（默认 NEBULA_CONFIG 或 config.yaml）"
     )
     variants_parser.add_argument(
-        "--embedding-version", default=None, help="向量版本（默认取配置中的版本）"
+        "--embedding-version",
+        default=None,
+        help="legacy 别名：旧 embedding version（仅用于 legacy 表征）",
     )
     variants_parser.add_argument(
         "--n-neighbors",
@@ -947,6 +1256,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="要对比的 n_neighbors 列表（默认 8 15 30）",
     )
     variants_parser.add_argument("--note-prefix", default=None, help="版本备注前缀")
+    _add_representation_arguments(variants_parser)
     _add_filter_arguments(variants_parser)
 
     list_parser = subparsers.add_parser("list", help="列出全部星云版本")

@@ -28,6 +28,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from nebula import CLIP_VECTOR_KINDS, EMBEDDING_KINDS, WORK_VECTOR_KINDS
@@ -40,7 +41,13 @@ from nebula.db import (
     work_key_for_bilibili,
     work_key_for_local,
 )
-from nebula.errors import DatabaseError, SamplingError
+from nebula.embed import save_vector
+from nebula.errors import DatabaseError, NebulaError, SamplingError
+from nebula.representations import (
+    load_representation_matrix,
+    resolve_representation,
+    save_representation_vectors,
+)
 from nebula.sampling import plan_clips
 from nebula.util import slugify
 
@@ -500,23 +507,38 @@ def test_bilibili_work_key_dedupes_by_bvid_and_part(catalog: Catalog) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def test_schema_v2_tables_and_columns(catalog: Catalog) -> None:
-    """v2 schema：新增三张表与 map_runs.filter_json 列，版本号必须为 2。"""
+def test_schema_v3_tables_and_columns(catalog: Catalog) -> None:
+    """v3 schema：v2 表/列保留，并新增表征/序列表与 v0.4 列；版本号必须为 3。"""
 
-    assert SCHEMA_VERSION == "2"
+    assert SCHEMA_VERSION == "3"
     tables = {
         str(row[0])
         for row in catalog.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
-    assert {"work_links", "pipeline_runs", "work_timings"} <= tables
+    assert {
+        "work_links",
+        "pipeline_runs",
+        "work_timings",
+        "representations",
+        "representation_vectors",
+        "sequence_states",
+    } <= tables
     map_columns = {
         str(row[1]) for row in catalog.conn.execute("PRAGMA table_info(map_runs)").fetchall()
     }
-    assert "filter_json" in map_columns
+    assert {"filter_json", "representation_id"} <= map_columns
     link_columns = {
         str(row[1]) for row in catalog.conn.execute("PRAGMA table_info(work_links)").fetchall()
     }
     assert {"canonical_work_id", "duplicate_work_id", "method"} <= link_columns
+    clip_columns = {
+        str(row[1]) for row in catalog.conn.execute("PRAGMA table_info(clips)").fetchall()
+    }
+    assert {"valid_duration_s", "weight"} <= clip_columns
+    timing_columns = {
+        str(row[1]) for row in catalog.conn.execute("PRAGMA table_info(work_timings)").fetchall()
+    }
+    assert "events_s" in timing_columns
 
 
 def test_work_links_single_level_and_unique(catalog: Catalog) -> None:
@@ -691,6 +713,322 @@ def test_pipeline_runs_and_timings_semantics(catalog: Catalog) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# v0.4：全片序列 / 表征版本 / 空间隔离
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _v04_register_version(
+    catalog: Catalog,
+    version: str,
+    *,
+    clips_per_work: int = 5,
+    clip_seconds: float = 8.0,
+) -> None:
+    catalog.register_embedding_version(
+        version,
+        model_checkpoint="synthetic",
+        model_revision=None,
+        frames=16,
+        clip_seconds=clip_seconds,
+        clips_per_work=clips_per_work,
+        audio_sample_rate=48000,
+        params={"test": "v0.4-invariants"},
+    )
+
+
+def _v04_unit(values: list[float]) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float32)
+    return array / float(np.linalg.norm(array))
+
+
+def _v04_local_work(catalog: Catalog, name: str) -> int:
+    work_id, _ = catalog.upsert_local_work(f"v04/{name}.mp4", title=name)
+    return int(work_id)
+
+
+def _v04_save_embedding(
+    catalog: Catalog,
+    config: Config,
+    work_id: int,
+    version: str,
+    vector: np.ndarray,
+) -> None:
+    path = config.paths.embeddings / version / f"{work_id:06d}" / "work_joint.npy"
+    save_vector(path, vector)
+    catalog.register_embedding(
+        work_id,
+        version=version,
+        kind="work_joint",
+        path=config.data_relpath(path),
+        dim=int(vector.size),
+    )
+
+
+def _v04_create_representation(
+    catalog: Catalog,
+    config: Config,
+    *,
+    name: str,
+    sequence_version: str,
+    vectors: dict[int, np.ndarray],
+) -> int:
+    rep_id = catalog.register_representation(
+        name,
+        sequence_version=sequence_version,
+        kind="full_mean",
+        params={"aggregator": "mean", "test": "v0.4-invariants"},
+    )
+    rep = catalog.get_representation(rep_id)
+    assert rep is not None
+    for work_id, vector in vectors.items():
+        save_representation_vectors(catalog, config, rep, work_id, {"joint": vector})
+    first = next(iter(vectors.values()))
+    catalog.set_representation_status(rep_id, "ready", dim=int(first.size))
+    return int(rep_id)
+
+
+def test_sampling_mode_switch_changes_active_version_not_legacy_formula(config: Config) -> None:
+    """sampling.mode 只切换“当前激活序列版本”；legacy 公式必须与旧版完全一致。"""
+
+    expected_legacy = (
+        f"{slugify(config.model.version)}"
+        f"__f{config.model.frames}"
+        f"_clip{config.media.clip_seconds:g}s"
+        f"_x{config.media.clips_per_work}"
+        f"_{config.media.audio_sample_rate // 1000}k"
+    )
+    if config.media.clip_height:
+        expected_legacy += f"_h{int(config.media.clip_height)}"
+    assert config.sampling.mode == "legacy"
+    assert config.legacy_embedding_version == expected_legacy
+    assert config.embedding_version == expected_legacy
+
+    full = replace(config, sampling=replace(config.sampling, mode="full_coverage"))
+    assert full.legacy_embedding_version == expected_legacy
+    assert full.embedding_version == full.full_sequence_version
+    assert full.embedding_version != config.embedding_version
+    assert "full" in full.embedding_version
+    assert f"_ov{full.sampling.overlap_seconds:g}" in full.embedding_version
+    assert f"x{config.media.clips_per_work}" not in full.full_sequence_version
+
+    # 改变 overlap 只会生成新的 full 序列版本，不改变 legacy 版本号
+    shifted = replace(full, sampling=replace(full.sampling, overlap_seconds=full.sampling.overlap_seconds + 0.5))
+    assert shifted.full_sequence_version != full.full_sequence_version
+    assert shifted.legacy_embedding_version == expected_legacy
+
+
+def test_full_sequence_version_format_and_clip_height(config: Config) -> None:
+    """full 版本号含 full/ov 与可选 _h 标记，且与 legacy 版本严格不同。"""
+
+    full = replace(config, sampling=replace(config.sampling, mode="full_coverage"))
+    assert full.full_sequence_version != full.legacy_embedding_version
+    assert f"_full{config.media.clip_seconds:g}s" in full.full_sequence_version
+    assert f"_ov{config.sampling.overlap_seconds:g}" in full.full_sequence_version
+    assert " " not in full.full_sequence_version and "/" not in full.full_sequence_version
+
+    tall = replace(config, media=replace(config.media, clip_height=336))
+    tall_full = replace(tall, sampling=replace(tall.sampling, mode="full_coverage"))
+    assert tall_full.full_sequence_version.endswith("_h336")
+    assert "_h336" in tall_full.legacy_embedding_version
+
+    plain = replace(config, media=replace(config.media, clip_height=None))
+    plain_full = replace(plain, sampling=replace(plain.sampling, mode="full_coverage"))
+    assert "_h" not in plain_full.full_sequence_version
+
+
+def test_representations_isolated_by_name_sequence_and_kind(
+    catalog: Catalog, config: Config
+) -> None:
+    """不同表征/不同序列的向量矩阵彼此隔离，legacy 与派生表征不混用。"""
+
+    _v04_register_version(catalog, "v04-a")
+    _v04_register_version(catalog, "v04-b")
+    first = _v04_local_work(catalog, "rep-a1")
+    second = _v04_local_work(catalog, "rep-a2")
+    third = _v04_local_work(catalog, "rep-b1")
+    fourth = _v04_local_work(catalog, "rep-a3-only-legacy")
+
+    vectors_a = {
+        first: _v04_unit([1.0, 0.0, 0.0, 0.0]),
+        second: _v04_unit([0.0, 1.0, 0.0, 0.0]),
+    }
+    vectors_b = {third: _v04_unit([1.0, 0.0, 0.0])}
+    for work_id, vector in vectors_a.items():
+        _v04_save_embedding(catalog, config, work_id, "v04-a", vector)
+    _v04_save_embedding(catalog, config, fourth, "v04-a", _v04_unit([0.0, 0.0, 1.0, 0.0]))
+
+    rep_a_id = _v04_create_representation(
+        catalog, config, name="full_mean_v1", sequence_version="v04-a", vectors=vectors_a
+    )
+    rep_b_id = _v04_create_representation(
+        catalog, config, name="full_mean_v1", sequence_version="v04-b", vectors=vectors_b
+    )
+    rep_a = catalog.get_representation(rep_a_id)
+    rep_b = catalog.get_representation(rep_b_id)
+    assert rep_a is not None and rep_b is not None
+
+    ids_a, matrix_a = load_representation_matrix(catalog, config, rep_a)
+    ids_b, matrix_b = load_representation_matrix(catalog, config, rep_b)
+    assert set(ids_a) == {first, second}
+    assert set(ids_b) == {third}
+    assert set(ids_a).isdisjoint(ids_b)
+    assert matrix_a.shape == (2, 4)
+    assert matrix_b.shape == (1, 3)
+
+    # legacy 表征只读 embeddings 表，不包含任何代表征向量
+    legacy_id = catalog.ensure_legacy_representation("v04-a")
+    legacy_rep = catalog.get_representation(legacy_id)
+    assert legacy_rep is not None
+    legacy_ids, legacy_matrix = load_representation_matrix(catalog, config, legacy_rep)
+    assert set(legacy_ids) == {first, second, fourth}
+    assert legacy_matrix.shape[1] == 4
+    assert third not in set(legacy_ids)
+
+    # 同名 + 同序列必须解析到同一条记录；不同序列不能串号
+    assert resolve_representation(
+        catalog, config, name="full_mean_v1", sequence_version="v04-a"
+    )["id"] == rep_a_id
+    assert resolve_representation(
+        catalog, config, name="full_mean_v1", sequence_version="v04-b"
+    )["id"] == rep_b_id
+    with pytest.raises(DatabaseError):
+        catalog.register_representation(
+            "full_mean_v1",
+            sequence_version="v04-a",
+            kind="full_mean",
+            params={"aggregator": "sum"},
+        )
+    with pytest.raises(NebulaError):
+        resolve_representation(catalog, config, name="not_built_representation")
+
+
+def test_maps_bind_representation_and_never_overwrite_old_coords(catalog: Catalog) -> None:
+    """地图必须绑定“同序列”的表征；新地图不覆盖旧地图坐标。"""
+
+    _v04_register_version(catalog, "v04-map")
+    _v04_register_version(catalog, "v04-other")
+    first = _v04_local_work(catalog, "map1")
+    second = _v04_local_work(catalog, "map2")
+    # 地图绑定测试不需要真实向量文件；直接登记 ready 表征
+    rep_id = catalog.register_representation(
+        "full_mean_v1",
+        sequence_version="v04-map",
+        kind="full_mean",
+        params={"test": "map-binding"},
+    )
+    catalog.set_representation_status(rep_id, "ready", dim=4)
+
+    catalog.create_map_run(
+        "map_v001",
+        embedding_version="v04-map",
+        params={"note": "旧地图未绑定表征"},
+        coords=[(first, 1.0, 2.0, 3.0, 4.0, 5.0), (second, -1.0, -2.0, -3.0, -4.0, -5.0)],
+    )
+    catalog.create_map_run(
+        "map_v002",
+        embedding_version="v04-map",
+        params={"note": "绑定表征"},
+        coords=[(first, 9.0, 8.0, 7.0, 6.0, 5.0)],
+        representation_id=rep_id,
+    )
+    assert catalog.get_map("map_v001")["representation_id"] is None
+    assert catalog.get_map("map_v002")["representation_id"] == rep_id
+    assert catalog.latest_map()["version"] == "map_v002"
+
+    # 表征序列与 embedding_version 不一致时必须拒绝建图
+    with pytest.raises(DatabaseError):
+        catalog.create_map_run(
+            "map_v003",
+            embedding_version="v04-other",
+            params={},
+            coords=[(first, 0.0, 0.0, 0.0, 0.0, 0.0)],
+            representation_id=rep_id,
+        )
+    # 旧地图版本不可覆盖（重复版本号被拒绝，坐标保持第一次写入的值）
+    with pytest.raises(DatabaseError):
+        catalog.create_map_run(
+            "map_v001",
+            embedding_version="v04-map",
+            params={},
+            coords=[(first, 100.0, 100.0, 100.0, 100.0, 100.0)],
+        )
+    old_rows = {int(row["id"]): row for row in catalog.load_map_rows("map_v001")}
+    assert old_rows[first]["x2"] == pytest.approx(1.0)
+    assert old_rows[second]["x2"] == pytest.approx(-1.0)
+    new_rows = catalog.load_map_rows("map_v002")
+    assert new_rows[0]["x2"] == pytest.approx(9.0)
+
+
+def test_catalog_initialize_and_legacy_registration_idempotent(config: Config) -> None:
+    """重复 initialize/登记 legacy 表征不产生重复行；clips 5 元组与序列状态可恢复。"""
+
+    catalog = Catalog(config.paths.db_path)
+    try:
+        catalog.initialize()
+        _v04_register_version(catalog, "v04-init")
+        work_id = _v04_local_work(catalog, "init")
+        legacy_id = catalog.ensure_legacy_representation("v04-init")
+        assert catalog.ensure_legacy_representation("v04-init") == legacy_id
+        catalog.replace_clips(
+            work_id,
+            version="v04-init",
+            clips=[(0, 0.0, 8.0, 8.0, 0.5), (1, 8.0, 8.0, 8.0, 0.5)],
+        )
+        catalog.upsert_sequence_state(
+            work_id,
+            version="v04-init",
+            duration_s=16.0,
+            n_clips=2,
+            n_clips_done=1,
+            partial_relpath="temp/v04-init/000001",
+            status="in_progress",
+        )
+        before = (
+            len(catalog.list_representations()),
+            len(catalog.list_maps()),
+            len(catalog.get_clips(work_id, version="v04-init")),
+        )
+        catalog.initialize()
+        catalog.initialize()
+        assert (
+            len(catalog.list_representations()),
+            len(catalog.list_maps()),
+            len(catalog.get_clips(work_id, version="v04-init")),
+        ) == before
+        assert catalog.ensure_legacy_representation("v04-init") == legacy_id
+        clips = catalog.get_clips(work_id, version="v04-init")
+        assert clips[0]["valid_duration_s"] == pytest.approx(8.0)
+        assert clips[0]["weight"] == pytest.approx(0.5)
+        state = catalog.get_sequence_state(work_id, version="v04-init")
+        assert state is not None
+        assert state["n_clips"] == 2 and state["n_clips_done"] == 1
+        catalog.upsert_sequence_state(
+            work_id,
+            version="v04-init",
+            duration_s=16.0,
+            n_clips=2,
+            n_clips_done=2,
+            partial_relpath=None,
+            status="assembled",
+        )
+        assembled = catalog.get_sequence_state(work_id, version="v04-init")
+        assert assembled is not None and assembled["status"] == "assembled"
+    finally:
+        catalog.close()
+
+
+def test_compare_spaces_tool_import_boundary(repo_root: Path) -> None:
+    """邻域迁移工具必须离线/纯数值：不依赖模型、UMAP、pandas 或界面库。"""
+
+    tool = repo_root / "tools" / "compare_spaces.py"
+    assert tool.is_file(), "tools/compare_spaces.py 尚未交付"
+    _assert_no_import(
+        tool,
+        ("torch", "transformers", "umap", "streamlit", "plotly", "pandas", "nebula.embed"),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 采样规则
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -811,6 +1149,7 @@ def test_gitignore_actually_ignores_paths(repo_root: Path) -> None:
         ("map.py", ("variants",)),
         ("ingest.py", ("link-local",)),
         ("tools/clip_stability.py", ()),
+        ("tools/compare_spaces.py", ()),
         ("qa.py", ()),
     ],
 )

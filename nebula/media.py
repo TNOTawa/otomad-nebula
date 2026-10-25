@@ -5,6 +5,7 @@
 - probe_media：解析 ffprobe 的 JSON，容忍只有视频 / 只有音频的文件；
 - extract_clip：用一条 ffmpeg 命令同时截取音画（-ss 放在 -i 前，
   音视频同源同偏移），输出无音轨 mp4（PE-AV 只需要画面）与 wav；
+  plan 兼容 ClipPlan 与 CoverageClip；media.clip_height 非空时视频预缩放；
   源文件无音轨时用 anullsrc 补等长静音；
 - mute_audio_clip / black_video_clip：为“静音 / 黑屏”消融实验生成等长素材；
 - clip_duration_report：抽查抽出的视频与音频时长是否一致（P0 音画同步自检）。
@@ -24,7 +25,7 @@ from pathlib import Path
 
 from .config import MediaConfig
 from .errors import MediaError
-from .sampling import ClipPlan
+from .sampling import ClipPlan, CoverageClip
 
 logger = logging.getLogger(__name__)
 
@@ -390,12 +391,22 @@ def _extract_command(
     if not has_audio:
         command += ["-f", "lavfi", "-i", f"anullsrc=r={rate}:cl={layout}"]
         audio_map = "1:a:0"
+    video_filters: list[str] = []
+    if media.clip_height:
+        height = int(media.clip_height)
+        if height < 2 or height % 2 != 0:
+            raise MediaError(
+                f"media.clip_height 必须是偶数（yuv420p 编码要求），实际 {media.clip_height!r}"
+            )
+        # 预缩放只影响视频切片；wav 仍从原文件解码，不受影响。
+        video_filters = ["-vf", f"scale=-2:{height}"]
     command += [
-        # 输出 1：无音轨 H.264/yuv420p 视频片段（画面尺寸保持）
+        # 输出 1：无音轨 H.264/yuv420p 视频片段（尺寸保持；clip_height 时预缩放）
         "-map",
         "0:v:0",
         "-t",
         f"{duration_s:.3f}",
+        *video_filters,
         "-c:v",
         "libx264",
         "-preset",
@@ -427,7 +438,7 @@ def _extract_command(
 
 def extract_clip(
     source: Path,
-    plan: ClipPlan,
+    plan: ClipPlan | CoverageClip,
     dst_dir: Path,
     *,
     media: MediaConfig,
@@ -435,8 +446,10 @@ def extract_clip(
 ) -> ExtractedClip:
     """按采样计划截取一个音画同步片段，输出无音轨 mp4 + wav 两个文件。
 
-    输出文件名固定为 clip_{index:02d}.mp4 与 clip_{index:02d}.wav。
-    mp4 只含视频轨（PE-AV 只从这里解码画面），wav 是模型需要的音频输入。
+    plan 可以是旧版 ClipPlan，也可以是 v0.4 全片覆盖的 CoverageClip（两者都有
+    index / start_s / duration_s）。输出文件名固定为 clip_{index:02d}.mp4 与
+    clip_{index:02d}.wav。mp4 只含视频轨（PE-AV 只从这里解码画面），wav 是模型
+    需要的音频输入。media.clip_height 非空时视频会在切片时预缩放到该高度。
     源文件没有音轨时，用 anullsrc 补等长静音 wav（是否补静音由
     probe_media 的 has_audio 决定），因此音频文件总是存在且可直接送模型。
 
@@ -454,8 +467,10 @@ def extract_clip(
     """
 
     src = Path(source)
-    if not isinstance(plan, ClipPlan):
-        raise MediaError(f"片段计划类型非法: {type(plan).__name__}（需要 ClipPlan）")
+    if not isinstance(plan, (ClipPlan, CoverageClip)):
+        raise MediaError(
+            f"片段计划类型非法: {type(plan).__name__}（需要 ClipPlan 或 CoverageClip）"
+        )
     if not src.is_file():
         raise MediaError(f"源视频不存在或不是普通文件: {src}")
     index = plan.index

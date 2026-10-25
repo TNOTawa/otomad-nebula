@@ -1766,6 +1766,7 @@ class Catalog:
         preprocess_s: float = 0.0,
         forward_s: float = 0.0,
         save_s: float = 0.0,
+        events_s: float = 0.0,
         total_s: float = 0.0,
     ) -> None:
         for name, value in (
@@ -1775,6 +1776,7 @@ class Catalog:
             ("preprocess_s", preprocess_s),
             ("forward_s", forward_s),
             ("save_s", save_s),
+            ("events_s", events_s),
             ("total_s", total_s),
         ):
             if not (float(value) >= 0.0):
@@ -1784,8 +1786,8 @@ class Catalog:
                 """
                 INSERT INTO work_timings (
                     run_id, work_id, embedding_version, download_s, probe_s, extract_s,
-                    preprocess_s, forward_s, save_s, total_s, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    preprocess_s, forward_s, save_s, events_s, total_s, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id, work_id) DO UPDATE SET
                     embedding_version = excluded.embedding_version,
                     download_s = excluded.download_s,
@@ -1794,6 +1796,7 @@ class Catalog:
                     preprocess_s = excluded.preprocess_s,
                     forward_s = excluded.forward_s,
                     save_s = excluded.save_s,
+                    events_s = excluded.events_s,
                     total_s = excluded.total_s,
                     created_at = excluded.created_at
                 """,
@@ -1807,6 +1810,7 @@ class Catalog:
                     float(preprocess_s),
                     float(forward_s),
                     float(save_s),
+                    float(events_s),
                     float(total_s),
                     now_utc_iso(),
                 ),

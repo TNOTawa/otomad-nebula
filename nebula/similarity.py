@@ -31,6 +31,7 @@ from typing import Any
 
 import numpy as np
 
+from . import representations
 from .config import Config
 from .db import Catalog
 from .errors import NebulaError
@@ -59,6 +60,13 @@ CLIP_KIND_LABELS: dict[str, str] = {
 
 DEFAULT_KIND = "work_joint"
 DEFAULT_CLIP_KIND = "clip_joint"
+
+#: 表征层向量 kind 与作品级模态的对应关系
+_REPRESENTATION_WORK_KINDS: dict[str, str] = {
+    "work_joint": "joint",
+    "work_audio": "audio",
+    "work_video": "video",
+}
 
 #: explain_pair 默认的片段相似度阈值
 DEFAULT_CLIP_THRESHOLD = 0.5
@@ -118,10 +126,36 @@ class SimilarityIndex:
         config: Config,
         *,
         version: str | None = None,
+        representation_id: int | None = None,
     ) -> None:
+        """构造近邻索引。
+
+        参数
+        ----
+        version:
+            无表征模式（representation_id=None）下的序列版本，默认 config.embedding_version。
+        representation_id:
+            v0.4 表征 id。给定时作品级向量来自 nebula.representations（legacy 表征内部
+            仍读 embeddings），片段级仍读该表征 sequence_version 的 clip_* 向量。
+        """
+
         self._config = config
-        self.version = str(version or config.embedding_version)
         self._closed = False
+        self.representation_id: int | None = (
+            None if representation_id is None else int(representation_id)
+        )
+        rep: dict[str, Any] | None = None
+        if self.representation_id is not None:
+            rep = catalog.get_representation(self.representation_id)
+            if rep is None:
+                raise NebulaError(f"表征不存在: {self.representation_id}")
+            self.representation_name: str | None = str(rep["name"])
+            self.sequence_version = str(rep["sequence_version"])
+            self.version = self.sequence_version
+        else:
+            self.representation_name = None
+            self.version = str(version or config.embedding_version)
+            self.sequence_version = self.version
 
         duplicate_ids = catalog.get_duplicate_work_ids()
         kind_ids: dict[str, list[int]] = {kind: [] for kind in KINDS}
@@ -145,6 +179,41 @@ class SimilarityIndex:
                 raw_count = row.get("n_clips")
                 clip_counts[kind][work_id] = None if raw_count is None else int(raw_count)
 
+        representation_matrices: dict[str, np.ndarray] = {}
+        if rep is not None:
+            # 作品级向量来自表征层；片段级仍来自 sequence version 的 clip_* 文件
+            kind_ids = {kind: [] for kind in KINDS}
+            kind_paths = {kind: {} for kind in KINDS}
+            kind_dims = {kind: {} for kind in KINDS}
+            for work_kind, rep_kind in _REPRESENTATION_WORK_KINDS.items():
+                try:
+                    vectors = representations.load_representation_vectors(
+                        catalog, config, rep, rep_kind
+                    )
+                except NebulaError as exc:
+                    raise NebulaError(
+                        f"读取表征 {self.representation_name} 的 {rep_kind} 向量失败: {exc}"
+                    ) from exc
+                if not vectors:
+                    continue
+                ids = tuple(sorted(vectors))
+                dims = {int(vector.shape[0]) for vector in vectors.values()}
+                if len(dims) > 1:
+                    raise NebulaError(
+                        f"表征 {self.representation_name} 的 {rep_kind} 向量维度不一致: {sorted(dims)}"
+                    )
+                try:
+                    matrix = _normalize_matrix(
+                        np.vstack([vectors[work_id] for work_id in ids]),
+                        where=f"表征 {self.representation_name}/{rep_kind}",
+                    )
+                except ValueError as exc:
+                    raise NebulaError(
+                        f"表征 {self.representation_name} 的 {rep_kind} 向量形状不一致: {exc}"
+                    ) from exc
+                kind_ids[work_kind] = list(ids)
+                representation_matrices[work_kind] = matrix
+
         self._kind_ids: dict[str, tuple[int, ...]] = {
             kind: tuple(sorted(work_ids)) for kind, work_ids in kind_ids.items() if work_ids
         }
@@ -165,15 +234,18 @@ class SimilarityIndex:
         self._clip_paths = clip_paths
         self._clip_dims = clip_dims
         self._clip_counts = clip_counts
-        #: work_id -> 片段元数据（来自 clips 表：idx/start_s/duration_s）
+        #: work_id -> 片段元数据（来自 clips 表：idx/start_s/duration_s/valid/weight）
         self._clip_times: dict[int, list[dict[str, Any]]] = {
-            work_id: catalog.get_clips(work_id, version=self.version)
+            work_id: catalog.get_clips(work_id, version=self.sequence_version)
             for work_id in self._work_ids
         }
 
         self._matrices: dict[str, np.ndarray] = {}
-        for kind in list(self._kind_ids):
-            self._matrices[kind] = self._load_kind(kind)
+        if rep is not None:
+            self._matrices = representation_matrices
+        else:
+            for kind in list(self._kind_ids):
+                self._matrices[kind] = self._load_kind(kind)
 
         #: 派生缓存：全库相似度矩阵、成对相似度排序数组、Top-k 集合、片段矩阵
         self._full_similarity_cache: dict[str, np.ndarray] = {}
@@ -182,8 +254,9 @@ class SimilarityIndex:
         self._clip_matrix_cache: dict[tuple[str, int], np.ndarray] = {}
 
         logger.info(
-            "近邻索引就绪: version=%s works=%d kinds=%s clip_kinds=%s",
-            self.version,
+            "近邻索引就绪: representation=%s sequence_version=%s works=%d kinds=%s clip_kinds=%s",
+            self.representation_name or "legacy(embeddings)",
+            self.sequence_version,
             len(self._work_ids),
             ",".join(self.available_kinds),
             ",".join(self.available_clip_kinds),
@@ -619,7 +692,10 @@ def load_similarity_index(
     config: Config,
     *,
     version: str | None = None,
+    representation_id: int | None = None,
 ) -> SimilarityIndex:
     """构造 SimilarityIndex（便捷函数，app 用 st.cache_resource 包一层）。"""
 
-    return SimilarityIndex(catalog, config, version=version)
+    return SimilarityIndex(
+        catalog, config, version=version, representation_id=representation_id
+    )

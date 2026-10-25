@@ -21,9 +21,14 @@ from nebula.similarity import (
 
 
 # --------------------------------------------------------------------------- 合成数据
-def _ensure_embedding_version(catalog: Catalog, config: Config) -> str:
+def _ensure_embedding_version(
+    catalog: Catalog,
+    config: Config,
+    version: str | None = None,
+) -> str:
+    target = version or config.embedding_version
     catalog.register_embedding_version(
-        config.embedding_version,
+        target,
         model_checkpoint=config.model.checkpoint,
         model_revision=config.model.revision,
         frames=config.model.frames,
@@ -32,7 +37,7 @@ def _ensure_embedding_version(catalog: Catalog, config: Config) -> str:
         audio_sample_rate=config.media.audio_sample_rate,
         params={},
     )
-    return config.embedding_version
+    return target
 
 
 def _unit(values) -> np.ndarray:
@@ -102,7 +107,7 @@ def _add_clip_vectors(
 ) -> None:
     """为一部作品登记片段级向量（堆叠 npy）与 clips 表起始时间。"""
 
-    target_version = version or config.embedding_version
+    target_version = _ensure_embedding_version(catalog, config, version)
     max_clips = 0
     for kind, matrix in matrices.items():
         array = np.asarray(matrix, dtype=np.float32)
@@ -638,5 +643,203 @@ def test_clip_registered_count_mismatch(config: Config, catalog: Catalog):
     try:
         with pytest.raises(NebulaError, match="片段数量与登记不一致"):
             index.clip_matrix(ids[1])
+    finally:
+        index.close()
+
+
+# --------------------------------------------------------------------------- v0.4 表征模式
+def _register_representation(
+    catalog: Catalog,
+    config: Config,
+    *,
+    work_vectors: dict[int, dict[str, np.ndarray]],
+    name: str = "full_mean_v1",
+    sequence_version: str = "full-seq-v1",
+    kind: str = "full_mean",
+) -> int:
+    from nebula import representations
+
+    _ensure_embedding_version(catalog, config, sequence_version)
+    rep_id = catalog.register_representation(
+        name,
+        sequence_version=sequence_version,
+        kind=kind,
+        params={"synthetic": True},
+    )
+    rep = catalog.get_representation(rep_id)
+    assert rep is not None
+    dims: set[int] = set()
+    for work_id, arrays in work_vectors.items():
+        saved = representations.save_representation_vectors(
+            catalog, config, rep, work_id, arrays
+        )
+        dims.update(int(item["dim"]) for item in saved.values())
+    catalog.set_representation_status(rep_id, "ready", dim=max(dims))
+    return rep_id
+
+
+def _seed_representation_case(config: Config, catalog: Catalog):
+    """3 部 legacy 作品 + full 序列片段向量 + 只覆盖前两部的派生表征。"""
+
+    joint_vectors = {
+        1: _unit([1.0, 0.0, 0.0, 0.0]),
+        2: _unit([0.6, 0.8, 0.0, 0.0]),
+        3: _unit([0.0, 1.0, 0.0, 0.0]),
+    }
+    ids = {
+        number: _add_work(
+            catalog, config, number, vectors={"work_joint": vector}, kinds=("work_joint",)
+        )
+        for number, vector in joint_vectors.items()
+    }
+    sequence_version = "full-seq-v1"
+    for work_id in ids.values():
+        clips = np.vstack(
+            [
+                _unit([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                _unit([0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+                _unit([1.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+            ]
+        ).astype(np.float32)
+        _add_clip_vectors(
+            catalog, config, work_id, version=sequence_version, matrices={"clip_joint": clips}
+        )
+    rep_id = _register_representation(
+        catalog,
+        config,
+        work_vectors={
+            ids[1]: {
+                "joint": _unit([0.0, 0.0, 1.0, 0.0]),
+                "audio": _unit([0.0, 1.0, 0.0, 0.0]),
+            },
+            ids[2]: {"joint": _unit([0.0, 0.0, 0.0, 1.0])},
+        },
+        sequence_version=sequence_version,
+    )
+    return ids, rep_id, sequence_version
+
+
+def test_representation_mode_uses_representation_vectors(config: Config, catalog: Catalog):
+    ids, rep_id, sequence_version = _seed_representation_case(config, catalog)
+    index = load_similarity_index(catalog, config, representation_id=rep_id)
+    try:
+        assert index.representation_name == "full_mean_v1"
+        assert index.sequence_version == sequence_version
+        assert index.work_ids == tuple(sorted([ids[1], ids[2]]))
+        assert index.available_kinds == ("work_joint", "work_audio")
+        # 作品级相似度来自 representation_vectors（而非 legacy embeddings）
+        assert index.similarity(ids[1], ids[2]) == pytest.approx(0.0, abs=1e-6)
+        assert index.matrix("work_audio").shape == (1, 4)
+        with pytest.raises(NebulaError):
+            index.neighbors(ids[1], kind="work_video")
+        # 片段级仍读 sequence version 的 clip_*（full coverage 片段数可不同于 legacy）
+        assert "clip_joint" in index.available_clip_kinds
+        assert index.clip_matrix(ids[1]).shape == (3, 6)
+        assert len(index.clip_times(ids[1])) == 3
+        assert index.has_clip_vector(ids[3], "clip_joint") is True
+    finally:
+        index.close()
+
+    legacy = load_similarity_index(catalog, config)
+    try:
+        assert set(legacy.work_ids) == {ids[1], ids[2], ids[3]}
+        assert legacy.version == config.legacy_embedding_version
+        # legacy 中 ids[1] 与 ids[2] 余弦为 0.6，与表征空间不同
+        assert legacy.similarity(ids[1], ids[2]) == pytest.approx(0.6, abs=1e-6)
+    finally:
+        legacy.close()
+
+
+def test_representation_mode_without_clip_vectors(config: Config, catalog: Catalog):
+    ids = {
+        number: _add_work(catalog, config, number, kinds=("work_joint",))
+        for number in (1, 2)
+    }
+    rep_id = _register_representation(
+        catalog,
+        config,
+        work_vectors={
+            ids[1]: {"joint": _unit([1.0, 0.0, 0.0])},
+            ids[2]: {"joint": _unit([0.0, 1.0, 0.0])},
+        },
+        name="temporal_stats_v1",
+        kind="temporal_stats",
+        sequence_version="full-seq-noclip",
+    )
+    index = load_similarity_index(catalog, config, representation_id=rep_id)
+    try:
+        assert index.representation_name == "temporal_stats_v1"
+        assert index.available_clip_kinds == ()
+        assert index.available_kinds == ("work_joint",)
+        with pytest.raises(NebulaError):
+            index.clip_matrix(ids[1])
+        with pytest.raises(NebulaError, match="没有 clip_joint 片段向量"):
+            index.best_clip_pairs(ids[1], ids[2])
+    finally:
+        index.close()
+
+
+def test_representation_mode_missing_representation(config: Config, catalog: Catalog):
+    with pytest.raises(NebulaError, match="表征不存在"):
+        load_similarity_index(catalog, config, representation_id=99999)
+
+
+def test_legacy_representation_id_matches_none_mode(config: Config, catalog: Catalog):
+    ids = _seed_axes_works(catalog, config)
+    legacy_id = catalog.ensure_legacy_representation(config.legacy_embedding_version)
+    rep_index = load_similarity_index(catalog, config, representation_id=legacy_id)
+    plain_index = load_similarity_index(catalog, config)
+    try:
+        assert rep_index.representation_name == "legacy_5clip_mean"
+        assert rep_index.work_ids == plain_index.work_ids
+        np.testing.assert_array_equal(
+            rep_index.matrix("work_joint"), plain_index.matrix("work_joint")
+        )
+        first, second = ids[1], ids[3]
+        assert rep_index.similarity(first, second) == pytest.approx(
+            plain_index.similarity(first, second), abs=1e-7
+        )
+        assert rep_index.available_clip_kinds == plain_index.available_clip_kinds
+    finally:
+        rep_index.close()
+        plain_index.close()
+
+
+def test_representation_mode_cache_reads_each_file_once(
+    config: Config, catalog: Catalog, monkeypatch
+):
+    ids = {
+        number: _add_work(catalog, config, number, kinds=("work_joint",))
+        for number in (1, 2)
+    }
+    rep_id = _register_representation(
+        catalog,
+        config,
+        work_vectors={
+            ids[1]: {
+                "joint": _unit([1.0, 0.0, 0.0, 0.0]),
+                "audio": _unit([0.0, 1.0, 0.0, 0.0]),
+            },
+            ids[2]: {"joint": _unit([0.0, 0.0, 1.0, 0.0])},
+        },
+    )
+    from nebula import representations
+
+    reads: list[str] = []
+    original = representations.load_vector
+
+    def counting_loader(path):
+        reads.append(str(path))
+        return original(path)
+
+    monkeypatch.setattr(representations, "load_vector", counting_loader)
+    index = load_similarity_index(catalog, config, representation_id=rep_id)
+    try:
+        assert len(reads) == 3  # joint×2 + audio×1
+        for _ in range(2):
+            index.matrix("work_joint")
+            index.matrix("work_audio")
+            index.neighbors(ids[1], kind="work_joint", k=1)
+        assert len(reads) == 3
     finally:
         index.close()

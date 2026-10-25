@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import importlib
 import json
 import shutil
 import subprocess
+import sys
+import types
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -23,44 +27,101 @@ def _copy_video(config: Config, source: Path, rel_path: str) -> Path:
     return target
 
 
-def _make_synth_video(path: Path, *, duration: int = 40, freq: int = 330) -> Path:
+def _make_synth_video(
+    path: Path, *, duration: int = 40, freq: int = 330, has_audio: bool = True
+) -> Path:
+    """用 ffmpeg 合成测试视频；has_audio=False 时生成无音轨视频。"""
+
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         pytest.skip("缺少 ffmpeg")
     path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            f"testsrc2=size=160x120:rate=10:duration={duration}",
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc2=size=160x120:rate=10:duration={duration}",
+    ]
+    if has_audio:
+        command += [
             "-f",
             "lavfi",
             "-i",
             f"sine=frequency={freq}:sample_rate=48000:duration={duration}",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-            str(path),
-        ],
-        check=True,
-        capture_output=True,
-    )
+        ]
+    command += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]
+    if has_audio:
+        command += ["-c:a", "aac", "-ar", "48000", "-ac", "2"]
+    command += [str(path)]
+    subprocess.run(command, check=True, capture_output=True)
     return path
+
+
+def _full_config(
+    config: Config,
+    *,
+    events: bool = False,
+    clip_height: int | None = None,
+    long_video_seconds: float | None = None,
+    batch_size: int | None = None,
+) -> Config:
+    """生成 full_coverage 测试配置：默认关闭 events（避免依赖 t3 的 nebula.events）。"""
+
+    media_fields: dict[str, object] = {}
+    if clip_height is not None:
+        media_fields["clip_height"] = clip_height
+    if long_video_seconds is not None:
+        media_fields["long_video_seconds"] = long_video_seconds
+    model = replace(config.model, batch_size=batch_size) if batch_size is not None else config.model
+    return replace(
+        config,
+        sampling=replace(config.sampling, mode="full_coverage"),
+        events=replace(config.events, enabled=events),
+        media=replace(config.media, **media_fields),
+        model=model,
+    )
+
+
+def _full_pipeline(
+    config: Config, catalog: Catalog, *, allow_long: bool = False, embedder=None
+) -> Pipeline:
+    return Pipeline(
+        config,
+        catalog=catalog,
+        embedder=embedder if embedder is not None else HashTestEmbedder(),
+        allow_test_embedder=True,
+        allow_long=allow_long,
+    )
+
+
+def _work_dir(config: Config, version: str, work_id: int) -> Path:
+    return config.paths.embeddings / version / f"{work_id:06d}"
+
+
+class _RecordingEmbedder(HashTestEmbedder):
+    """可注入失败、并统计编码片段对数量的测试嵌入器。
+
+    同一个类既用于“注入第 2 批失败”，也用于恢复阶段的计数，避免因
+    type(embedder).__name__ 不同导致同一 sequence version 的 params 冲突。
+    """
+
+    def __init__(self, *, fail_on_call: int | None = None) -> None:
+        super().__init__()
+        self.fail_on_call = fail_on_call
+        self.calls = 0
+        self.encoded_pairs = 0
+
+    def encode_pairs(self, pairs):
+        self.calls += 1
+        if self.fail_on_call is not None and self.calls == self.fail_on_call:
+            raise RuntimeError(f"注入：第 {self.calls} 批编码失败")
+        self.encoded_pairs += len(pairs)
+        return super().encode_pairs(pairs)
 
 
 def _open_catalog(config: Config) -> Catalog:
@@ -400,3 +461,497 @@ def test_process_pending_list_key_orders_and_limits(config, tmp_path):
         pipeline.close()
     finally:
         catalog.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v0.4 full_coverage 模式
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _manifest(config: Config, version: str, work_id: int) -> dict:
+    path = _work_dir(config, version, work_id) / "manifest.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_full_mode_12s_sequence_layout(config, sample_video):
+    _copy_video(config, sample_video, "full12.mp4")
+    cfg = _full_config(config)
+    catalog = _open_catalog(cfg)
+    try:
+        pipeline = _full_pipeline(cfg, catalog)
+        register_local_videos(catalog, cfg)
+        stats = pipeline.process_pending(source="local")
+        assert stats.completed == 1 and stats.failed == 0, [
+            o.message for o in stats.outcomes
+        ]
+        work = catalog.list_works()[0]
+        work_id = int(work["id"])
+        version = pipeline.embedding_version
+
+        # 版本命名：full 序列版本，clips_per_work=0，params 不混入事件字段
+        assert version == "test-hash-v1__f16_full8s_ov0_48k"
+        version_row = catalog.get_embedding_version(version)
+        assert version_row["clips_per_work"] == 0
+        params = json.loads(version_row["params_json"])
+        assert params["sampling_mode"] == "full_coverage"
+        assert params["full_coverage"] is True
+        assert params["overlap_seconds"] == 0.0
+        assert params["clip_height"] is None
+        assert "event_version" not in params
+        assert "events_enabled" not in params
+
+        # 片段：12s -> 2 个 8s 窗口，起点 0/4，末尾锚定 12
+        clips = catalog.get_clips(work_id, version=version)
+        assert len(clips) == 2
+        assert [c["idx"] for c in clips] == [0, 1]
+        assert [round(c["start_s"], 6) for c in clips] == [0.0, 4.0]
+        assert [round(c["duration_s"], 6) for c in clips] == [8.0, 8.0]
+        assert [round(c["valid_duration_s"], 6) for c in clips] == [8.0, 8.0]
+        assert sum(c["weight"] for c in clips) == pytest.approx(1.0, abs=1e-6)
+        assert all(c["weight"] == pytest.approx(0.5, abs=1e-6) for c in clips)
+
+        # 六种向量 kind 都登记；clip_* n_clips=2，work_* 为 None
+        kinds = {row["kind"]: row for row in catalog.list_embeddings(version)}
+        assert set(kinds) == {
+            "work_joint",
+            "work_audio",
+            "work_video",
+            "clip_joint",
+            "clip_audio",
+            "clip_video",
+        }
+        for kind in ("clip_joint", "clip_audio", "clip_video"):
+            assert kinds[kind]["n_clips"] == 2
+            array = load_vector(cfg.data_path(kinds[kind]["path"]))
+            assert array.shape == (2, 32)
+        for kind in ("work_joint", "work_audio", "work_video"):
+            assert kinds[kind]["n_clips"] is None
+            array = load_vector(cfg.data_path(kinds[kind]["path"]))
+            assert array.shape == (32,)
+            assert np.linalg.norm(array) == pytest.approx(1.0, abs=1e-5)
+
+        # clip_times.npy: (T,4) = start, duration, valid, weight
+        clip_times = load_vector(_work_dir(cfg, version, work_id) / "clip_times.npy")
+        assert clip_times.shape == (2, 4)
+        assert clip_times.dtype == np.float32
+        assert np.allclose(clip_times[:, 0], [0.0, 4.0])
+        assert np.allclose(clip_times[:, 1], [8.0, 8.0])
+        assert np.allclose(clip_times[:, 2], [8.0, 8.0])
+        assert float(clip_times[:, 3].sum()) == pytest.approx(1.0, abs=1e-6)
+
+        # manifest 与序列状态
+        manifest = _manifest(cfg, version, work_id)
+        assert manifest["n_clips"] == 2
+        assert manifest["duration_s"] == pytest.approx(12.0, abs=0.05)
+        assert manifest["sampling"]["mode"] == "full_coverage"
+        assert manifest["event_version"] == cfg.events.version
+        assert manifest["events_scanned"] is False
+        state = catalog.get_sequence_state(work_id, version=version)
+        assert state is not None
+        assert state["status"] == "assembled"
+        assert state["n_clips"] == 2 and state["n_clips_done"] == 2
+
+        # 完成后清理 .partial 与 temp
+        assert not (_work_dir(cfg, version, work_id) / ".partial").exists()
+        assert not (cfg.paths.temp / f"work_{work_id:06d}").exists()
+
+        # 幂等：已有向量 -> 跳过
+        stats2 = pipeline.process_pending(source="local")
+        assert stats2.selected == 0
+        pipeline.close()
+    finally:
+        catalog.close()
+
+
+def test_full_mode_40s_five_windows(config, tmp_path):
+    source = _make_synth_video(tmp_path / "full40.mp4", duration=40, freq=220)
+    _copy_video(config, source, "full40.mp4")
+    cfg = _full_config(config)
+    catalog = _open_catalog(cfg)
+    try:
+        pipeline = _full_pipeline(cfg, catalog)
+        register_local_videos(catalog, cfg)
+        stats = pipeline.process_pending(source="local")
+        assert stats.completed == 1, [o.message for o in stats.outcomes]
+        work = catalog.list_works()[0]
+        version = pipeline.embedding_version
+        clips = catalog.get_clips(int(work["id"]), version=version)
+        assert len(clips) == 5
+        assert [round(c["start_s"], 6) for c in clips] == [0.0, 8.0, 16.0, 24.0, 32.0]
+        assert all(c["duration_s"] == 8.0 for c in clips)
+        assert clips[-1]["start_s"] + clips[-1]["duration_s"] == pytest.approx(40.0, abs=1e-6)
+        assert sum(c["weight"] for c in clips) == pytest.approx(1.0, abs=1e-6)
+        clip_joint = load_vector(
+            cfg.data_path(
+                catalog.get_embedding(int(work["id"]), version=version, kind="clip_joint")["path"]
+            )
+        )
+        assert clip_joint.shape == (5, 32)
+        pipeline.close()
+    finally:
+        catalog.close()
+
+
+def test_full_mode_180s_23_windows(config, tmp_path):
+    source = _make_synth_video(tmp_path / "full180.mp4", duration=180, freq=330)
+    _copy_video(config, source, "full180.mp4")
+    cfg = _full_config(config)
+    catalog = _open_catalog(cfg)
+    try:
+        pipeline = _full_pipeline(cfg, catalog)
+        register_local_videos(catalog, cfg)
+        stats = pipeline.process_pending(source="local")
+        assert stats.completed == 1, [o.message for o in stats.outcomes]
+        work = catalog.list_works()[0]
+        work_id = int(work["id"])
+        version = pipeline.embedding_version
+        clips = catalog.get_clips(work_id, version=version)
+        assert len(clips) == 23
+        assert clips[-1]["start_s"] == pytest.approx(172.0, abs=1e-6)
+        assert clips[-1]["start_s"] + clips[-1]["duration_s"] == pytest.approx(180.0, abs=1e-3)
+        assert sum(c["weight"] for c in clips) == pytest.approx(1.0, abs=1e-6)
+        clip_joint = load_vector(
+            cfg.data_path(
+                catalog.get_embedding(work_id, version=version, kind="clip_joint")["path"]
+            )
+        )
+        assert clip_joint.shape == (23, 32)
+        clip_times = load_vector(_work_dir(cfg, version, work_id) / "clip_times.npy")
+        assert clip_times.shape == (23, 4)
+        assert float(clip_times[:, 3].sum()) == pytest.approx(1.0, abs=1e-6)
+        state = catalog.get_sequence_state(work_id, version=version)
+        assert state["status"] == "assembled" and state["n_clips_done"] == 23
+        assert not (_work_dir(cfg, version, work_id) / ".partial").exists()
+        pipeline.close()
+    finally:
+        catalog.close()
+
+
+def test_full_mode_no_audio_video(config, tmp_path):
+    source = _make_synth_video(tmp_path / "silent12.mp4", duration=12, has_audio=False)
+    _copy_video(config, source, "silent12.mp4")
+    cfg = _full_config(config)
+    catalog = _open_catalog(cfg)
+    try:
+        pipeline = _full_pipeline(cfg, catalog)
+        register_local_videos(catalog, cfg)
+        stats = pipeline.process_pending(source="local")
+        assert stats.completed == 1, [o.message for o in stats.outcomes]
+        work = catalog.list_works()[0]
+        assert work["has_audio"] == 0
+        version = pipeline.embedding_version
+        assert len(catalog.get_clips(int(work["id"]), version=version)) == 2
+        kinds = {row["kind"] for row in catalog.list_embeddings(version)}
+        assert "clip_audio" in kinds and "work_audio" in kinds
+        pipeline.close()
+    finally:
+        catalog.close()
+
+
+def test_full_mode_clip_height_changes_version_and_manifest(config, sample_video):
+    _copy_video(config, sample_video, "h336.mp4")
+    cfg = _full_config(config, clip_height=336)
+    catalog = _open_catalog(cfg)
+    try:
+        pipeline = _full_pipeline(cfg, catalog)
+        register_local_videos(catalog, cfg)
+        stats = pipeline.process_pending(source="local")
+        assert stats.completed == 1, [o.message for o in stats.outcomes]
+        assert pipeline.embedding_version.endswith("__f16_full8s_ov0_48k_h336")
+        work = catalog.list_works()[0]
+        manifest = _manifest(cfg, pipeline.embedding_version, int(work["id"]))
+        assert manifest["clip_height"] == 336
+        assert cfg.full_sequence_version.endswith("_h336")
+        pipeline.close()
+    finally:
+        catalog.close()
+
+
+def test_full_mode_rejects_long_video_without_allow_long(config, sample_video):
+    _copy_video(config, sample_video, "longish.mp4")
+    cfg = _full_config(config, long_video_seconds=10.0)
+    catalog = _open_catalog(cfg)
+    try:
+        pipeline = _full_pipeline(cfg, catalog)
+        register_local_videos(catalog, cfg)
+        stats = pipeline.process_pending(source="local")
+        assert stats.failed == 1 and stats.completed == 0
+        failure = stats.outcomes[0]
+        assert "long_video_seconds" in (failure.message or "")
+        assert "--allow-long" in (failure.message or "")
+        work = catalog.list_works()[0]
+        assert work["status"] == "failed"
+        # 显式允许后可以处理
+        pipeline_allowed = _full_pipeline(cfg, catalog, allow_long=True)
+        stats_allowed = pipeline_allowed.process_pending(source="local")
+        assert stats_allowed.completed == 1, [o.message for o in stats_allowed.outcomes]
+        version = pipeline_allowed.embedding_version
+        assert len(catalog.get_clips(int(work["id"]), version=version)) == 2
+        pipeline_allowed.close()
+    finally:
+        catalog.close()
+
+
+def test_full_mode_resumes_missing_batches_after_failure(config, tmp_path):
+    source = _make_synth_video(tmp_path / "resume40.mp4", duration=40, freq=300)
+    _copy_video(config, source, "resume40.mp4")
+    cfg = _full_config(config, batch_size=3)
+    catalog = _open_catalog(cfg)
+    try:
+        pipeline = _full_pipeline(cfg, catalog, embedder=_RecordingEmbedder(fail_on_call=2))
+        register_local_videos(catalog, cfg)
+        stats = pipeline.process_pending(source="local")
+        assert stats.failed == 1, [o.message for o in stats.outcomes]
+        work = catalog.list_works()[0]
+        work_id = int(work["id"])
+        version = pipeline.embedding_version
+        partial = _work_dir(cfg, version, work_id) / ".partial"
+        assert partial.is_dir()
+        assert (partial / "plan.json").is_file()
+        assert (partial / "batch_0000.npz").is_file()
+        assert not (partial / "batch_0001.npz").exists()
+        assert not (_work_dir(cfg, version, work_id) / "clip_joint.npy").exists()
+        assert not catalog.has_embedding(work_id, version=version)
+        assert (cfg.paths.temp / f"work_{work_id:06d}").is_dir()
+        state = catalog.get_sequence_state(work_id, version=version)
+        assert state["status"] == "failed"
+        assert state["n_clips"] == 5 and state["n_clips_done"] == 3
+
+        # 恢复：只编码缺失的第 2 批（2 个片段）
+        counting = _RecordingEmbedder()
+        pipeline_resume = _full_pipeline(cfg, catalog, embedder=counting)
+        stats2 = pipeline_resume.process_pending(source="local")
+        assert stats2.completed == 1, [o.message for o in stats2.outcomes]
+        assert counting.encoded_pairs == 2
+        clips = catalog.get_clips(work_id, version=version)
+        assert len(clips) == 5
+        assert not partial.exists()
+        assert not (cfg.paths.temp / f"work_{work_id:06d}").exists()
+        state = catalog.get_sequence_state(work_id, version=version)
+        assert state["status"] == "assembled" and state["n_clips_done"] == 5
+        clip_times = load_vector(_work_dir(cfg, version, work_id) / "clip_times.npy")
+        assert clip_times.shape == (5, 4)
+        pipeline_resume.close()
+    finally:
+        catalog.close()
+
+
+def test_full_mode_discards_partial_when_plan_changes(config, tmp_path):
+    source = _make_synth_video(tmp_path / "mismatch40.mp4", duration=40, freq=360)
+    _copy_video(config, source, "mismatch40.mp4")
+    cfg = _full_config(config, batch_size=3)
+    catalog = _open_catalog(cfg)
+    try:
+        pipeline = _full_pipeline(cfg, catalog, embedder=_RecordingEmbedder(fail_on_call=2))
+        register_local_videos(catalog, cfg)
+        stats = pipeline.process_pending(source="local")
+        assert stats.failed == 1
+        work = catalog.list_works()[0]
+        work_id = int(work["id"])
+        version = pipeline.embedding_version
+        plan_path = _work_dir(cfg, version, work_id) / ".partial" / "plan.json"
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        payload["plans"][0]["start_s"] = 0.5  # 伪造与当前采样不一致的旧计划
+        plan_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        counting = _RecordingEmbedder()
+        pipeline_retry = _full_pipeline(cfg, catalog, embedder=counting)
+        stats2 = pipeline_retry.process_pending(source="local")
+        assert stats2.completed == 1, [o.message for o in stats2.outcomes]
+        # partial 被丢弃 -> 全部 5 个片段的重新编码
+        assert counting.encoded_pairs == 5
+        assert not (_work_dir(cfg, version, work_id) / ".partial").exists()
+        pipeline_retry.close()
+    finally:
+        catalog.close()
+
+
+def test_full_mode_events_integration_records_events_s(config, sample_video, monkeypatch):
+    calls: dict[str, list] = {"scan": [], "save": []}
+    fake_module = types.ModuleType("nebula.events")
+
+    class _FakeFeatures:
+        version = "events_v1"
+
+    def fake_scan(source, plans, *, ffmpeg="ffmpeg", audio_rate_hz=100, video_fps=30, timeout_s=600.0):
+        calls["scan"].append(
+            {
+                "source": Path(source),
+                "plans": list(plans),
+                "ffmpeg": ffmpeg,
+                "audio_rate_hz": audio_rate_hz,
+                "video_fps": video_fps,
+                "timeout_s": timeout_s,
+            }
+        )
+        return _FakeFeatures()
+
+    def fake_save(work_dir, features):
+        calls["save"].append({"work_dir": Path(work_dir), "features": features})
+        target = Path(work_dir) / "event_scan.npz"
+        target.write_bytes(b"fake-event-scan")
+        (Path(work_dir) / "event_features.npy").write_bytes(b"fake-event-features")
+
+    fake_module.scan_events = fake_scan
+    fake_module.save_events_bundle = fake_save
+    monkeypatch.setitem(sys.modules, "nebula.events", fake_module)
+
+    _copy_video(config, sample_video, "events12.mp4")
+    cfg = _full_config(config, events=True)
+    catalog = _open_catalog(cfg)
+    try:
+        pipeline = _full_pipeline(cfg, catalog)
+        register_local_videos(catalog, cfg)
+        stats = pipeline.process_pending(source="local")
+        assert stats.completed == 1, [o.message for o in stats.outcomes]
+        work = catalog.list_works()[0]
+        work_id = int(work["id"])
+        version = pipeline.embedding_version
+        assert len(calls["scan"]) == 1
+        scan_call = calls["scan"][0]
+        assert len(scan_call["plans"]) == 2
+        assert scan_call["audio_rate_hz"] == cfg.events.audio_rate_hz
+        assert scan_call["video_fps"] == cfg.events.video_fps
+        assert scan_call["ffmpeg"] == cfg.media.ffmpeg
+        assert sum(p.weight for p in scan_call["plans"]) == pytest.approx(1.0, abs=1e-6)
+        assert len(calls["save"]) == 1
+        assert calls["save"][0]["work_dir"] == _work_dir(cfg, version, work_id)
+        work_dir = _work_dir(cfg, version, work_id)
+        assert (work_dir / "event_scan.npz").is_file()
+        manifest = _manifest(cfg, version, work_id)
+        assert manifest["events_scanned"] is True
+        runs = catalog.list_pipeline_runs()
+        timings = catalog.list_work_timings(run_id=runs[0]["id"])
+        assert len(timings) == 1
+        assert timings[0]["events_s"] >= 0.0
+        pipeline.close()
+    finally:
+        catalog.close()
+
+
+def test_full_mode_bilibili_reuses_existing_download(config, sample_video, monkeypatch):
+    cfg = _full_config(config)
+    catalog = _open_catalog(cfg)
+    try:
+        work_id, _created = catalog.upsert_bilibili_work(
+            "BV1xx411c7m1", title="复用下载测试", duration_s=12.0
+        )
+        download_dir = cfg.paths.temp / f"work_{work_id:06d}" / "download"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(sample_video, download_dir / "cached_source.mp4")
+
+        def _no_network(*args, **kwargs):
+            raise AssertionError("已有可复用下载时不应创建 BilibiliClient")
+
+        monkeypatch.setattr("nebula.download.BilibiliClient", _no_network)
+        pipeline = _full_pipeline(cfg, catalog)
+        stats = pipeline.process_pending(source="bilibili")
+        assert stats.completed == 1, [o.message for o in stats.outcomes]
+        assert catalog.get_work(work_id)["status"] == "completed"
+        version = pipeline.embedding_version
+        assert len(catalog.get_clips(work_id, version=version)) == 2
+        assert not (cfg.paths.temp / f"work_{work_id:06d}").exists()
+        pipeline.close()
+    finally:
+        catalog.close()
+
+
+def test_legacy_mode_regression_columns_and_version(config, sample_video):
+    _copy_video(config, sample_video, "legacy12.mp4")
+    catalog = _open_catalog(config)
+    try:
+        pipeline = _pipeline(config, catalog)
+        register_local_videos(catalog, config)
+        stats = pipeline.process_pending(source="local")
+        assert stats.completed == 1
+        work = catalog.list_works()[0]
+        version = pipeline.embedding_version
+        assert version.endswith("__f16_clip8s_x5_48k")
+        version_row = catalog.get_embedding_version(version)
+        assert version_row["clips_per_work"] == 5
+        clips = catalog.get_clips(int(work["id"]), version=version)
+        assert len(clips) == 1
+        # legacy 行为：valid_duration_s / weight 保持 NULL
+        assert clips[0]["valid_duration_s"] is None
+        assert clips[0]["weight"] is None
+        assert not (_work_dir(config, version, int(work["id"])) / ".partial").exists()
+        pipeline.close()
+    finally:
+        catalog.close()
+
+
+def test_invalid_sampling_mode_raises(config):
+    catalog = _open_catalog(config)
+    try:
+        with pytest.raises(PipelineError, match="采样模式"):
+            Pipeline(
+                config,
+                catalog=catalog,
+                embedder=HashTestEmbedder(),
+                allow_test_embedder=True,
+                sampling_mode="nope",
+            )
+    finally:
+        catalog.close()
+
+
+def test_full_mode_retry_is_deterministic(config, sample_video):
+    """full 模式重新编码同一作品：向量与 clip_times 必须逐元素一致。"""
+
+    _copy_video(config, sample_video, "det12.mp4")
+    cfg = _full_config(config)
+    catalog = _open_catalog(cfg)
+    try:
+        pipeline = _full_pipeline(cfg, catalog)
+        register_local_videos(catalog, cfg)
+        stats = pipeline.process_pending(source="local")
+        assert stats.completed == 1
+        work = catalog.list_works()[0]
+        work_id = int(work["id"])
+        version = pipeline.embedding_version
+        before = load_vector(
+            cfg.data_path(
+                catalog.get_embedding(work_id, version=version, kind="clip_joint")["path"]
+            )
+        )
+        times_before = load_vector(_work_dir(cfg, version, work_id) / "clip_times.npy")
+
+        retried = pipeline.retry_works([work_id])
+        assert retried.completed == 1, [o.message for o in retried.outcomes]
+        after = load_vector(
+            cfg.data_path(
+                catalog.get_embedding(work_id, version=version, kind="clip_joint")["path"]
+            )
+        )
+        times_after = load_vector(_work_dir(cfg, version, work_id) / "clip_times.npy")
+
+        assert np.array_equal(before, after)
+        assert np.array_equal(times_before, times_after)
+        state = catalog.get_sequence_state(work_id, version=version)
+        assert state["status"] == "assembled" and state["n_clips_done"] == 2
+        pipeline.close()
+    finally:
+        catalog.close()
+
+
+def test_cli_run_options_parse():
+    cli = importlib.import_module("pipeline")
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "process-local",
+            "--sampling",
+            "full_coverage",
+            "--clip-height",
+            "336",
+            "--allow-long",
+        ]
+    )
+    assert args.sampling == "full_coverage"
+    assert args.clip_height == 336
+    assert args.allow_long is True
+    default_args = parser.parse_args(["run-pending"])
+    assert default_args.sampling is None
+    assert default_args.clip_height is None
+    assert default_args.allow_long is False
+

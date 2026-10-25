@@ -12,6 +12,10 @@
   python pipeline.py clean-temp           清理失败残留的临时目录
 
 全局选项 --config 可指定配置文件；默认使用项目根目录 config.yaml。
+v0.4 采样选项（process-local / run-pending / retry 均可用）：
+  --sampling {legacy,full_coverage}  覆盖 config.sampling.mode
+  --clip-height H                    切片时把视频缩放到高度 H（如 336，生成 _h336 序列版本）
+  --allow-long                       full_coverage 下允许处理超过 media.long_video_seconds 的超长视频
 """
 
 from __future__ import annotations
@@ -19,10 +23,33 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 
 from nebula.config import load_config
 from nebula.errors import NebulaError
 from nebula.log import configure_logging
+
+
+def _add_run_options(parser: argparse.ArgumentParser) -> None:
+    """给跑批子命令添加 v0.4 采样/切片/超长视频选项。"""
+
+    parser.add_argument(
+        "--sampling",
+        choices=["legacy", "full_coverage"],
+        default=None,
+        help="覆盖 config.sampling.mode：legacy=旧 5 片段；full_coverage=全片覆盖",
+    )
+    parser.add_argument(
+        "--clip-height",
+        type=int,
+        default=None,
+        help="切片时把视频缩放到该高度（如 336，生成 _h336 序列版本）；默认用配置值",
+    )
+    parser.add_argument(
+        "--allow-long",
+        action="store_true",
+        help="full_coverage 下允许处理超过 media.long_video_seconds 的超长视频",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     local.add_argument(
         "--test-embedder", action="store_true", help="使用测试用 HashTestEmbedder（仅调试）"
     )
+    _add_run_options(local)
 
     pending = sub.add_parser("run-pending", help="继续处理 pending/failed 作品")
     pending.add_argument("--limit", type=int, default=None, help="最多处理多少部")
@@ -61,12 +89,14 @@ def build_parser() -> argparse.ArgumentParser:
     pending.add_argument(
         "--test-embedder", action="store_true", help="使用测试用 HashTestEmbedder（仅调试）"
     )
+    _add_run_options(pending)
 
     retry = sub.add_parser("retry", help="重试指定作品（可一次多个 work_id）")
     retry.add_argument("work_ids", nargs="+", type=int, help="作品内部 ID")
     retry.add_argument(
         "--test-embedder", action="store_true", help="使用测试用 HashTestEmbedder（仅调试）"
     )
+    _add_run_options(retry)
 
     ablate = sub.add_parser("ablate", help="P0 消融实验：静音/遮蔽画面后联合向量是否变化")
     ablate.add_argument("--limit", type=int, default=3, help="抽查作品数")
@@ -86,14 +116,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _make_pipeline(config, *, test_embedder: bool):
+def _make_pipeline(
+    config,
+    *,
+    test_embedder: bool,
+    sampling_mode: str | None = None,
+    clip_height: int | None = None,
+    allow_long: bool = False,
+):
+    """构造 Pipeline；--clip-height 通过替换 frozen config.media 实现。"""
+
     from nebula.pipeline import Pipeline
 
+    if clip_height is not None:
+        if clip_height < 2 or clip_height % 2 != 0:
+            raise NebulaError(f"--clip-height 必须是 >=2 的偶数，实际 {clip_height}")
+        config = replace(config, media=replace(config.media, clip_height=int(clip_height)))
     if test_embedder:
         from nebula.embed import HashTestEmbedder
 
-        return Pipeline(config, embedder=HashTestEmbedder(), allow_test_embedder=True)
-    return Pipeline(config)
+        return Pipeline(
+            config,
+            embedder=HashTestEmbedder(),
+            allow_test_embedder=True,
+            sampling_mode=sampling_mode,
+            allow_long=allow_long,
+        )
+    return Pipeline(config, sampling_mode=sampling_mode, allow_long=allow_long)
 
 
 def _print_failures(stats) -> None:
@@ -118,9 +167,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "process-local":
             from nebula.ingest import register_local_videos
 
-            with _make_pipeline(config, test_embedder=args.test_embedder) as pipeline:
+            with _make_pipeline(
+                config,
+                test_embedder=args.test_embedder,
+                sampling_mode=args.sampling,
+                clip_height=args.clip_height,
+                allow_long=args.allow_long,
+            ) as pipeline:
                 if pipeline.embedder.is_test_only:
                     print("警告：使用测试用嵌入器，生成的向量不能用于真实观察", file=sys.stderr)
+                print(
+                    f"采样模式: {pipeline.sampling_mode}；序列版本: {pipeline.embedding_version}"
+                )
                 summary = register_local_videos(pipeline.catalog, config)
                 print(
                     f"本地扫描: {summary.files} 个视频（新登记 {summary.created}，已存在 {summary.existing}）"
@@ -142,9 +200,18 @@ def main(argv: list[str] | None = None) -> int:
                 return 0 if stats.failed == 0 else 1
 
         if args.command == "run-pending":
-            with _make_pipeline(config, test_embedder=args.test_embedder) as pipeline:
+            with _make_pipeline(
+                config,
+                test_embedder=args.test_embedder,
+                sampling_mode=args.sampling,
+                clip_height=args.clip_height,
+                allow_long=args.allow_long,
+            ) as pipeline:
                 if pipeline.embedder.is_test_only:
                     print("警告：使用测试用嵌入器，生成的向量不能用于真实观察", file=sys.stderr)
+                print(
+                    f"采样模式: {pipeline.sampling_mode}；序列版本: {pipeline.embedding_version}"
+                )
                 stats = pipeline.process_pending(
                     source=None if args.source == "all" else args.source,
                     limit=args.limit,
@@ -157,7 +224,16 @@ def main(argv: list[str] | None = None) -> int:
                 return 0 if stats.failed == 0 else 1
 
         if args.command == "retry":
-            with _make_pipeline(config, test_embedder=args.test_embedder) as pipeline:
+            with _make_pipeline(
+                config,
+                test_embedder=args.test_embedder,
+                sampling_mode=args.sampling,
+                clip_height=args.clip_height,
+                allow_long=args.allow_long,
+            ) as pipeline:
+                print(
+                    f"采样模式: {pipeline.sampling_mode}；序列版本: {pipeline.embedding_version}"
+                )
                 stats = pipeline.retry_works(args.work_ids)
                 print(stats.summary())
                 _print_failures(stats)
@@ -201,14 +277,16 @@ def main(argv: list[str] | None = None) -> int:
                     rows = catalog.list_work_timings(run_id=run_id)
                     print(f"\nrun_id={run_id} 单部分阶段耗时（{len(rows)} 行）:")
                     print(
-                        "work_id  total_s  download   probe  extract  preprocess  forward  save"
+                        "work_id  total_s  download   probe  extract  preprocess  forward"
+                        "  events    save"
                     )
                     for row in rows:
                         print(
                             f"{row['work_id']:>7}  {row['total_s']:>7.2f}  "
                             f"{row['download_s']:>8.2f}  {row['probe_s']:>6.2f}  "
                             f"{row['extract_s']:>7.2f}  {row['preprocess_s']:>10.2f}  "
-                            f"{row['forward_s']:>7.2f}  {row['save_s']:>4.2f}"
+                            f"{row['forward_s']:>7.2f}  {row['events_s']:>7.2f}  "
+                            f"{row['save_s']:>4.2f}"
                         )
                 return 0
             finally:

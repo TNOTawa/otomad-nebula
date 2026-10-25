@@ -637,3 +637,265 @@ def test_cli_filter_error_returns_nonzero(config: Config, catalog: Catalog, caps
     captured = capsys.readouterr()
     assert "错误" in captured.err
     assert "筛选后作品数量不足" in captured.err
+
+
+# --------------------------------------------------------------------------- v0.4 表征空间
+def _register_derived_representation(
+    catalog: Catalog,
+    config: Config,
+    *,
+    name: str = "full_mean_v1",
+    sequence_version: str = "full-seq-v1",
+    kind: str = "full_mean",
+    work_ids: list[int],
+    seed: int = 11,
+    dim: int = 8,
+) -> int:
+    """登记一个 synthetic 派生表征（joint 向量），返回 representation_id。"""
+
+    from nebula import representations
+
+    _ensure_embedding_version(catalog, config, sequence_version)
+    rep_id = catalog.register_representation(
+        name,
+        sequence_version=sequence_version,
+        kind=kind,
+        params={"synthetic": True, "dim": dim},
+    )
+    rep = catalog.get_representation(rep_id)
+    assert rep is not None
+    rng = np.random.default_rng(seed)
+    for work_id in work_ids:
+        vector = rng.normal(size=dim).astype(np.float32)
+        vector = (vector / np.linalg.norm(vector)).astype(np.float32)
+        representations.save_representation_vectors(
+            catalog, config, rep, work_id, {"joint": vector}
+        )
+    catalog.set_representation_status(rep_id, "ready", dim=dim)
+    return rep_id
+
+
+def test_build_map_representation_and_isolation(config: Config, catalog: Catalog):
+    from nebula import representations
+
+    groups = _seed_mixed_works(catalog, config)
+    derived_ids = groups["all"][:5]
+    rep_id = _register_derived_representation(
+        catalog, config, work_ids=derived_ids, seed=3
+    )
+
+    derived = build_map(
+        catalog,
+        config,
+        representation=representations.FULL_MEAN_V1,
+        sequence_version="full-seq-v1",
+        note="full mean 地图",
+    )
+    assert derived.representation_id == rep_id
+    assert derived.representation_name == representations.FULL_MEAN_V1
+    assert derived.embedding_version == "full-seq-v1"
+    assert derived.n_works == len(derived_ids)
+    derived_frame = _read_coords(derived)
+    assert set(derived_frame["work_id"].tolist()) == set(derived_ids)
+
+    map_row = catalog.get_map(derived.version)
+    assert map_row["representation_id"] == rep_id
+    assert map_row["embedding_version"] == "full-seq-v1"
+    params = json.loads(map_row["params_json"])
+    assert params["representation"]["name"] == representations.FULL_MEAN_V1
+    assert params["representation"]["id"] == rep_id
+    meta = json.loads((derived.coords_path.parent / "meta.json").read_text(encoding="utf-8"))
+    assert meta["representation"]["name"] == representations.FULL_MEAN_V1
+    assert meta["representation"]["sequence_version"] == "full-seq-v1"
+
+    # 旧行为：不指定表征时按当前 sampling.mode（默认 legacy）建图，且使用旧序列版本
+    legacy = build_map(catalog, config, note="legacy 地图")
+    assert legacy.embedding_version == config.legacy_embedding_version
+    assert legacy.representation_id is not None
+    assert legacy.representation_id != rep_id
+    legacy_frame = _read_coords(legacy)
+    assert set(legacy_frame["work_id"].tolist()) == set(groups["all"])
+    assert legacy_frame["work_id"].tolist() != derived_frame["work_id"].tolist()
+
+    # 数据库层表征过滤：不同表征的地图互不混淆
+    assert [row["version"] for row in catalog.list_maps(representation_id=rep_id)] == [
+        derived.version
+    ]
+    latest = catalog.latest_map(representation_id=rep_id)
+    assert latest is not None and latest["version"] == derived.version
+
+
+def test_build_map_representation_filter_spec(config: Config, catalog: Catalog):
+    from nebula import representations
+
+    groups = _seed_mixed_works(catalog, config)
+    rep_id = _register_derived_representation(
+        catalog, config, work_ids=groups["all"], seed=9
+    )
+    result = build_map(
+        catalog,
+        config,
+        representation=representations.FULL_MEAN_V1,
+        sequence_version="full-seq-v1",
+        filter_spec={"dataset": "bilibili"},
+    )
+    frame = _read_coords(result)
+    assert set(frame["work_id"].tolist()) == set(groups["bilibili"])
+    assert result.n_works == len(groups["bilibili"])
+    map_row = catalog.get_map(result.version)
+    assert json.loads(map_row["filter_json"]) == {"dataset": "bilibili"}
+    assert map_row["representation_id"] == rep_id
+
+    # 派生表征默认排除 duplicate，include_duplicates 明确不支持
+    with pytest.raises(MapError, match="include_duplicates"):
+        build_map(
+            catalog,
+            config,
+            representation=representations.FULL_MEAN_V1,
+            sequence_version="full-seq-v1",
+            filter_spec={"include_duplicates": True},
+        )
+
+
+def test_build_map_unknown_representation_raises(config: Config, catalog: Catalog):
+    _seed_mixed_works(catalog, config)
+    from nebula import representations
+
+    with pytest.raises(MapError, match="无法解析表征"):
+        build_map(
+            catalog,
+            config,
+            representation=representations.TEMPORAL_STATS_V1,
+            sequence_version="full-seq-v1",
+        )
+    with pytest.raises(MapError, match="表征不存在"):
+        build_map(catalog, config, representation_id=99999)
+
+
+def test_build_map_variants_representation(config: Config, catalog: Catalog):
+    from nebula import representations
+
+    groups = _seed_mixed_works(catalog, config)
+    rep_id = _register_derived_representation(
+        catalog, config, work_ids=groups["all"], seed=5
+    )
+    results = build_map_variants(
+        catalog,
+        config,
+        n_neighbors_list=(3, 5),
+        representation=representations.FULL_MEAN_V1,
+        sequence_version="full-seq-v1",
+    )
+    assert len(results) == 2
+    for result in results:
+        assert result.representation_id == rep_id
+        map_row = catalog.get_map(result.version)
+        assert map_row["representation_id"] == rep_id
+        params = json.loads(map_row["params_json"])
+        assert params["representation"]["name"] == representations.FULL_MEAN_V1
+    assert [
+        json.loads(catalog.get_map(result.version)["params_json"])["n_neighbors"]
+        for result in results
+    ] == [3, 5]
+
+
+def test_transform_new_representation(config: Config, catalog: Catalog):
+    from nebula import representations
+
+    groups = _seed_mixed_works(catalog, config)
+    rep_id = _register_derived_representation(
+        catalog, config, work_ids=groups["all"][:5], seed=7
+    )
+    result = build_map(
+        catalog,
+        config,
+        representation=representations.FULL_MEAN_V1,
+        sequence_version="full-seq-v1",
+    )
+    old_frame = _read_coords(result).set_index("work_id")
+
+    new_work_id = _add_work(catalog, config, 50, source="local")
+    rep = catalog.get_representation(rep_id)
+    assert rep is not None
+    representations.save_representation_vectors(
+        catalog,
+        config,
+        rep,
+        new_work_id,
+        {"joint": np.asarray([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)},
+    )
+    added = transform_new(catalog, config, map_version=result.version)
+    assert added == 1
+    new_frame = _read_coords(result).set_index("work_id")
+    assert new_work_id in new_frame.index
+    for work_id in old_frame.index:
+        for column in ("x2", "y2", "x3", "y3", "z3"):
+            assert new_frame.loc[work_id, column] == old_frame.loc[work_id, column]
+    map_row = catalog.get_map(result.version)
+    assert map_row["representation_id"] == rep_id
+    assert catalog.get_representation(rep_id)["id"] == rep_id
+
+
+def test_cli_representation_build_and_list(config: Config, catalog: Catalog, capsys):
+    from nebula import representations
+
+    groups = _seed_mixed_works(catalog, config)
+    rep_id = _register_derived_representation(
+        catalog, config, work_ids=groups["all"], seed=13
+    )
+    code = main(
+        [
+            "build",
+            "--config",
+            str(config.path),
+            "--representation",
+            "full_mean_v1",
+            "--sequence-version",
+            "full-seq-v1",
+            "--note",
+            "表征 CLI",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert representations.REPRESENTATION_LABELS[representations.FULL_MEAN_V1] in out
+    map_row = catalog.latest_map(representation_id=rep_id)
+    assert map_row is not None
+    assert map_row["embedding_version"] == "full-seq-v1"
+
+    assert main(["list", "--config", str(config.path)]) == 0
+    out = capsys.readouterr().out
+    assert representations.REPRESENTATION_LABELS[representations.FULL_MEAN_V1] in out
+    assert "全片平均" in out
+
+    assert main(["variants", "--config", str(config.path), "--representation", "full_mean_v1",
+                 "--sequence-version", "full-seq-v1", "--n-neighbors", "3"]) == 0
+    out = capsys.readouterr().out
+    assert "星云变体" in out
+
+    assert main(["build", "--config", str(config.path), "--representation", "not_a_rep"]) == 1
+    captured = capsys.readouterr()
+    assert "错误" in captured.err
+    assert "无法解析表征" in captured.err
+
+
+def test_cli_legacy_embedding_version_alias(config: Config, catalog: Catalog, capsys):
+    groups = _seed_mixed_works(catalog, config)
+    code = main(
+        [
+            "build",
+            "--config",
+            str(config.path),
+            "--embedding-version",
+            config.legacy_embedding_version,
+        ]
+    )
+    assert code == 0
+    capsys.readouterr()
+    map_row = catalog.latest_map()
+    assert map_row is not None
+    assert map_row["embedding_version"] == config.legacy_embedding_version
+    rep = catalog.get_representation(int(map_row["representation_id"]))
+    assert rep is not None
+    assert rep["name"] == "legacy_5clip_mean"
+    assert len(groups["all"]) == 8

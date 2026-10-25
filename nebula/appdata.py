@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,9 +23,10 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pandas as pd
 
+from . import representations
 from .config import Config
 from .db import Catalog
-from .errors import MapError
+from .errors import MapError, NebulaError
 
 if TYPE_CHECKING:  # 仅类型提示；appdata 运行期不依赖近邻模块，保持纯数据层轻量
     from .similarity import SimilarityIndex
@@ -117,6 +119,28 @@ _FRAME_COLUMNS = [
     "search_text",
     "hover_text",
 ]
+
+logger = logging.getLogger(__name__)
+
+#: 事件时间轴曲线选择偏好（按事件模块的 feature names 匹配，缺失时退回第 0 列）
+_AUDIO_SERIES_PREFERENCE: tuple[str, ...] = (
+    "onset_strength",
+    "spectral_flux",
+    "rms",
+    "log_energy",
+)
+_VIDEO_SERIES_PREFERENCE: tuple[str, ...] = (
+    "motion_energy",
+    "frame_diff_mean",
+    "edge_change",
+    "luma_std",
+)
+_AV_SERIES_PREFERENCE: tuple[str, ...] = (
+    "envelope_correlation",
+    "max_correlation",
+    "coincidence_rate",
+    "corr_lag0",
+)
 
 #: 搜索时参与匹配的文本列
 _SEARCH_COLUMNS = (
@@ -426,7 +450,476 @@ def load_nebula_frame(
     map_info = dict(map_row)
     map_info["params"] = _parse_map_params(map_row)
     map_info["filter_spec"] = _parse_filter_spec(map_row)
+    map_info.update(_map_representation_info(cat, map_row))
     return map_info, frame
+
+
+# --------------------------------------------------------------------------- 表征空间
+def _map_representation_info(
+    cat: Catalog,
+    map_row: Mapping[str, Any],
+) -> dict[str, Any]:
+    """暴露地图所属表征的名称/标签/序列版本（旧地图按 legacy 处理）。"""
+
+    rep_id = map_row.get("representation_id")
+    if rep_id is not None:
+        rep = cat.get_representation(int(rep_id))
+        if rep is not None:
+            return {
+                "representation_id": int(rep["id"]),
+                "representation_name": str(rep["name"]),
+                "representation_label": representations.representation_label(str(rep["name"])),
+                "representation_sequence_version": str(rep["sequence_version"]),
+                "representation_kind": str(rep["kind"]),
+            }
+    sequence_version = str(map_row.get("embedding_version") or "")
+    return {
+        "representation_id": None if rep_id is None else int(rep_id),
+        "representation_name": representations.LEGACY_NAME,
+        "representation_label": representations.representation_label(
+            representations.LEGACY_NAME
+        ),
+        "representation_sequence_version": sequence_version,
+        "representation_kind": "legacy",
+    }
+
+
+def _latest_unfiltered_map_version(maps: Iterable[Mapping[str, Any]]) -> str | None:
+    latest: Mapping[str, Any] | None = None
+    for row in maps:
+        if row.get("filter_json"):
+            continue
+        latest = row
+    return None if latest is None else str(latest["version"])
+
+
+def map_matches_representation(
+    map_row: Mapping[str, Any],
+    option: Mapping[str, Any],
+) -> bool:
+    """判断一个 ready 地图是否属于某个表征空间（兼容未回填的旧地图）。"""
+
+    representation_id = map_row.get("representation_id")
+    option_id = option.get("representation_id")
+    if representation_id is not None:
+        return option_id is not None and int(representation_id) == int(option_id)
+    return (
+        str(option.get("representation_name")) == representations.LEGACY_NAME
+        and str(map_row.get("embedding_version"))
+        == str(option.get("sequence_version"))
+    )
+
+
+def load_representation_options(
+    catalog: Catalog,
+    config: Config,
+) -> list[dict[str, Any]]:
+    """列出可切换的表征空间及其“最新 ready 且无筛选”的地图版本。
+
+    返回每项：representation_id / representation_name / label / kind /
+    sequence_version / map_version / n_maps。没有地图的表征也会返回，
+    map_version 为 None（界面可忽略或提示尚未构建地图）。
+    """
+
+    try:
+        registered = representations.list_available(catalog, config)
+    except NebulaError as exc:  # pragma: no cover - 仅界面提示
+        logger.warning("读取表征列表失败: %s", exc)
+        registered = []
+    ready_maps = [
+        row for row in catalog.list_maps() if str(row.get("status")) == "ready"
+    ]
+    options: list[dict[str, Any]] = []
+
+    def append_option(
+        *,
+        representation_id: int | None,
+        name: str,
+        kind: str | None,
+        sequence_version: str | None,
+        matches: list[Mapping[str, Any]],
+        registered_flag: bool,
+    ) -> None:
+        options.append(
+            {
+                "representation_id": representation_id,
+                "representation_name": name,
+                "label": representations.representation_label(name),
+                "kind": kind,
+                "sequence_version": sequence_version,
+                "map_version": _latest_unfiltered_map_version(matches),
+                "n_maps": len(matches),
+                "registered": registered_flag,
+            }
+        )
+
+    for rep in registered:
+        rep_id = int(rep["id"])
+        name = str(rep["name"])
+        sequence_version = str(rep["sequence_version"])
+        matches = [
+            row for row in ready_maps if row.get("representation_id") == rep_id
+        ]
+        if name == representations.LEGACY_NAME:
+            # 旧地图可能仍是 representation_id=NULL，按 sequence_version 归入 legacy 空间
+            matches = matches + [
+                row
+                for row in ready_maps
+                if row.get("representation_id") is None
+                and str(row.get("embedding_version")) == sequence_version
+            ]
+        append_option(
+            representation_id=rep_id,
+            name=name,
+            kind=str(rep["kind"]),
+            sequence_version=sequence_version,
+            matches=matches,
+            registered_flag=True,
+        )
+
+    # 没有任何已登记 legacy 表征、但存在旧地图时，合成一个 legacy 空间
+    null_maps = [row for row in ready_maps if row.get("representation_id") is None]
+    covered_sequences = {
+        str(option["sequence_version"])
+        for option in options
+        if str(option["representation_name"]) == representations.LEGACY_NAME
+    }
+    for sequence_version in sorted(
+        {str(row.get("embedding_version")) for row in null_maps} - covered_sequences
+    ):
+        matches = [
+            row
+            for row in null_maps
+            if str(row.get("embedding_version")) == sequence_version
+        ]
+        append_option(
+            representation_id=None,
+            name=representations.LEGACY_NAME,
+            kind="legacy",
+            sequence_version=sequence_version,
+            matches=matches,
+            registered_flag=False,
+        )
+
+    # 未登记/孤儿表征的地图也给出可切换空间，避免地图“消失”
+    known_ids = {
+        int(option["representation_id"])
+        for option in options
+        if option["representation_id"] is not None
+    }
+    orphan_maps = [
+        row
+        for row in ready_maps
+        if row.get("representation_id") is not None
+        and int(row["representation_id"]) not in known_ids
+    ]
+    for rep_id in sorted({int(row["representation_id"]) for row in orphan_maps}):
+        matches = [
+            row for row in orphan_maps if int(row["representation_id"]) == rep_id
+        ]
+        append_option(
+            representation_id=rep_id,
+            name=f"representation_{rep_id}",
+            kind=None,
+            sequence_version=str(matches[0].get("embedding_version")),
+            matches=matches,
+            registered_flag=False,
+        )
+
+    priority = {
+        representations.LEGACY_NAME: 0,
+        representations.FULL_MEAN_V1: 1,
+        representations.TEMPORAL_STATS_V1: 2,
+        representations.TRANSFORMER_V1: 3,
+    }
+    options.sort(
+        key=lambda option: (
+            priority.get(str(option["representation_name"]), 9),
+            str(option["label"]),
+        )
+    )
+    return options
+
+
+
+
+# --------------------------------------------------------------------------- 事件时间轴
+def _event_module() -> Any | None:
+    """延迟导入 nebula.events（t3 并行实现；模块缺失时返回 None）。"""
+
+    try:
+        from . import events
+    except ImportError:
+        return None
+    return events
+
+
+def _load_events_bundle(work_dir: Path) -> Any | None:
+    """读取事件包络（便于测试 monkeypatch）；文件缺失/模块未就绪返回 None。"""
+
+    module = _event_module()
+    if module is None:
+        return None
+    loader = getattr(module, "load_events_bundle", None)
+    if loader is None:
+        return None
+    try:
+        return loader(work_dir)
+    except NebulaError:
+        return None
+    except Exception as exc:  # noqa: BLE001 - 事件文件损坏只影响时间轴显示
+        logger.warning("读取事件包络失败 %s: %s", work_dir, exc)
+        return None
+
+
+def _event_feature_names(attribute: str) -> tuple[str, ...]:
+    module = _event_module()
+    if module is None:
+        return ()
+    try:
+        return tuple(str(name) for name in getattr(module, attribute, ()))
+    except TypeError:  # pragma: no cover - 防御性分支
+        return ()
+
+
+def _normalize_display_series(values: np.ndarray) -> list[float]:
+    """把任意范围的事件曲线缩放到 0..1（恒定值返回全 0）。"""
+
+    array = np.asarray(values, dtype=np.float64)
+    if array.size == 0:
+        return []
+    finite = np.where(np.isfinite(array), array, 0.0)
+    low = float(np.min(finite))
+    high = float(np.max(finite))
+    if not np.isfinite(low) or not np.isfinite(high) or high - low <= 1e-12:
+        return [0.0 for _ in range(finite.size)]
+    return ((finite - low) / (high - low)).astype(float).tolist()
+
+
+def _matrix_series(
+    matrix: Any,
+    *,
+    names: tuple[str, ...],
+    preference: tuple[str, ...],
+    rate: float,
+) -> dict[str, Any] | None:
+    """从 (n, features) 事件矩阵中取一条包络曲线（优先按 feature 名称选列）。"""
+
+    if matrix is None:
+        return None
+    array = np.asarray(matrix, dtype=np.float64)
+    if array.ndim != 2 or array.shape[0] == 0 or array.shape[1] == 0:
+        return None
+    column = 0
+    feature = names[0] if names else "feature_0"
+    for candidate in preference:
+        if candidate in names:
+            column = names.index(candidate)
+            feature = candidate
+            break
+    if column >= array.shape[1]:
+        column = 0
+    values = array[:, column]
+    if not np.all(np.isfinite(values)):
+        values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    safe_rate = float(rate) if float(rate) > 0 else 1.0
+    return {
+        "feature": feature,
+        "rate_hz": safe_rate,
+        "time_s": [round(index / safe_rate, 6) for index in range(values.size)],
+        "values": _normalize_display_series(values),
+    }
+
+
+def _resample_series(values: list[float], target_length: int) -> list[float]:
+    """线性插值把一条曲线重采样到目标长度（用于音画包络对齐）。"""
+
+    if target_length <= 0 or not values:
+        return []
+    if len(values) == target_length:
+        return list(values)
+    source = np.linspace(0.0, 1.0, len(values))
+    target = np.linspace(0.0, 1.0, target_length)
+    return np.interp(target, source, np.asarray(values, dtype=np.float64)).astype(float).tolist()
+
+
+def _coverage_ratio(
+    boundaries: list[dict[str, Any]],
+    duration_s: float | None,
+) -> tuple[float, float]:
+    """返回 (被覆盖秒数, 覆盖率)；覆盖率以视频总时长为准。"""
+
+    intervals = sorted(
+        (float(item["start_s"]), float(item["end_s"])) for item in boundaries
+    )
+    merged: list[list[float]] = []
+    for start, end in intervals:
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1] + 1e-9:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    if duration_s is not None and duration_s > 0:
+        covered = sum(
+            max(0.0, min(end, duration_s) - max(0.0, start))
+            for start, end in merged
+        )
+        return float(covered), float(covered / duration_s)
+    covered = sum(end - start for start, end in merged)
+    return float(covered), 1.0 if covered > 0 else 0.0
+
+
+def load_event_timeline(
+    catalog: Catalog,
+    config: Config,
+    sequence_version: str,
+    work_id: int,
+) -> dict[str, Any] | None:
+    """读取某作品的事件时间轴数据（供 app 画图）；没有事件文件返回 None。
+
+    返回内容：片段窗口边界、被覆盖时长/覆盖率、事件包络曲线（audio/video/
+    av 重合/窗口特征，均缩放至 0..1 便于叠画）、事件版本与采样率。
+    """
+
+    work = catalog.get_work(int(work_id))
+    if work is None:
+        raise MapError(f"作品不存在: {work_id}")
+    work_dir = representations.sequence_work_dir(
+        config, str(sequence_version), int(work_id)
+    )
+    features = _load_events_bundle(work_dir)
+    if features is None:
+        return None
+
+    clip_rows = catalog.get_clips(int(work_id), version=str(sequence_version))
+    boundaries: list[dict[str, Any]] = []
+    for row in clip_rows:
+        start = float(row["start_s"])
+        duration = float(row["duration_s"])
+        valid_raw = row.get("valid_duration_s")
+        weight_raw = row.get("weight")
+        boundaries.append(
+            {
+                "index": int(row["idx"]),
+                "start_s": round(start, 6),
+                "end_s": round(start + duration, 6),
+                "duration_s": round(duration, 6),
+                "valid_duration_s": (
+                    round(float(valid_raw), 6) if valid_raw is not None else round(duration, 6)
+                ),
+                "weight": None if weight_raw is None else float(weight_raw),
+            }
+        )
+
+    duration_s = work.get("duration_s")
+    if duration_s is None:
+        duration_s = getattr(features, "duration_s", None)
+    if duration_s is None:
+        state = catalog.get_sequence_state(int(work_id), version=str(sequence_version))
+        if state is not None:
+            duration_s = state.get("duration_s")
+    duration_value = None if duration_s is None else float(duration_s)
+    covered_s, coverage_ratio = _coverage_ratio(boundaries, duration_value)
+
+    audio_matrix = getattr(features, "audio", None)
+    video_matrix = getattr(features, "video", None)
+    audio_rate = float(getattr(features, "audio_rate_hz", 0.0) or 0.0)
+    video_rate = float(
+        getattr(features, "video_fps_effective", 0.0)
+        or getattr(features, "video_fps", 0.0)
+        or 0.0
+    )
+    audio_series = _matrix_series(
+        audio_matrix,
+        names=_event_feature_names("AUDIO_FEATURE_NAMES"),
+        preference=_AUDIO_SERIES_PREFERENCE,
+        rate=audio_rate,
+    )
+    video_series = _matrix_series(
+        video_matrix,
+        names=_event_feature_names("VIDEO_FEATURE_NAMES"),
+        preference=_VIDEO_SERIES_PREFERENCE,
+        rate=video_rate,
+    )
+
+    series: dict[str, dict[str, Any]] = {}
+    if audio_series is not None:
+        audio_series["label"] = "音频事件包络"
+        series["audio"] = audio_series
+    if video_series is not None:
+        video_series["label"] = "画面运动包络"
+        series["video"] = video_series
+    av_series = _matrix_series(
+        getattr(features, "av", None),
+        names=_event_feature_names("AV_FEATURE_NAMES"),
+        preference=_AV_SERIES_PREFERENCE,
+        rate=audio_rate,
+    )
+    if av_series is not None:
+        av_series["label"] = "音画关系包络（归一化）"
+        series["av"] = av_series
+    elif audio_series is not None and video_series is not None:
+        # 没有音画关系序列时，用音频×画面包络的乘积做替代展示
+        aligned_video = _resample_series(
+            video_series["values"], len(audio_series["values"])
+        )
+        overlap = [
+            round(min(1.0, a * v), 6)
+            for a, v in zip(audio_series["values"], aligned_video, strict=True)
+        ]
+        series["av"] = {
+            "label": "音画包络重合（音频×画面，归一化）",
+            "feature": "audio_x_video_normalized",
+            "rate_hz": audio_series["rate_hz"],
+            "time_s": list(audio_series["time_s"]),
+            "values": overlap,
+        }
+
+    window_features_raw = getattr(features, "window_features", None)
+    window_features: list[list[float]] | None = None
+    if window_features_raw is not None:
+        window_array = np.asarray(window_features_raw, dtype=np.float64)
+        if window_array.ndim == 2 and window_array.shape[0] > 0:
+            window_features = window_array.astype(float).tolist()
+            energy = np.nanmean(window_array, axis=1)
+            energy = np.nan_to_num(energy, nan=0.0, posinf=0.0, neginf=0.0)
+            if len(boundaries) == window_array.shape[0]:
+                times = [
+                    round((item["start_s"] + item["end_s"]) / 2.0, 6)
+                    for item in boundaries
+                ]
+            else:
+                times = [float(index) for index in range(window_array.shape[0])]
+            series["window"] = {
+                "label": "窗口事件特征均值（归一化）",
+                "feature": "window_feature_mean",
+                "rate_hz": None,
+                "time_s": times,
+                "values": _normalize_display_series(energy),
+            }
+
+    event_version = getattr(features, "version", None)
+    return {
+        "work_id": int(work_id),
+        "sequence_version": str(sequence_version),
+        "event_version": None if event_version is None else str(event_version),
+        "duration_s": duration_value,
+        "n_clips": len(boundaries),
+        "window_boundaries": boundaries,
+        "window_features": window_features,
+        "coverage_s": round(covered_s, 6),
+        "coverage_ratio": round(coverage_ratio, 6),
+        "audio_rate_hz": audio_rate or None,
+        "video_fps_effective": video_rate or None,
+        "feature_names": {
+            "audio": list(_event_feature_names("AUDIO_FEATURE_NAMES")),
+            "video": list(_event_feature_names("VIDEO_FEATURE_NAMES")),
+            "av": list(_event_feature_names("AV_FEATURE_NAMES")),
+            "window": list(_event_feature_names("WINDOW_FEATURE_NAMES")),
+        },
+        "series": series,
+    }
 
 
 # --------------------------------------------------------------------------- 染色

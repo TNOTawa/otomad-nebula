@@ -30,6 +30,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from nebula import representations
 from nebula.appdata import (
     ColorSpec,
     apply_color,
@@ -39,7 +40,10 @@ from nebula.appdata import (
     external_url,
     filter_frame,
     hub_rows,
+    load_event_timeline,
     load_nebula_frame,
+    load_representation_options,
+    map_matches_representation,
     neighbor_rows,
     search_frame,
 )
@@ -117,25 +121,95 @@ def _load_frame(config_path: str, map_version: str) -> tuple[dict[str, Any], pd.
         cat.close()
 
 
+@st.cache_data(show_spinner=False)
+def _load_representation_options_cached(config_path: str) -> list[dict[str, Any]]:
+    cfg = load_config(config_path)
+    cat = Catalog(cfg.paths.db_path)
+    try:
+        cat.initialize()
+        return load_representation_options(cat, cfg)
+    finally:
+        cat.close()
+
+
+@st.cache_data(show_spinner=False)
+def _load_timeline_cached(
+    config_path: str,
+    sequence_version: str,
+    work_id: int,
+) -> dict[str, Any] | None:
+    cfg = load_config(config_path)
+    cat = Catalog(cfg.paths.db_path)
+    try:
+        cat.initialize()
+        return load_event_timeline(cat, cfg, sequence_version, work_id)
+    finally:
+        cat.close()
+
+
 @st.cache_resource(show_spinner="正在加载高维近邻索引…")
 def _load_similarity_index(
     config_path: str,
     version: str,
+    representation_id: int | None,
     db_mtime_ns: int,
 ) -> _SimilarityState:
-    """加载高维近邻索引；db 文件 mtime 参与缓存 key，新增向量后自动失效。"""
+    """加载高维近邻索引；db 文件 mtime 与表征 id 参与缓存 key。"""
 
     del db_mtime_ns  # 仅用于缓存 key
     cfg = load_config(config_path)
     cat = Catalog(cfg.paths.db_path)
     try:
         cat.initialize()
-        index = load_similarity_index(cat, cfg, version=version)
+        index = load_similarity_index(
+            cat, cfg, version=version, representation_id=representation_id
+        )
         return _SimilarityState(index=index, error=None)
     except NebulaError as exc:
         return _SimilarityState(index=None, error=str(exc))
     finally:
         cat.close()
+
+
+def _build_representation_spaces(
+    maps: list[dict[str, Any]],
+    rep_options: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """把表征选项与 ready 地图合并成侧栏可切换的“表征空间”列表。"""
+
+    ready_rows = [row for row in maps if str(row.get("status")) == "ready"]
+    spaces: list[dict[str, Any]] = []
+    for option in rep_options:
+        rows = [row for row in ready_rows if map_matches_representation(row, option)]
+        if not rows:
+            continue
+        versions = [str(row["version"]) for row in rows]
+        default_version = option.get("map_version")
+        if default_version not in versions:
+            default_version = versions[-1]
+        spaces.append({**option, "versions": versions, "default_version": default_version})
+    if spaces:
+        return spaces
+    # 数据库里还没有表征登记（旧库/测试环境）：所有 ready 地图归入一个 legacy 空间
+    versions = [str(row["version"]) for row in ready_rows]
+    unfiltered = [row for row in ready_rows if not row.get("filter_json")]
+    default_version = (
+        str(unfiltered[-1]["version"]) if unfiltered else versions[-1]
+    )
+    return [
+        {
+            "representation_id": None,
+            "representation_name": representations.LEGACY_NAME,
+            "label": representations.representation_label(representations.LEGACY_NAME),
+            "kind": "legacy",
+            "sequence_version": None,
+            "map_version": default_version,
+            "n_maps": len(ready_rows),
+            "registered": False,
+            "versions": versions,
+            "default_version": default_version,
+        }
+    ]
 
 
 # --------------------------------------------------------------------------- 小工具
@@ -748,6 +822,105 @@ def _render_clip_panel(
         )
 
 
+
+
+# --------------------------------------------------------------------------- 时间轴
+def _render_timeline_panel(
+    config_path: str,
+    map_info: Mapping[str, Any],
+    work_id: int,
+) -> None:
+    """详情里的“完整时间轴”面板：事件包络 + 片段窗口边界 + 覆盖率摘要。"""
+
+    sequence_version = str(
+        map_info.get("representation_sequence_version")
+        or map_info.get("embedding_version")
+        or ""
+    )
+    with st.expander("完整时间轴（音画事件 + 片段窗口）", expanded=False):
+        st.caption(
+            "曲线来自高频音画事件扫描并归一到 0..1；竖线为片段窗口起点。"
+            "事件通道补充节奏/运动/突变信息，不代表逐帧语义理解。"
+        )
+        if not sequence_version:
+            st.caption("缺少序列版本信息，无法读取事件时间轴。")
+            return
+        try:
+            timeline = _load_timeline_cached(
+                config_path, sequence_version, int(work_id)
+            )
+        except NebulaError as exc:
+            st.caption(f"读取时间轴失败：{exc}")
+            return
+        if timeline is None:
+            st.caption(
+                "该作品暂无事件扫描数据（需要 full coverage 编码并开启 events 扫描）。"
+            )
+            return
+
+        series = timeline.get("series") or {}
+        if not series:
+            st.caption("事件文件存在，但没有可绘制的包络曲线。")
+        else:
+            colors = {
+                "audio": "#4cc9f0",
+                "video": "#f77f00",
+                "window": "#ffd166",
+                "av": "#90be6d",
+            }
+            figure = go.Figure()
+            for key in ("audio", "video", "window", "av"):
+                item = series.get(key)
+                if not item:
+                    continue
+                figure.add_trace(
+                    go.Scatter(
+                        x=item["time_s"],
+                        y=item["values"],
+                        mode="lines",
+                        name=str(item.get("label") or key),
+                        line={"width": 1.2, "color": colors.get(key)},
+                        hovertemplate=(
+                            f"{item.get('label') or key}<br>t=%{{x:.1f}}s"
+                            " · 强度=%{y:.3f}<extra></extra>"
+                        ),
+                    )
+                )
+            boundaries = timeline.get("window_boundaries") or []
+            shapes = [
+                {
+                    "type": "line",
+                    "x0": float(boundary["start_s"]),
+                    "x1": float(boundary["start_s"]),
+                    "y0": 0.0,
+                    "y1": 1.0,
+                    "yref": "paper",
+                    "line": {"color": "rgba(210, 210, 210, 0.35)", "width": 1},
+                }
+                for boundary in boundaries
+            ]
+            figure.update_layout(
+                template="plotly_dark",
+                height=340,
+                margin={"l": 10, "r": 10, "t": 30, "b": 10},
+                shapes=shapes,
+                legend={"orientation": "h", "y": 1.02},
+                xaxis_title="时间（秒）",
+                yaxis_title="归一化事件强度",
+            )
+            st.plotly_chart(figure, width="stretch", key="timeline_chart")
+
+        duration_s = timeline.get("duration_s")
+        duration_text = "-" if duration_s is None else f"{float(duration_s):.1f}s"
+        coverage_ratio = float(timeline.get("coverage_ratio") or 0.0)
+        coverage_s = float(timeline.get("coverage_s") or 0.0)
+        st.caption(
+            f"片段 {int(timeline.get('n_clips') or 0)} 个 · 时长 {duration_text} · "
+            f"覆盖 {coverage_ratio * 100:.1f}%（{coverage_s:.1f}s） · "
+            f"事件版本 {timeline.get('event_version') or '未知'}"
+        )
+
+
 def _on_neighbor_jump(selectbox_key: str) -> None:
     """近邻下拉变化时记录待跳转作品，下一次 rerun 生效。"""
 
@@ -758,33 +931,55 @@ def _on_neighbor_jump(selectbox_key: str) -> None:
 
 # --------------------------------------------------------------------------- 侧栏
 def _render_sidebar_map_settings(
-    versions: list[str],
-    latest: str,
+    spaces: list[dict[str, Any]],
+    default_space_index: int,
     cfg: Config,
-) -> tuple[str, str]:
+) -> tuple[str, str, dict[str, Any]]:
+    """表征空间 + 星云版本 + 投影方式侧栏控件。"""
+
     with st.sidebar:
         st.header("显示设置")
-        if st.button("刷新数据", key="refresh_data", help="重新读取数据库、星云版本与高维向量索引"):
+        if st.button("刷新数据", key="refresh_data", help="重新读取数据库、表征与高维向量索引"):
             st.cache_data.clear()
             st.cache_resource.clear()
             st.rerun()
-        # 默认打开最新的总星云；用户手动切换后由 selectbox 的 key 记住选择。
-        # 不在这里写 session_state（否则 Streamlit 会警告“default + Session State 同时设置”）。
+        # 默认打开最新总星云所在表征空间；用户切换后由 selectbox 的 key 记住选择。
+        current_space = st.session_state.get("representation_space")
+        if (
+            not isinstance(current_space, int)
+            or isinstance(current_space, bool)
+            or not 0 <= current_space < len(spaces)
+        ):
+            st.session_state.pop("representation_space", None)
+            current_space = None
+        space_index = st.selectbox(
+            "表征空间",
+            options=list(range(len(spaces))),
+            index=default_space_index,
+            format_func=lambda index: spaces[index]["label"],
+            key="representation_space",
+            help="Legacy / Full Mean / Temporal Stats 等表征空间；不同空间的坐标不可直接比较",
+        )
+        selected_space = spaces[int(space_index)]
+        versions = list(selected_space["versions"])
         current_version = st.session_state.get("map_version")
         if current_version is not None and current_version not in versions:
             st.session_state.pop("map_version", None)
             current_version = None
+        fallback_version = str(selected_space["default_version"])
+        if fallback_version not in versions:
+            fallback_version = versions[-1]
         default_index = (
             versions.index(current_version)
             if current_version in versions
-            else versions.index(latest)
+            else versions.index(fallback_version)
         )
         version = st.selectbox(
             "星云版本",
             options=versions,
             index=default_index,
             key="map_version",
-            help="默认打开最新的总星云；可切换到 2025 独立星云或 n_neighbors 变体（坐标不可直接比较）",
+            help="默认打开该表征空间最新的总星云；可切换到筛选版或 n_neighbors 变体（坐标不可直接比较）",
         )
         projection = st.radio(
             "投影方式",
@@ -793,7 +988,7 @@ def _render_sidebar_map_settings(
             format_func=lambda value: _PROJECTION_LABELS.get(value, value),
             key="projection",
         )
-    return str(version), str(projection)
+    return str(version), str(projection), selected_space
 
 
 def _render_sidebar_display_settings(
@@ -953,15 +1148,34 @@ def main() -> None:
         st.info(f"数据库：{cfg.paths.db_path}")
         return
 
-    # 默认打开“最新的总星云”（没有筛选条件的版本）；筛选地图与变体坐标不可直接比较，
-    # 让用户先看到全量空间，再主动切到 2025 独立星云/n_neighbors 变体。
-    total_versions = [
+    try:
+        rep_options = _load_representation_options_cached(config_path)
+    except NebulaError as exc:
+        st.warning(f"读取表征空间失败（降级为 legacy 空间）：{exc}")
+        rep_options = []
+    spaces = _build_representation_spaces(maps, rep_options)
+
+    # 默认打开“最新 ready 且无筛选的星云”，并自动定位它所属的表征空间；
+    # 用户可在侧栏切换到 Full Mean / Temporal Stats 等其他空间。
+    unfiltered_versions = [
         str(row["version"])
         for row in maps
         if str(row.get("status")) == "ready" and not row.get("filter_json")
     ]
-    latest = total_versions[-1] if total_versions else versions[-1]
-    version, projection = _render_sidebar_map_settings(versions, latest, cfg)
+    default_version = (
+        unfiltered_versions[-1] if unfiltered_versions else versions[-1]
+    )
+    default_space_index = next(
+        (
+            index
+            for index, space in enumerate(spaces)
+            if default_version in space["versions"]
+        ),
+        0,
+    )
+    version, projection, selected_space = _render_sidebar_map_settings(
+        spaces, default_space_index, cfg
+    )
 
     try:
         map_info, frame = _load_frame(config_path, version)
@@ -972,11 +1186,28 @@ def main() -> None:
         st.warning(f"星云版本 {version} 没有作品坐标，请重新运行 map.py build。")
         return
 
-    embedding_version = str(map_info.get("embedding_version") or cfg.embedding_version)
+    representation_id = map_info.get("representation_id")
+    representation_label = str(
+        map_info.get("representation_label")
+        or representations.representation_label(
+            str(selected_space.get("representation_name"))
+        )
+    )
+    embedding_version = str(
+        map_info.get("representation_sequence_version")
+        or map_info.get("embedding_version")
+        or cfg.embedding_version
+    )
     similarity_state = _load_similarity_index(
-        config_path, embedding_version, _db_mtime_ns(cfg.paths.db_path)
+        config_path,
+        embedding_version,
+        representation_id,
+        _db_mtime_ns(cfg.paths.db_path),
     )
     index = similarity_state.index
+    st.sidebar.caption(
+        f"当前表征：{representation_label} · 序列 {embedding_version}"
+    )
     if index is not None:
         st.sidebar.caption(
             f"高维近邻已就绪：{len(index.work_ids)} 部作品，"
@@ -1060,11 +1291,13 @@ def main() -> None:
     if selected_row is not None and selected_id is not None:
         st.divider()
         _render_detail(selected_row, cfg)
+        _render_timeline_panel(config_path, map_info, selected_id)
         _render_neighbor_panel(frame, view, index, selected_id, similarity_state.error)
 
     st.caption(
-        f"星云版本 {version} · 构建筛选 {_describe_filter_spec(map_info.get('filter_spec'))} · "
-        f"向量版本 {embedding_version} · 作品数 {map_info.get('n_works')} · "
+        f"星云版本 {version} · 表征 {representation_label} · "
+        f"构建筛选 {_describe_filter_spec(map_info.get('filter_spec'))} · "
+        f"序列版本 {embedding_version} · 作品数 {map_info.get('n_works')} · "
         f"创建于 {map_info.get('created_at')}"
     )
 

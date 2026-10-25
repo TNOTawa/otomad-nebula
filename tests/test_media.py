@@ -26,7 +26,7 @@ from nebula.media import (
     mute_audio_clip,
     probe_media,
 )
-from nebula.sampling import ClipPlan, plan_clips
+from nebula.sampling import ClipPlan, plan_clips, plan_full_coverage
 
 pytestmark = pytest.mark.integration
 
@@ -500,3 +500,61 @@ def test_clip_duration_report_invalid_tolerance_raises(config, tmp_path: Path):
     audio = mute_audio_clip(1.0, tmp_path / "audio.wav", media=config.media)
     with pytest.raises(MediaError, match="容差"):
         clip_duration_report(video, audio, ffprobe=config.media.ffprobe, tolerance_s=-1.0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v0.4：CoverageClip 切片与 clip_height 预缩放
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_extract_coverage_clips(sample_video: Path, config, tmp_path: Path):
+    plans = plan_full_coverage(12.0)
+    assert len(plans) == 2
+    clips = [
+        extract_clip(sample_video, plan, tmp_path / "clips", media=config.media, info=None)
+        for plan in plans
+    ]
+    for plan, clip in zip(plans, clips, strict=True):
+        assert isinstance(clip, ExtractedClip)
+        assert clip.index == plan.index
+        assert clip.start_s == pytest.approx(plan.start_s)
+        assert clip.duration_s == pytest.approx(plan.duration_s)
+        assert clip.video_path.name == f"clip_{plan.index:02d}.mp4"
+        assert clip.audio_path.name == f"clip_{plan.index:02d}.wav"
+        report = clip_duration_report(
+            clip.video_path, clip.audio_path, ffprobe=config.media.ffprobe
+        )
+        assert report["ok"] is True
+        assert report["delta_s"] <= 0.15
+        # 临时 mp4 仍然无音轨（A5 行为不变）
+        assert probe_media(clip.video_path, ffprobe=config.media.ffprobe).has_audio is False
+
+
+def test_extract_clip_with_height_filter(sample_video: Path, config, tmp_path: Path):
+    media = replace(config.media, clip_height=336)
+    plan = plan_full_coverage(12.0)[0]
+    clip = extract_clip(sample_video, plan, tmp_path / "clips", media=media)
+
+    info = probe_media(clip.video_path, ffprobe=config.media.ffprobe)
+    assert info.has_video is True
+    assert info.has_audio is False
+    # 160x120 按高 336 等比缩放 -> 448x336（宽高均为偶数）
+    assert info.height == 336
+    assert info.width == 448
+
+    samples, sample_rate, channels = _read_wav_samples(clip.audio_path)
+    assert sample_rate == 48000
+    assert channels == 2
+    assert samples.size > 0
+
+
+def test_extract_clip_rejects_odd_clip_height(sample_video: Path, config, tmp_path: Path):
+    media = replace(config.media, clip_height=335)
+    with pytest.raises(MediaError, match="偶数"):
+        extract_clip(sample_video, plan_full_coverage(12.0)[0], tmp_path, media=media)
+
+
+def test_extract_clip_rejects_unknown_plan_type(sample_video: Path, config, tmp_path: Path):
+    with pytest.raises(MediaError, match="CoverageClip"):
+        extract_clip(sample_video, "not-a-plan", tmp_path, media=config.media)  # type: ignore[arg-type]
+

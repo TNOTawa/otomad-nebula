@@ -1,17 +1,25 @@
 """流水线：下载 -> 切片 -> 推理 -> 保存 -> 登记 -> 清理。
 
-处理一部作品的顺序（任何一步失败都会记入 failed 并保留原因）：
+支持两种采样模式（Pipeline(config, sampling_mode=...) 可覆盖 config.sampling.mode）：
 
+legacy（v0.3，默认）：
 1. 解析来源：本地文件直接使用（永不删除）；Bilibili 作品先取元数据再下载到 temp。
-2. ffprobe 读取时长与音视频流信息，按 nebula.sampling.plan_clips 生成均匀片段。
-3. ffmpeg 在 temp 中截取音画同步片段（mp4 + wav）。
-4. 调用 Embedder 得到片段级联合/音频/视频向量。
-5. 逐行归一化 -> 求平均 -> 再归一化，得到作品级向量。
-6. 写入 data/embeddings/<向量版本>/<work_id>/ 并登记到 SQLite（先写文件再登记）。
-7. 登记成功后删除该作品在 temp 中的全部临时文件；失败时保留 temp 便于排查。
+2. ffprobe 读取时长与音视频流信息，按 nebula.sampling.plan_clips 生成均匀片段（<=N 段）。
+3. ffmpeg 截取音画同步片段（无音轨 mp4 + wav），调用 Embedder 得到片段向量。
+4. 逐行归一化 -> 求平均 -> 再归一化得到作品向量，写 data/embeddings 并登记 SQLite。
 
-断点续跑：已有当前向量版本 work_joint 向量的作品直接跳过；换模型/采样参数会生成新版本，
-老作品会被 reopen 并补算新向量，旧版本文件保留。
+full_coverage（v0.4）：
+1. 同 legacy 的取源与 probe；超长视频（> media.long_video_seconds）默认拒绝，需 --allow-long。
+2. plan_full_coverage 覆盖整条时间轴；窗口计划与参数写入 .partial/plan.json。
+3. 可选高频事件扫描（nebula.events，延迟 import），产物为 event_scan.npz。
+4. 按 model.batch_size 分批：只对缺失批次提取 -> 编码 -> 原子写 batch_{k}.npz ->
+   删该批临时切片 -> 更新 sequence_states；中断后按 plan.json 校验并从缺失批继续。
+5. 全部完成后拼接 clip_*.npy / clip_times.npy / work_*.npy / manifest.json，
+   replace_clips（5 元组）-> register_embedding（六种 kind）-> assembled -> complete，
+   再删除 .partial 与 temp。失败保留 .partial/temp 供恢复。
+
+两种模式都用“先写文件再登记 DB”；已有当前版本向量的作品直接跳过，换参数生成新版本，
+旧版本文件保留。Bilibili 下载若 temp/work_XXXXXX/download/ 已有可 probe 的源文件则复用。
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -27,6 +36,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from . import __version__
 from .config import Config
 from .db import Catalog
 from .errors import DatabaseError, EmbeddingError, MediaError, PipelineError
@@ -37,12 +47,15 @@ from .media import (
     mute_audio_clip,
     probe_media,
 )
-from .sampling import ClipPlan, plan_clips
+from .sampling import ClipPlan, CoverageClip, plan_clips, plan_full_coverage
 from .util import now_utc_iso, slugify
 
 logger = logging.getLogger(__name__)
 
 CLIP_SUFFIX = "__f{frames}_clip{clip_seconds}s_x{clips}_{sr}k"
+FULL_SUFFIX = "__f{frames}_full{clip_seconds}s_ov{overlap}_{sr}k{height}"
+
+SAMPLING_MODES = ("legacy", "full_coverage")
 
 
 @dataclass
@@ -93,7 +106,16 @@ class Pipeline:
         catalog: Catalog | None = None,
         embedder: Any | None = None,
         allow_test_embedder: bool = False,
+        sampling_mode: str | None = None,
+        allow_long: bool = False,
     ) -> None:
+        mode = sampling_mode if sampling_mode is not None else config.sampling.mode
+        if mode not in SAMPLING_MODES:
+            raise PipelineError(
+                f"未知采样模式: {mode!r}（只支持 {', '.join(SAMPLING_MODES)}）"
+            )
+        self.sampling_mode = mode
+        self.allow_long = bool(allow_long)
         self.config = config
         self.config.ensure_directories()
         self._owns_catalog = catalog is None
@@ -140,15 +162,28 @@ class Pipeline:
 
     @property
     def embedding_version(self) -> str:
-        """由嵌入器版本 + 采样参数拼出的向量版本；不同版本绝不覆盖。"""
+        """由嵌入器版本 + 采样参数拼出的序列版本；不同版本绝不覆盖。"""
 
         if self._version is None:
-            suffix = CLIP_SUFFIX.format(
-                frames=self.config.model.frames,
-                clip_seconds=f"{self.config.media.clip_seconds:g}",
-                clips=self.config.media.clips_per_work,
-                sr=self.config.media.audio_sample_rate // 1000,
-            )
+            if self.sampling_mode == "full_coverage":
+                suffix = FULL_SUFFIX.format(
+                    frames=self.config.model.frames,
+                    clip_seconds=f"{self.config.media.clip_seconds:g}",
+                    overlap=f"{self.config.sampling.overlap_seconds:g}",
+                    sr=self.config.media.audio_sample_rate // 1000,
+                    height=(
+                        f"_h{int(self.config.media.clip_height)}"
+                        if self.config.media.clip_height
+                        else ""
+                    ),
+                )
+            else:
+                suffix = CLIP_SUFFIX.format(
+                    frames=self.config.model.frames,
+                    clip_seconds=f"{self.config.media.clip_seconds:g}",
+                    clips=self.config.media.clips_per_work,
+                    sr=self.config.media.audio_sample_rate // 1000,
+                )
             self._version = slugify(self.embedder.version) + suffix
         return self._version
 
@@ -156,13 +191,35 @@ class Pipeline:
         version = self.embedding_version
         embedder = self.embedder
         is_test = bool(getattr(embedder, "is_test_only", False))
-        params = {
-            "embedder": type(embedder).__name__,
-            "is_test_only": is_test,
-            "aggregation": "l2-normalize-mean-l2-normalize",
-            "preprocess": "ffmpeg 8s clip h264/yuv420p + wav 48k/2ch/pcm_s16le",
-            "ablation": None,
-        }
+        if self.sampling_mode == "full_coverage":
+            params = {
+                "embedder": type(embedder).__name__,
+                "is_test_only": is_test,
+                "sampling_mode": "full_coverage",
+                "full_coverage": True,
+                "overlap_seconds": float(self.config.sampling.overlap_seconds),
+                "clip_height": self.config.media.clip_height,
+                "aggregation": "l2-normalize-mean-l2-normalize",
+                "preprocess": (
+                    "ffmpeg full-coverage windows h264/yuv420p"
+                    + (
+                        f" scale=-2:{int(self.config.media.clip_height)}"
+                        if self.config.media.clip_height
+                        else " (native resolution)"
+                    )
+                    + " + wav 48k/2ch/pcm_s16le"
+                ),
+            }
+            clips_per_work = 0
+        else:
+            params = {
+                "embedder": type(embedder).__name__,
+                "is_test_only": is_test,
+                "aggregation": "l2-normalize-mean-l2-normalize",
+                "preprocess": "ffmpeg 8s clip h264/yuv420p + wav 48k/2ch/pcm_s16le",
+                "ablation": None,
+            }
+            clips_per_work = self.config.media.clips_per_work
         self.catalog.register_embedding_version(
             version,
             model_checkpoint=(
@@ -171,7 +228,7 @@ class Pipeline:
             model_revision=None if is_test else self.config.model.revision,
             frames=self.config.model.frames,
             clip_seconds=self.config.media.clip_seconds,
-            clips_per_work=self.config.media.clips_per_work,
+            clips_per_work=clips_per_work,
             audio_sample_rate=self.config.media.audio_sample_rate,
             params=params,
         )
@@ -333,6 +390,7 @@ class Pipeline:
             "preprocess_s",
             "forward_s",
             "save_s",
+            "events_s",
             "total_s",
         ]
         with path.open("w", encoding="utf-8", newline="") as handle:
@@ -449,6 +507,8 @@ class Pipeline:
     def _process_work(
         self, work: dict[str, Any], *, version: str, run_id: int | None = None
     ) -> WorkOutcome:
+        """处理一部作品：按 sampling_mode 走 legacy 或 full_coverage 分支。"""
+
         work_id = int(work["id"])
         started = time.monotonic()
         temp_dir = self.config.paths.temp / f"work_{work_id:06d}"
@@ -459,6 +519,7 @@ class Pipeline:
             "extract_s": 0.0,
             "preprocess_s": 0.0,
             "forward_s": 0.0,
+            "events_s": 0.0,
             "save_s": 0.0,
         }
         try:
@@ -466,20 +527,7 @@ class Pipeline:
                 self.catalog.reopen(
                     work_id, reason=f"为向量版本 {version} 重新处理（旧向量保留）"
                 )
-            if work["source"] == "local":
-                if not work.get("local_path"):
-                    raise PipelineError("本地作品缺少 local_path")
-                source_path = self.config.local_work_path(str(work["local_path"]))
-                if not source_path.is_file():
-                    raise PipelineError(f"本地视频不存在: {source_path}")
-                self.catalog.begin_attempt(work_id, "encoding")
-            elif work["source"] == "bilibili":
-                download_started = time.monotonic()
-                source_path = self._download_bilibili_work(work, temp_dir)
-                timing["download_s"] = time.monotonic() - download_started
-                self.catalog.begin_attempt(work_id, "encoding")
-            else:
-                raise PipelineError(f"未知作品来源: {work['source']}")
+            source_path = self._resolve_source(work, work_id, temp_dir, timing)
 
             probe_started = time.monotonic()
             info = probe_media(
@@ -496,59 +544,32 @@ class Pipeline:
                 has_audio=int(info.has_audio),
                 has_video=int(info.has_video),
             )
-            plans: tuple[ClipPlan, ...] = plan_clips(
-                info.duration_s,
-                clip_seconds=self.config.media.clip_seconds,
-                clips_per_work=self.config.media.clips_per_work,
-                min_duration_seconds=self.config.media.min_duration_seconds,
-            )
-            clip_dir = temp_dir / "clips"
-            clip_dir.mkdir(parents=True, exist_ok=True)
-            extract_started = time.monotonic()
-            extracted = [
-                extract_clip(
-                    source_path,
-                    plan,
-                    clip_dir,
-                    media=self.config.media,
-                    info=info,
-                )
-                for plan in plans
-            ]
-            timing["extract_s"] = time.monotonic() - extract_started
-            if self._sync_budget > 0:
-                self._record_sync_checks(work_id, extracted)
-                self._sync_budget -= 1
 
-            batch = self.embedder.encode_pairs(
-                [(clip.video_path, clip.audio_path) for clip in extracted]
-            )
-            timing["preprocess_s"] = float(getattr(batch, "preprocess_s", 0.0) or 0.0)
-            timing["forward_s"] = float(getattr(batch, "forward_s", 0.0) or 0.0)
-            self._validate_batch(batch, expected=len(extracted))
-            save_started = time.monotonic()
-            work_dir = self.config.paths.embeddings / version / f"{work_id:06d}"
-            work_dir.mkdir(parents=True, exist_ok=True)
-            saved = self._save_vectors(work_dir, batch)
-            # 先登记片段计划再登记向量：这样崩溃在登记与 complete 之间时，
-            # _heal_interrupted_work 能看到完整片段记录并安全自愈。
-            self.catalog.replace_clips(
-                work_id,
-                version=version,
-                clips=[(clip.index, clip.start_s, clip.duration_s) for clip in extracted],
-            )
-            self._register_vectors(work_id, version=version, saved=saved, n_clips=len(extracted))
+            if self.sampling_mode == "full_coverage":
+                n_clips = self._run_full_coverage(
+                    work_id, source_path, info, version, temp_dir, timing
+                )
+            else:
+                n_clips = self._run_legacy(
+                    work_id, source_path, info, version, temp_dir, timing
+                )
+
             self.catalog.complete(work_id)
-            timing["save_s"] = time.monotonic() - save_started
             outcome = WorkOutcome(
                 work_id=work_id,
                 status="completed",
-                n_clips=len(extracted),
+                n_clips=n_clips,
                 duration_s=round(info.duration_s, 3),
             )
             # 只有向量成功写入并登记后才清理临时文件
             shutil.rmtree(temp_dir, ignore_errors=True)
-            logger.info("work_id=%s 完成：%d 个片段，%.1fs", work_id, len(extracted), info.duration_s)
+            logger.info(
+                "work_id=%s 完成（%s）：%d 个片段，%.1fs",
+                work_id,
+                self.sampling_mode,
+                n_clips,
+                info.duration_s,
+            )
         except Exception as exc:  # noqa: BLE001 - 批处理需要捕获任何单部失败
             message = f"{type(exc).__name__}: {exc}"
             logger.exception("work_id=%s 处理失败: %s", work_id, message)
@@ -573,10 +594,573 @@ class Pipeline:
         outcome.elapsed_s = round(time.monotonic() - started, 3)
         return outcome
 
+    def _resolve_source(
+        self,
+        work: dict[str, Any],
+        work_id: int,
+        temp_dir: Path,
+        timing: dict[str, float],
+    ) -> Path:
+        """解析源视频路径（本地直接使用；Bilibili 下载或复用 temp 中已下载文件）。"""
+
+        if work["source"] == "local":
+            if not work.get("local_path"):
+                raise PipelineError("本地作品缺少 local_path")
+            source_path = self.config.local_work_path(str(work["local_path"]))
+            if not source_path.is_file():
+                raise PipelineError(f"本地视频不存在: {source_path}")
+            self.catalog.begin_attempt(work_id, "encoding")
+            return source_path
+        if work["source"] == "bilibili":
+            download_started = time.monotonic()
+            source_path = self._download_bilibili_work(work, temp_dir)
+            timing["download_s"] += time.monotonic() - download_started
+            self.catalog.begin_attempt(work_id, "encoding")
+            return source_path
+        raise PipelineError(f"未知作品来源: {work['source']}")
+
+    # ------------------------------------------------------------------ legacy 分支
+    def _run_legacy(
+        self,
+        work_id: int,
+        source_path: Path,
+        info: Any,
+        version: str,
+        temp_dir: Path,
+        timing: dict[str, float],
+    ) -> int:
+        """v0.3 行为：plan_clips 均匀抽 <=N 段 -> 编码 -> 平均 -> 登记。"""
+
+        plans: tuple[ClipPlan, ...] = plan_clips(
+            info.duration_s,
+            clip_seconds=self.config.media.clip_seconds,
+            clips_per_work=self.config.media.clips_per_work,
+            min_duration_seconds=self.config.media.min_duration_seconds,
+        )
+        clip_dir = temp_dir / "clips"
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        extract_started = time.monotonic()
+        extracted = [
+            extract_clip(source_path, plan, clip_dir, media=self.config.media, info=info)
+            for plan in plans
+        ]
+        timing["extract_s"] += time.monotonic() - extract_started
+        if self._sync_budget > 0:
+            self._record_sync_checks(work_id, extracted)
+            self._sync_budget -= 1
+
+        batch = self.embedder.encode_pairs(
+            [(clip.video_path, clip.audio_path) for clip in extracted]
+        )
+        timing["preprocess_s"] += float(getattr(batch, "preprocess_s", 0.0) or 0.0)
+        timing["forward_s"] += float(getattr(batch, "forward_s", 0.0) or 0.0)
+        self._validate_batch(batch, expected=len(extracted))
+
+        save_started = time.monotonic()
+        work_dir = self.config.paths.embeddings / version / f"{work_id:06d}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        saved = self._save_vectors(work_dir, batch)
+        # 先登记片段计划再登记向量：这样崩溃在登记与 complete 之间时，
+        # _heal_interrupted_work 能看到完整片段记录并安全自愈。
+        self.catalog.replace_clips(
+            work_id,
+            version=version,
+            clips=[(clip.index, clip.start_s, clip.duration_s) for clip in extracted],
+        )
+        self._register_vectors(work_id, version=version, saved=saved, n_clips=len(extracted))
+        timing["save_s"] += time.monotonic() - save_started
+        return len(extracted)
+
+    # ------------------------------------------------------------------ full coverage 分支
+    def _run_full_coverage(
+        self,
+        work_id: int,
+        source_path: Path,
+        info: Any,
+        version: str,
+        temp_dir: Path,
+        timing: dict[str, float],
+    ) -> int:
+        """v0.4 全片覆盖：分片提取 -> 编码 -> 原子批文件 -> 拼接 -> 登记（支持恢复）。"""
+
+        config = self.config
+        duration_s = float(info.duration_s)
+        if duration_s > config.media.long_video_seconds and not self.allow_long:
+            raise PipelineError(
+                f"超长视频 {duration_s:.1f}s 超过 media.long_video_seconds="
+                f"{config.media.long_video_seconds:g}s；full_coverage 默认不处理，"
+                "确认要全片处理请加 --allow-long"
+            )
+        plans = plan_full_coverage(
+            duration_s,
+            clip_seconds=config.media.clip_seconds,
+            overlap_seconds=config.sampling.overlap_seconds,
+            min_duration_seconds=config.media.min_duration_seconds,
+        )
+        n_clips = len(plans)
+        batch_size = max(1, int(config.model.batch_size))
+        work_dir = config.paths.embeddings / version / f"{work_id:06d}"
+        partial_dir = work_dir / ".partial"
+        partial_relpath = config.data_relpath(partial_dir)
+        sampling_payload = {
+            "mode": "full_coverage",
+            "clip_seconds": float(config.media.clip_seconds),
+            "overlap_seconds": float(config.sampling.overlap_seconds),
+            "clip_height": config.media.clip_height,
+            "duration_s": round(duration_s, 6),
+            "event_version": config.events.version,
+        }
+        work_dir.mkdir(parents=True, exist_ok=True)
+        done_batches = self._prepare_partial_plan(work_id, partial_dir, plans, sampling_payload)
+        n_done = min(done_batches * batch_size, n_clips)
+        self.catalog.upsert_sequence_state(
+            work_id,
+            version=version,
+            duration_s=duration_s,
+            n_clips=n_clips,
+            n_clips_done=n_done,
+            partial_relpath=partial_relpath,
+            status="in_progress",
+        )
+
+        try:
+            events_started = time.monotonic()
+            self._scan_events_if_needed(work_id, work_dir, source_path, plans)
+            timing["events_s"] += time.monotonic() - events_started
+
+            completed_batches = 0
+            for batch_index, chunk in enumerate(self._batched_plans(plans, batch_size)):
+                batch_path = partial_dir / f"batch_{batch_index:04d}.npz"
+                if batch_path.is_file():
+                    completed_batches += 1
+                    logger.info(
+                        "work_id=%s full_coverage 复用已编码批次 %d/%d",
+                        work_id,
+                        batch_index + 1,
+                        (n_clips + batch_size - 1) // batch_size,
+                    )
+                    continue
+                clip_dir = temp_dir / f"batch_{batch_index:04d}"
+                extract_started = time.monotonic()
+                extracted = [
+                    extract_clip(source_path, plan, clip_dir, media=config.media, info=info)
+                    for plan in chunk
+                ]
+                timing["extract_s"] += time.monotonic() - extract_started
+                try:
+                    batch = self.embedder.encode_pairs(
+                        [(clip.video_path, clip.audio_path) for clip in extracted]
+                    )
+                    timing["preprocess_s"] += float(
+                        getattr(batch, "preprocess_s", 0.0) or 0.0
+                    )
+                    timing["forward_s"] += float(getattr(batch, "forward_s", 0.0) or 0.0)
+                    self._validate_batch(batch, expected=len(chunk))
+                    self._write_partial_batch(batch_path, batch)
+                finally:
+                    # 编码成功与否都删掉该批临时切片；失败批次不保留半成品编码
+                    shutil.rmtree(clip_dir, ignore_errors=True)
+                completed_batches += 1
+                n_done = min(completed_batches * batch_size, n_clips)
+                self.catalog.upsert_sequence_state(
+                    work_id,
+                    version=version,
+                    duration_s=duration_s,
+                    n_clips=n_clips,
+                    n_clips_done=n_done,
+                    partial_relpath=partial_relpath,
+                    status="in_progress",
+                )
+                logger.info(
+                    "work_id=%s full_coverage 批次 %d/%d 完成（%d/%d 片段）",
+                    work_id,
+                    batch_index + 1,
+                    (n_clips + batch_size - 1) // batch_size,
+                    n_done,
+                    n_clips,
+                )
+
+            save_started = time.monotonic()
+            saved = self._assemble_full_sequence(
+                work_id=work_id,
+                version=version,
+                work_dir=work_dir,
+                partial_dir=partial_dir,
+                plans=plans,
+                batch_size=batch_size,
+                duration_s=duration_s,
+                sampling_payload=sampling_payload,
+            )
+            self.catalog.replace_clips(
+                work_id,
+                version=version,
+                clips=[
+                    (
+                        int(plan.index),
+                        float(plan.start_s),
+                        float(plan.duration_s),
+                        float(plan.valid_duration_s),
+                        float(plan.weight),
+                    )
+                    for plan in plans
+                ],
+            )
+            self._register_vectors(work_id, version=version, saved=saved, n_clips=n_clips)
+            self.catalog.upsert_sequence_state(
+                work_id,
+                version=version,
+                duration_s=duration_s,
+                n_clips=n_clips,
+                n_clips_done=n_clips,
+                partial_relpath=partial_relpath,
+                status="assembled",
+            )
+            timing["save_s"] += time.monotonic() - save_started
+        except Exception:
+            try:
+                done_now = min(
+                    self._count_partial_batches(partial_dir) * batch_size, n_clips
+                )
+                self.catalog.upsert_sequence_state(
+                    work_id,
+                    version=version,
+                    duration_s=duration_s,
+                    n_clips=n_clips,
+                    n_clips_done=done_now,
+                    partial_relpath=partial_relpath,
+                    status="failed",
+                )
+            except DatabaseError:  # pragma: no cover - 编目异常不掩盖主错误
+                logger.exception("记录 work_id=%s 的失败序列状态时出错", work_id)
+            raise
+
+        shutil.rmtree(partial_dir, ignore_errors=True)
+        return n_clips
+
+    @staticmethod
+    def _batched_plans(
+        plans: Sequence[CoverageClip], batch_size: int
+    ) -> list[list[CoverageClip]]:
+        """把窗口计划按 batch_size 切成批次列表。"""
+
+        return [
+            list(plans[start : start + batch_size])
+            for start in range(0, len(plans), batch_size)
+        ]
+
+    @staticmethod
+    def _count_partial_batches(partial_dir: Path) -> int:
+        """统计从 0 开始连续存在的 batch_*.npz 数量。"""
+
+        count = 0
+        while (partial_dir / f"batch_{count:04d}.npz").is_file():
+            count += 1
+        return count
+
+    def _prepare_partial_plan(
+        self,
+        work_id: int,
+        partial_dir: Path,
+        plans: Sequence[CoverageClip],
+        sampling_payload: Mapping[str, Any],
+    ) -> int:
+        """写入/校验 .partial/plan.json，返回已完成的批次数。
+
+        若已有 plan.json 与当前窗口计划完全一致则复用（崩溃恢复）；不一致
+        （源文件时长/采样参数变化）则丢弃整个 .partial 重新开始。
+        """
+
+        plan_path = partial_dir / "plan.json"
+        expected: dict[str, Any] = {
+            "work_id": work_id,
+            "n_clips": len(plans),
+            "sampling": dict(sampling_payload),
+            "plans": [
+                {
+                    "index": int(plan.index),
+                    "start_s": float(plan.start_s),
+                    "duration_s": float(plan.duration_s),
+                    "valid_duration_s": float(plan.valid_duration_s),
+                    "weight": float(plan.weight),
+                }
+                for plan in plans
+            ],
+        }
+        if plan_path.is_file():
+            try:
+                existing = json.loads(plan_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = None
+            if existing == expected:
+                return self._count_partial_batches(partial_dir)
+            logger.warning(
+                "work_id=%s 的 .partial/plan.json 与当前窗口计划不一致，丢弃 partial 重新编码",
+                work_id,
+            )
+            shutil.rmtree(partial_dir, ignore_errors=True)
+        partial_dir.mkdir(parents=True, exist_ok=True)
+        self._atomic_write_json(plan_path, expected)
+        return 0
+
+    def _write_partial_batch(self, path: Path, batch: Any) -> None:
+        """原子写入一个批次的向量 npz（先写同目录临时文件再 os.replace）。"""
+
+        arrays: dict[str, np.ndarray] = {
+            "joint": np.asarray(batch.joint, dtype=np.float32)
+        }
+        if getattr(batch, "audio", None) is not None:
+            arrays["audio"] = np.asarray(batch.audio, dtype=np.float32)
+        if getattr(batch, "video", None) is not None:
+            arrays["video"] = np.asarray(batch.video, dtype=np.float32)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.tmp")
+        try:
+            with tmp_path.open("wb") as handle:
+                np.savez(handle, **arrays)
+            os.replace(tmp_path, path)
+        except OSError as exc:
+            raise PipelineError(f"写入批次向量失败（{path}）：{exc}") from exc
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:  # pragma: no cover - 清理失败不改变主结果
+                logger.warning("无法删除批次临时文件: %s", tmp_path)
+
+    def _scan_events_if_needed(
+        self,
+        work_id: int,
+        work_dir: Path,
+        source_path: Path,
+        plans: Sequence[CoverageClip],
+    ) -> bool:
+        """按需调用 nebula.events 扫描高频事件（延迟 import，失败让作品失败）。"""
+
+        config = self.config
+        if not config.events.enabled:
+            return False
+        scan_path = work_dir / "event_scan.npz"
+        if scan_path.is_file():
+            logger.info("work_id=%s 复用已有事件扫描文件: %s", work_id, scan_path)
+            return False
+        try:
+            from .events import save_events_bundle, scan_events
+        except ImportError as exc:
+            raise PipelineError(
+                "config.events.enabled=true 但 nebula.events 不可用："
+                f"{exc}（事件扫描模块未交付或接口缺失）"
+            ) from exc
+        logger.info("work_id=%s 开始高频事件扫描（%d 个窗口）", work_id, len(plans))
+        features = scan_events(
+            source_path,
+            plans,
+            ffmpeg=config.media.ffmpeg,
+            audio_rate_hz=int(config.events.audio_rate_hz),
+            video_fps=int(config.events.video_fps),
+            timeout_s=float(config.media.extract_timeout_seconds),
+        )
+        save_events_bundle(work_dir, features)
+        if not scan_path.is_file():
+            raise PipelineError(f"事件扫描未生成 event_scan.npz: {scan_path}")
+        return True
+
+    @staticmethod
+    def _validate_sequence_times(
+        plans: Sequence[CoverageClip], duration_s: float
+    ) -> None:
+        """校验拼接前的窗口时间：单调、无越界、无间隙、末尾锚定。"""
+
+        if not plans:
+            raise PipelineError("全片覆盖计划为空，无法拼接序列")
+        starts = np.asarray([plan.start_s for plan in plans], dtype=np.float64)
+        ends = starts + np.asarray([plan.duration_s for plan in plans], dtype=np.float64)
+        if abs(float(starts[0])) > 1e-6:
+            raise PipelineError(f"第一个窗口未从 0 开始: {starts[0]:.6f}")
+        if abs(float(ends[-1]) - duration_s) > 1e-3:
+            raise PipelineError(
+                f"最后一个窗口结束于 {ends[-1]:.3f}s，未锚定视频结尾 {duration_s:.3f}s"
+            )
+        if float(starts.min()) < -1e-9 or float(ends.max()) > duration_s + 1e-3:
+            raise PipelineError("窗口越界（起点为负或结束超过视频时长）")
+        if np.any(np.diff(starts) < -1e-9):
+            raise PipelineError("窗口起点不是单调非降")
+        gaps = starts[1:] - ends[:-1]
+        if np.any(gaps > 1e-6):
+            raise PipelineError(
+                f"窗口之间存在未覆盖间隙（最大 {float(gaps.max()):.6f}s）"
+            )
+
+    def _assemble_full_sequence(
+        self,
+        *,
+        work_id: int,
+        version: str,
+        work_dir: Path,
+        partial_dir: Path,
+        plans: Sequence[CoverageClip],
+        batch_size: int,
+        duration_s: float,
+        sampling_payload: Mapping[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        """拼接所有批次 -> 写 clip_*.npy / clip_times.npy / work_*.npy / manifest.json。"""
+
+        from .embed import aggregate_work_vector, save_vector
+
+        n_clips = len(plans)
+        expected_batches = (n_clips + batch_size - 1) // batch_size
+        joint_parts: list[np.ndarray] = []
+        audio_parts: list[np.ndarray] = []
+        video_parts: list[np.ndarray] = []
+        has_audio: bool | None = None
+        has_video: bool | None = None
+        for batch_index in range(expected_batches):
+            path = partial_dir / f"batch_{batch_index:04d}.npz"
+            if not path.is_file():
+                raise PipelineError(f"缺少批次向量文件，无法拼接: {path}")
+            expected_rows = min(batch_size, n_clips - batch_index * batch_size)
+            with np.load(path, allow_pickle=False) as payload:
+                keys = set(payload.files)
+                joint = np.asarray(payload["joint"], dtype=np.float32)
+                if joint.ndim != 2 or joint.shape[0] != expected_rows or joint.shape[1] < 1:
+                    raise EmbeddingError(
+                        f"批次 {batch_index} 的 joint 形状异常: {joint.shape}（期望 {expected_rows} 行）"
+                    )
+                if not np.all(np.isfinite(joint)):
+                    raise EmbeddingError(f"批次 {batch_index} 的 joint 含 NaN/Inf")
+                joint_parts.append(joint)
+                batch_has_audio = "audio" in keys
+                batch_has_video = "video" in keys
+                if has_audio is None:
+                    has_audio, has_video = batch_has_audio, batch_has_video
+                elif (batch_has_audio, batch_has_video) != (has_audio, has_video):
+                    raise EmbeddingError(
+                        f"批次 {batch_index} 的单模态向量可用性与其他批次不一致"
+                    )
+                if batch_has_audio:
+                    audio = np.asarray(payload["audio"], dtype=np.float32)
+                    if audio.shape != joint.shape:
+                        raise EmbeddingError(f"批次 {batch_index} 的 audio 形状异常: {audio.shape}")
+                    audio_parts.append(audio)
+                if batch_has_video:
+                    video = np.asarray(payload["video"], dtype=np.float32)
+                    if video.shape != joint.shape:
+                        raise EmbeddingError(f"批次 {batch_index} 的 video 形状异常: {video.shape}")
+                    video_parts.append(video)
+
+        clip_joint = np.concatenate(joint_parts, axis=0).astype(np.float32, copy=False)
+        if clip_joint.shape[0] != n_clips:
+            raise EmbeddingError(
+                f"拼接后的片段数 {clip_joint.shape[0]} 与计划 {n_clips} 不一致"
+            )
+        clip_audio = (
+            np.concatenate(audio_parts, axis=0).astype(np.float32, copy=False)
+            if audio_parts
+            else None
+        )
+        clip_video = (
+            np.concatenate(video_parts, axis=0).astype(np.float32, copy=False)
+            if video_parts
+            else None
+        )
+        self._validate_sequence_times(plans, duration_s)
+
+        saved: dict[str, dict[str, Any]] = {}
+
+        def _save(kind: str, array: np.ndarray) -> None:
+            path = work_dir / f"{kind}.npy"
+            save_vector(path, array)
+            saved[kind] = {
+                "path": self.config.data_relpath(path),
+                "dim": int(array.shape[-1]),
+                "n_clips": int(array.shape[0]) if kind.startswith("clip_") else None,
+            }
+
+        _save("clip_joint", clip_joint)
+        if clip_audio is not None:
+            _save("clip_audio", clip_audio)
+        if clip_video is not None:
+            _save("clip_video", clip_video)
+        _save("work_joint", aggregate_work_vector(clip_joint))
+        if clip_audio is not None:
+            _save("work_audio", aggregate_work_vector(clip_audio))
+        if clip_video is not None:
+            _save("work_video", aggregate_work_vector(clip_video))
+
+        clip_times = np.asarray(
+            [
+                [
+                    float(plan.start_s),
+                    float(plan.duration_s),
+                    float(plan.valid_duration_s),
+                    float(plan.weight),
+                ]
+                for plan in plans
+            ],
+            dtype=np.float32,
+        )
+        save_vector(work_dir / "clip_times.npy", clip_times)
+
+        manifest = {
+            "work_id": work_id,
+            "sequence_version": version,
+            "sampling": dict(sampling_payload),
+            "n_clips": n_clips,
+            "duration_s": round(duration_s, 6),
+            "clip_height": self.config.media.clip_height,
+            "batch_size": batch_size,
+            "event_version": self.config.events.version,
+            "events_enabled": bool(self.config.events.enabled),
+            "events_scanned": (work_dir / "event_scan.npz").is_file(),
+            "embedder": type(self.embedder).__name__,
+            "is_test_only": bool(getattr(self.embedder, "is_test_only", False)),
+            "code_version": __version__,
+            "created_at": now_utc_iso(),
+        }
+        self._atomic_write_json(work_dir / "manifest.json", manifest)
+        logger.info(
+            "work_id=%s 序列拼接完成：%d 个片段，权重和 %.6f，已写 manifest",
+            work_id,
+            n_clips,
+            float(clip_times[:, 3].sum()),
+        )
+        return saved
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+        """以“同目录临时文件 + os.replace”原子写入 JSON。"""
+
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target.with_name(f".{target.name}.tmp")
+        text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        try:
+            tmp_path.write_text(text, encoding="utf-8")
+            os.replace(tmp_path, target)
+        except OSError as exc:
+            raise PipelineError(f"写入 JSON 失败（{target}）：{exc}") from exc
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:  # pragma: no cover - 清理失败不改变主结果
+                logger.warning("无法删除 JSON 临时文件: %s", tmp_path)
+
     def _download_bilibili_work(self, work: dict[str, Any], temp_dir: Path) -> Path:
+        """下载 Bilibili 源视频；崩溃恢复场景下复用 temp 中已可 probe 的文件。"""
+
         if not work.get("bvid"):
             raise PipelineError("Bilibili 作品缺少 bvid")
-        self.catalog.begin_attempt(int(work["id"]), "downloading")
+        work_id = int(work["id"])
+        self.catalog.begin_attempt(work_id, "downloading")
+        download_dir = temp_dir / "download"
+        reused = self._find_reusable_download(download_dir)
+        if reused is not None:
+            logger.info(
+                "work_id=%s 复用 temp 中已下载的源文件，跳过重复下载: %s",
+                work_id,
+                reused,
+            )
+            return reused
         from .download import BilibiliClient, download_bilibili
 
         client = self._bilibili_client
@@ -587,14 +1171,13 @@ class Pipeline:
         part = int(work["part"])
         meta = client.fetch_meta(bvid, part=part)
         self.catalog.update_work_metadata(
-            int(work["id"]),
+            work_id,
             title=meta.title,
             author_uid=meta.author_uid,
             author_name=meta.author_name,
             duration_s=meta.duration_s,
             publish_date=meta.publish_date,
         )
-        download_dir = temp_dir / "download"
         download_dir.mkdir(parents=True, exist_ok=True)
         path = download_bilibili(
             bvid,
@@ -605,6 +1188,27 @@ class Pipeline:
         if not path.is_file():
             raise PipelineError(f"下载后找不到文件: {path}")
         return path
+
+    def _find_reusable_download(self, download_dir: Path) -> Path | None:
+        """在 temp/download/ 中查找已存在且可 probe 的源文件（崩溃恢复用）。"""
+
+        if not download_dir.is_dir():
+            return None
+        for candidate in sorted(download_dir.iterdir()):
+            if not candidate.is_file():
+                continue
+            if candidate.suffix.lower() in (".part", ".tmp", ".ytdl"):
+                continue
+            try:
+                probe_media(
+                    candidate,
+                    ffprobe=self.config.media.ffprobe,
+                    timeout_s=self.config.media.probe_timeout_seconds,
+                )
+            except MediaError:
+                continue
+            return candidate
+        return None
 
     # ------------------------------------------------------------------ 向量保存
     def _save_vectors(self, work_dir: Path, batch: Any) -> dict[str, dict[str, Any]]:

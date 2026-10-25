@@ -50,7 +50,10 @@ Bilibili BV 清单 ───┘                                        │
 | 数据层 | `nebula/identity.py` | 标题规范化、本地↔Bilibili 身份候选与关联（人工清单兜底）、向量复制登记 | db、config、errors；Bilibili 客户端由调用方注入 |
 | 分析层 | `nebula/stability.py` | 片段留一重聚合、Top-k 稳定性报告（JSON/CSV） | config、db、embed、numpy；**不加载模型、不导入 umap/pandas** |
 | 分析层 | `nebula/avsync.py` | 音画错位实验：WAV 偏移/交换、画质退化基线、Δ=1-cos 计算与 JSON/CSV 报告 | config、embed、media、sampling、numpy；不写主向量库 |
-| 入口层 | `ingest.py` / `pipeline.py` / `map.py` / `qa.py` / `tools/clip_stability.py` / `tools/desync_experiment.py` / `tools/preflight_works.py` | 参数解析、调用库代码、打印结果、返回退出码 | 对应库模块 |
+| 领域层 | `nebula/events.py` | 高频音画事件扫描：音频 100Hz/视频 30fps 特征、音画互相关、窗口压缩为 32 维 | media、config、numpy；不导入模型/UMAP/UI |
+| 分析层 | `nebula/temporal.py` | 表征聚合：Full Mean（全片窗口均值）与 Temporal Stats（全局/阶段/漂移/动态/自相似/事件分组） | representations、numpy；确定性、顺序敏感性由测试约束 |
+| 分析层 | `nebula/representations.py` | 表征注册/解析/向量落盘与加载；legacy 复用 embeddings，派生走 representation_vectors；矩阵按 work_id 排序、排除 duplicate | config、db、embed、numpy |
+| 入口层 | `ingest.py` / `pipeline.py` / `map.py` / `qa.py` / `tools/clip_stability.py` / `tools/desync_experiment.py` / `tools/preflight_works.py` / `tools/build_representation.py` / `tools/compare_spaces.py` / `tools/events_probe.py` | 参数解析、调用库代码、打印结果、返回退出码 | 对应库模块 |
 
 依赖方向只有一条：入口层 → 展示层 / 编排层 → 领域层 → 基础层。
 几个必须保持的边界（由 `tests/test_invariants.py` 静态检查）：
@@ -67,6 +70,8 @@ Bilibili BV 清单 ───┘                                        │
 - `nebula.identity` 只做本地数据与编排，Bilibili 网络客户端由调用方注入（默认测试离线）；
 - `nebula.avsync` 不导入 UMAP/界面库；导入模块本身不加载 torch/transformers（模型在实验脚本内按需使用），
   实验只写 `logs/`，不改主 `data/embeddings` 与 `embedding_version`；
+- `nebula.events` / `nebula.temporal` / `nebula.representations` 不导入模型/UMAP/Streamlit/Plotly；
+  事件与表征层只做数值计算与文件/DB 登记，渲染在 `app.py`；
 - 片段级探索的纯数据接口（`appdata.clip_heatmap_data / clip_pair_rows`）只返回 dict/list，
   不接收 Plotly/Streamlit 对象；渲染在 `app.py`；
 - 近邻解释字段（`pair_percentile / is_mutual / hubness`）只影响展示，不改变近邻排序、
@@ -86,6 +91,9 @@ works 1────N map_coords N────1 map_runs
 map_runs N────1 embedding_versions         （星云必须记录基于哪个向量版本）
 works 1────N work_links N────1 works       （canonical ← duplicate 单层身份关联，v0.2）
 works 1────N work_timings N────1 pipeline_runs   （单部分阶段耗时 ← 批次，v0.2）
+works 1────N sequence_states N────1 embedding_versions  （全片编码进度，v0.4）
+works 1────N representation_vectors N────1 representations
+map_runs N────1 representations            （地图必须绑定一个表征，v0.4）
 ~~~
 
 | 表 | 关键列 | 说明 |
@@ -97,12 +105,15 @@ works 1────N work_timings N────1 pipeline_runs   （单部分阶
 | `appearances` | `work_id`, `list_id`, `rank`, `votes` | 作品与榜单的出现关系；跨年重复只增行 |
 | `embedding_versions` | `version` PK, `model_checkpoint`, `model_revision`, `frames`, `clip_seconds`, `clips_per_work`, `audio_sample_rate`, `params_json` | 向量版本登记；同版本参数不一致直接报错 |
 | `embeddings` | `work_id`, `version`, `kind`, `path`, `dim`, `n_clips` | 只登记向量文件位置与形状，不存元数据 |
-| `clips` | `work_id`, `version`, `idx`, `start_s`, `duration_s` | 采样计划落库，用于复核音画同步 |
-| `map_runs` | `version` PK, `embedding_version`, `params_json`, `filter_json`, `coords_path`, `model_2d_path`, `model_3d_path`, `n_works`, `status` | 星云版本；`building/ready/failed`；`filter_json` 记录 v0.2 筛选条件（NULL = 全量） |
+| `clips` | `work_id`, `version`, `idx`, `start_s`, `duration_s`, `valid_duration_s`, `weight` | 采样计划落库；v0.4 全片格式为 5 元组，旧 3 元组写入时后两列为 NULL |
+| `map_runs` | `version` PK, `embedding_version`, `representation_id`, `params_json`, `filter_json`, `coords_path`, `model_2d_path`, `model_3d_path`, `n_works`, `status` | 星云版本；`building/ready/failed`；`filter_json` 记录筛选条件（NULL = 全量）；`representation_id` 绑定表征（v0.4） |
 | `map_coords` | `map_version`, `work_id`, `x2`, `y2`, `x3`, `y3`, `z3` | 主键 `(map_version, work_id)`，一个版本一套坐标 |
 | `work_links` | `canonical_work_id`, `duplicate_work_id` UNIQUE, `method`, `confidence`, `note` | 身份关联（v0.2）：duplicate 唯一、单层、默认不进星云；CHECK 禁止自关联 |
 | `pipeline_runs` | `id`, `started_at/finished_at`, `embedding_version`, `model_load_s`, `n_selected/n_completed/n_failed`, `total_s`, `params_json` | A4 批次级指标（模型加载属于批次级） |
-| `work_timings` | `run_id`, `work_id`, `embedding_version`, `download_s/probe_s/extract_s/preprocess_s/forward_s/save_s/total_s` | A4 单部作品分阶段耗时；`UNIQUE(run_id, work_id)` 防止重复登记 |
+| `work_timings` | `run_id`, `work_id`, `embedding_version`, `download_s/probe_s/extract_s/preprocess_s/forward_s/save_s/events_s/total_s` | A4 单部作品分阶段耗时；v0.4 新增 `events_s`（事件扫描）；`UNIQUE(run_id, work_id)` 防止重复登记 |
+| `representations` | `id`, `name`, `sequence_version`, `kind`, `dim`, `path_prefix`, `params_json`, `status`, `note` | 表征版本（v0.4）；`UNIQUE(name, sequence_version)`；kind ∈ legacy/full_mean/temporal_stats/transformer；聚合器变化只新增表征，不重编码 |
+| `representation_vectors` | `representation_id`, `work_id`, `kind`, `path`, `dim` | 派生表征的作品级向量（joint/audio/video）；legacy 不写此表，直接复用 embeddings |
+| `sequence_states` | `work_id`, `version`, `duration_s`, `n_clips`, `n_clips_done`, `partial_relpath`, `status` | 全片编码进度（v0.4）；status ∈ in_progress/assembled/failed；支持片段级断点恢复 |
 
 连接设置：WAL、`foreign_keys=ON`、`BEGIN IMMEDIATE` 事务、`busy_timeout`；
 所有写操作在事务内完成，读方法返回普通 `dict` 便于上层使用。
@@ -123,24 +134,37 @@ works 1────N work_timings N────1 pipeline_runs   （单部分阶
 ```text
 data/
 ├── catalog.sqlite                     # 索引与状态
-├── embeddings/<embedding_version>/
+├── embeddings/<sequence_version>/     # 序列层：PE-AV 片段/事件（只编码一次）
 │   └── <work_id>/
-│       ├── work_joint.npy             # (dim,) float32，L2 范数 ≈ 1
+│       ├── work_joint.npy             # (dim,) float32，L2 范数 ≈ 1（全片/片段均值）
 │       ├── work_audio.npy / work_video.npy      # 单模态作品向量（若模型提供）
 │       ├── clip_joint.npy             # (n_clips, dim) float32，每行 L2 范数 ≈ 1
-│       └── clip_audio.npy / clip_video.npy
+│       ├── clip_audio.npy / clip_video.npy
+│       ├── clip_times.npy             # (T,4) start_s, duration_s, valid_duration_s, weight（v0.4）
+│       ├── event_scan.npz             # v0.4.1 高频事件原始序列（音频/视频/音画关系 + 速率/版本）
+│       ├── event_features.npy         # (T,32) 每个窗口的事件特征
+│       ├── event_manifest.json
+│       ├── manifest.json              # n_clips / duration / sampling 参数 / 代码版本标签
+│       └── .partial/                  # 编码中：batch_0000.npz ... 原子写入，完成后删除
+├── representations/<name>/<sequence_version>/<work_id>/
+│   └── {joint,audio,video}.npy        # 派生表征向量（full_mean/temporal_stats）
 └── maps/<map_version>/
     ├── coords.parquet                 # work_id, x2, y2, x3, y3, z3
     ├── map_2d.joblib                  # 已训练的 2D UMAP 模型（供 transform）
     ├── map_3d.joblib
-    └── meta.json                      # 参数、向量版本、作品数、生成时间
+    └── meta.json                      # 参数、向量版本、表征、作品数、生成时间
 ```
 
 - 数据库里 `embeddings.path` 存的是相对 `data/` 的 POSIX 路径
   （`config.data_relpath`），保证换机器/换盘符后仍可解析；
-- `work_joint` 等作品级向量的 `dim` 在同一个 `embedding_version` 内必须一致；
+- `work_joint` 等作品级向量的 `dim` 在同一个 `sequence_version` 内必须一致；
 - 片段级向量形状 `(n_clips, dim)`，`n_clips` 与 `clips` 表的段数一致；
-- 所有 npy / joblib / parquet 写入都走“临时文件 + 原子替换”，避免半文件。
+  全片模式没有片段数上限，最后一个窗口结束于视频结尾且任意时间点至少被 1 个窗口覆盖；
+- 序列层（片段/事件）编码一次后长期复用；表征层只做聚合（Full Mean / Temporal Stats），
+  聚合器变化写新 `representations` 行，绝不重新编码 PE-AV；
+- legacy 序列版本目录保持原样、只读；新序列版本另建目录，不覆盖旧向量；
+- 所有 npy / joblib / parquet 写入都走“临时文件 + 原子替换”，避免半文件；
+  全片编码的 `.partial/batch_*.npz` 逐批原子写入，重启只补缺失批。
 
 `logs/` 下的可重建报告（v0.2）：
 
@@ -151,7 +175,8 @@ logs/
 ├── ablation_report.json        # 静音/遮蔽画面消融
 ├── clip_stability.json/.csv    # A3：片段稳定性报告（tools/clip_stability.py 生成）
 ├── av_desync_experiment.json/.csv  # A6：音画错位实验（tools/desync_experiment.py 生成）
-└── preflight_89.json           # 2025 选票扩量预检（tools/preflight_works.py 生成）
+├── preflight_89.json           # 2025 选票扩量预检（tools/preflight_works.py 生成）
+└── space_compare_*.json/.csv   # v0.4：两个表征空间的邻域迁移对比（tools/compare_spaces.py 生成）
 ~~~
 
 这些文件只用于观察与证据，**不进入**向量库与星云；删除后可按原命令重新生成。
@@ -230,6 +255,19 @@ logs/
     `nebula/avsync` 与 `tools/desync_experiment.py` 只在 `temp/` 生成变体并写
     `logs/` 报告；不写 `data/embeddings`、不登记新 `embedding_version`、
     不参与星云；真实运行需要模型，必须标 `model` marker，默认测试不加载权重。
+17. **序列层与表征层分离，版本只增不改（v0.4）。**
+    序列层 `data/embeddings/<sequence_version>/` 保存 PE-AV 片段/事件，编码一次后复用；
+    表征层 `data/representations/<name>/<sequence_version>/` 只保存聚合结果，聚合器变化只新增
+    `representations` 行。不同 sequence/representation 的向量**禁止混入同一 UMAP 输入或近邻矩阵**；
+    legacy 目录只读，旧 `embedding_version` 与旧地图不迁移、不覆盖。
+18. **地图必须绑定同序列代表征（v0.4）。**
+    `map_runs.representation_id` 必须存在，且其 `sequence_version` 必须与地图的
+    `embedding_version` 一致；旧地图允许不绑定（历史兼容），但新地图必须绑定；
+    版本号 `map_vNNN` 只增不改，重复建图直接拒绝。
+19. **全片覆盖与恢复语义（v0.4）。**
+    `plan_full_coverage` 生成无间隙、无越界、末尾锚定窗口，`Σweight=1`；
+    编码按批写入 `.partial/batch_*.npz`（原子），失败重启用 `sequence_states` 只补缺失批；
+    完成后 `clips` 5 元组与 `clip_*` 行数一致，状态置 `assembled`。
 
 ## 5. 处理流程与失败语义
 
@@ -369,7 +407,7 @@ A 原始、A-quality 轻画质退化基线、B 音频 +0.5s、C 音频 +1.0s、D
 | --- | --- |
 | `nebula/config.py` | 唯一配置来源；所有相对路径相对 config.yaml 解析 |
 | `nebula/db.py` | Catalog：作品、榜单、向量、状态、星云版本 |
-| `nebula/sampling.py` | 时间轴采样规则 |
+| `nebula/sampling.py` | 时间轴采样规则：legacy `plan_clips`（≤5×8s）与 v0.4 全覆盖 `plan_full_coverage`（无间隙/末尾锚定/权重和=1） |
 | `nebula/media.py` | ffprobe/ffmpeg 封装 |
 | `nebula/embed.py` | PE-AV / 测试嵌入器、聚合、npy 读写 |
 | `nebula/pipeline.py` | 单部处理与批处理编排 |
@@ -379,13 +417,19 @@ A 原始、A-quality 轻画质退化基线、B 音频 +0.5s、C 音频 +1.0s、D
 | `nebula/identity.py` | 标题规范化、本地↔BV 身份候选/关联、向量复制（B1） |
 | `nebula/stability.py` | 片段留一重聚合与 Top-k 稳定性报告（A3） |
 | `nebula/avsync.py` | 音画错位实验：WAV 偏移/交换、画质退化基线、Δ 计算与报告（A6） |
-| `nebula/mapplot.py` | UMAP 训练、筛选/变体版本落盘、transform |
+| `nebula/events.py` | 高频音画事件扫描（音频 100Hz/视频 30fps、音画互相关、窗口 32 维特征，v0.4.1） |
+| `nebula/temporal.py` | Full Mean / Temporal Stats 聚合（v0.4.2） |
+| `nebula/representations.py` | 表征注册/解析/保存/加载；legacy 与派生表征隔离 |
+| `nebula/mapplot.py` | UMAP 训练、筛选/变体版本落盘、transform、按表征建图 |
 | `nebula/appdata.py` | 可视化数据准备（纯函数，含近邻密度与筛选） |
 | `app.py` | Streamlit 应用（近邻面板、密度、筛选） |
 | `ingest.py/pipeline.py/map.py/qa.py` | 顶层 CLI（含 link-local、variants） |
 | `tools/clip_stability.py` | A3 稳定性报告 CLI（只读、离线） |
 | `tools/desync_experiment.py` | A6 音画错位实验 CLI（真实模型，输出 logs） |
 | `tools/preflight_works.py` | 2025 选票 89 部扩量预检 CLI（只读 DB，真实 API） |
+| `tools/build_representation.py` | v0.4 表征构建 CLI（full_mean / temporal_stats，只读序列、不重编码） |
+| `tools/compare_spaces.py` | v0.4 两个表征空间的邻域迁移对比（Jaccard/稳定对/余弦相关/hubness） |
+| `tools/events_probe.py` | v0.4.1 事件扫描探针/预览 CLI（离线合成或单部作品） |
 | `tools/bench_ffmpeg.py` / `bench_preprocess.py` / `bench_peav.py` / `verify_peav.py` | 提速/推理基准与真实模型验证证据脚本 |
 | `tests/` | 单元、不变量、E2E 测试；`tests/fixtures/` 合成视频与临时配置 |
 | `docs/` | 契约（V1/V2）、ADR、质量规范、执行方案 |
@@ -395,13 +439,18 @@ A 原始、A-quality 轻画质退化基线、B 音频 +0.5s、C 音频 +1.0s、D
 - **唯一门禁**：`python qa.py`（ruff + pytest 快速离线 + 文档/入口/配置检查）；
   `--full` 额外运行 `model` / `network` 标记测试；
 - **测试分层**：单元（config/db/sampling/media/embed/ingest/mapplot/appdata/similarity/
-  identity/stability/avsync）、不变量（`tests/test_invariants.py`：模块边界、版本、状态机、去重、
-  schema v2/身份关联/计时/filter_json/采样/gitignore/CLI/近邻解释字段/片段数据层/avsync 导入边界）、
+  identity/stability/avsync/events/temporal/representations）、不变量（`tests/test_invariants.py`：
+  模块边界、版本、状态机、去重、schema v3/身份关联/计时/filter_json/采样/gitignore/CLI/
+  近邻解释字段/片段数据层/avsync 导入边界/模式切换/表征隔离/地图绑定/迁移幂等）、
   端到端（`tests/test_e2e.py`：合成视频 → 流水线 → 向量 → 近邻解释/稳定性 → 筛选星云 →
-  appdata → Streamlit AppTest）；
+  appdata → Streamlit AppTest；v0.4 全片编码 → Full Mean 表征 → 表征地图 → 空间对比）；
 - **v0.2.x 独立验收**：全库分位/互为 Top-k/hubness 与手算全库成对相似度矩阵对照；片段热图/最高配对
   schema 与手算片段余弦对照；AppTest 检查解释列、枢纽表、片段热图与模态切换；
   A6 实验检查 Δ 数学与“不写主向量库”；扩量预检 JSON 与 DB 状态一致性核对；
+- **v0.4 独立验收**：模式切换版本公式/格式、不同表征与序列隔离、地图代表征绑定与旧地图坐标不可覆盖、
+  schema v3 迁移幂等；全链路离线（HashTestEmbedder + 12s/40s 合成视频）覆盖中断恢复、Full Mean 构建、
+  表征地图、appdata 数据帧与 `tools/compare_spaces.py` 输出结构；真实数据阶段核对覆盖率/
+  n_clips/恢复/336p 对照/多空间邻域迁移数字（`docs/reports/full-coverage-analysis.md`）；
 - **独立预言机**：E2E 使用 `tests/fixtures/video_factory.py` 现场合成的素材与独立断言，
   不复用实现方测试的断言逻辑；`qa.py` 的入口检查与 pytest 独立失败；
 - **默认离线**：网络/模型测试必须打 marker，默认测试不触网、不加载权重；
