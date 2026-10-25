@@ -44,12 +44,13 @@ Bilibili BV 清单 ───┘                                        │
 | 编排层 | `nebula/pipeline.py` | 单部作品全流程、批处理、断点续跑、临时目录生命周期 | media、embed、ingest、download、db、config |
 | 数据层 | `nebula/ingest.py` / `nebula/download.py` | 本地扫描、选票/周报解析、Bilibili 元数据与下载 | db、config、errors |
 | 数据层 | `nebula/mapplot.py` | 向量矩阵加载、UMAP 2D/3D、版本落盘、transform 增量 | db、config、umap-learn、joblib、numpy |
-| 展示层 | `nebula/appdata.py` | 纯数据准备：DataFrame、染色 `ColorSpec`（含高维近邻密度）、筛选、搜索、hover、近邻展示行 | pandas、numpy、db、config；**不导入 streamlit/plotly** |
-| 展示层 | `app.py` | Streamlit 页面：侧栏控件、Plotly 图、详情与近邻面板 | streamlit、plotly、appdata、similarity（经缓存） |
-| 分析层 | `nebula/similarity.py` | 高维余弦近邻索引：三模态 Top-k、第 k 近邻距离、进程内矩阵缓存 | db、config、numpy；**不导入 umap/streamlit/plotly** |
+| 展示层 | `nebula/appdata.py` | 纯数据准备：DataFrame、染色 `ColorSpec`（含高维近邻密度）、筛选、搜索、hover、近邻解释行、枢纽行、片段热图/配对纯数据 | pandas、numpy、db、config；**不导入 streamlit/plotly** |
+| 展示层 | `app.py` | Streamlit 页面：侧栏控件、Plotly 图、详情、近邻解释表、枢纽与片段级对应面板 | streamlit、plotly、appdata、similarity（经缓存） |
+| 分析层 | `nebula/similarity.py` | 高维余弦近邻索引：三模态 Top-k、全库分位/互为 Top-k、hubness、第 k 近邻距离、片段级相似（热图/配对/解释）、进程内缓存 | db、config、numpy；**不导入 umap/streamlit/plotly** |
 | 数据层 | `nebula/identity.py` | 标题规范化、本地↔Bilibili 身份候选与关联（人工清单兜底）、向量复制登记 | db、config、errors；Bilibili 客户端由调用方注入 |
 | 分析层 | `nebula/stability.py` | 片段留一重聚合、Top-k 稳定性报告（JSON/CSV） | config、db、embed、numpy；**不加载模型、不导入 umap/pandas** |
-| 入口层 | `ingest.py` / `pipeline.py` / `map.py` / `qa.py` / `tools/clip_stability.py` | 参数解析、调用库代码、打印结果、返回退出码 | 对应库模块 |
+| 分析层 | `nebula/avsync.py` | 音画错位实验：WAV 偏移/交换、画质退化基线、Δ=1-cos 计算与 JSON/CSV 报告 | config、embed、media、sampling、numpy；不写主向量库 |
+| 入口层 | `ingest.py` / `pipeline.py` / `map.py` / `qa.py` / `tools/clip_stability.py` / `tools/desync_experiment.py` / `tools/preflight_works.py` | 参数解析、调用库代码、打印结果、返回退出码 | 对应库模块 |
 
 依赖方向只有一条：入口层 → 展示层 / 编排层 → 领域层 → 基础层。
 几个必须保持的边界（由 `tests/test_invariants.py` 静态检查）：
@@ -64,6 +65,12 @@ Bilibili BV 清单 ───┘                                        │
 - `nebula.stability` 不导入模型/torch、UMAP 或界面库：A3 只读已保存向量，不重新编码、
   不参与坐标训练；`tools/clip_stability.py` 同样不加载模型；
 - `nebula.identity` 只做本地数据与编排，Bilibili 网络客户端由调用方注入（默认测试离线）；
+- `nebula.avsync` 不导入 UMAP/界面库；导入模块本身不加载 torch/transformers（模型在实验脚本内按需使用），
+  实验只写 `logs/`，不改主 `data/embeddings` 与 `embedding_version`；
+- 片段级探索的纯数据接口（`appdata.clip_heatmap_data / clip_pair_rows`）只返回 dict/list，
+  不接收 Plotly/Streamlit 对象；渲染在 `app.py`；
+- 近邻解释字段（`pair_percentile / is_mutual / hubness`）只影响展示，不改变近邻排序、
+  坐标与向量；其统计集合是当前 `embedding_version` 的 canonical 作品，界面筛选不改变它；
 - `app.py` 只依赖 `appdata` / `similarity` 与库层，不反向被库代码导入。
 
 ## 3. 数据模型
@@ -100,6 +107,17 @@ works 1────N work_timings N────1 pipeline_runs   （单部分阶
 连接设置：WAL、`foreign_keys=ON`、`BEGIN IMMEDIATE` 事务、`busy_timeout`；
 所有写操作在事务内完成，读方法返回普通 `dict` 便于上层使用。
 
+**当前数据规模（2026-10-25 扩量后；真实运行数据不随仓库分发）**：
+
+- `works` 122 行：33 local completed + 87 bilibili completed + 2 bilibili failed
+  （8.71h 直播回放、API -404 已删除视频），pending = 0；
+- `embeddings` 720 条（120 部 × 6 类 npy）；`clips` 586 条；
+- `lists` 1 个（`votes_2025`，89 部）；`appearances` 89 条；
+  `work_links` 10 条（duplicate 默认不进星云，npy 保留）；
+- 星云：`map_v001`(33, P0)、v002(29, votes_2025)、v003(56, 全量)、
+  v004–v006(29, n_neighbors 变体)、`map_v007`(87, 2025 全量)、
+  `map_v008`(110, 总星云，当前默认)。所有版本永久保留，坐标跨版本不可直接比较。
+
 ### 3.2 文件系统工件
 
 ```text
@@ -131,7 +149,9 @@ logs/
 ├── perf_<run_id>.csv            # A4：每部作品的分阶段耗时（pipeline 自动生成）
 ├── sync_report.json             # 音画同步抽查
 ├── ablation_report.json        # 静音/遮蔽画面消融
-└── clip_stability.json/.csv    # A3：片段稳定性报告（tools/clip_stability.py 生成）
+├── clip_stability.json/.csv    # A3：片段稳定性报告（tools/clip_stability.py 生成）
+├── av_desync_experiment.json/.csv  # A6：音画错位实验（tools/desync_experiment.py 生成）
+└── preflight_89.json           # 2025 选票扩量预检（tools/preflight_works.py 生成）
 ~~~
 
 这些文件只用于观察与证据，**不进入**向量库与星云；删除后可按原命令重新生成。
@@ -199,6 +219,17 @@ logs/
     只读取 `clip_joint` 与 `work_joint` npy 做留一重聚合与 Top-k 对比，
     不加载模型、不重新编码、不写数据库；报告输出到 `logs/`，仅用于评估
     “作品近邻结论对单个 8 秒片段的依赖程度”，不是作品优劣指标。
+14. **近邻解释仅用于展示（v0.2.x）。**
+    `pair_percentile / is_mutual / hubness` 不改变近邻排序、坐标与向量；分位是
+    “当前 `embedding_version` 的 canonical 集合”内的相对量，界面筛选/不同星云版本
+    之间不可横向比较；小样本下 hubness 不稳定，不能据此评价作品质量或热度。
+15. **片段级探索保持纯数据层（v0.2.x）。**
+    `clip_heatmap_data / clip_pair_rows` 位于 `appdata`，只返回 dict/list；
+    不得导入 Plotly/Streamlit 或接收 UI 对象；`similarity` 的片段矩阵按需加载并缓存。
+16. **错位实验与主数据隔离（v0.2.x/A6）。**
+    `nebula/avsync` 与 `tools/desync_experiment.py` 只在 `temp/` 生成变体并写
+    `logs/` 报告；不写 `data/embeddings`、不登记新 `embedding_version`、
+    不参与星云；真实运行需要模型，必须标 `model` marker，默认测试不加载权重。
 
 ## 5. 处理流程与失败语义
 
@@ -254,21 +285,7 @@ PE-AV 的语义质量不在自动化测试范围内，P0 只做“静音/遮蔽�
 - 真实 P0/P1 的耗时主要来自下载与推理，用 `pipeline.py timings` 与
   `logs/perf_<run_id>.csv` 定位瓶颈，避免凭感觉调参。
 
-### 6.2 A5 低风险提速实测（v0.2）
 
-提速原则：**不改变 `embedding_version` 的行为才可直接采纳**；任何会改变向量的优化必须
-发布新向量版本并整批重跑。以下数据来自 T1 的基准工具（`tools/bench_peav.py` /
-`tools/verify_peav.py`）在真实视频上的实测：
-
-| 优化项 | 实测结果 | 结论 |
-| --- | --- | --- |
-| 切片 mp4 去掉 AAC 音轨 | 真实 3 部作品 4 类向量 sha1 全等，max abs diff = 0；joint cos = 0.99999994 | 零漂移，v0.2 起默认采纳 |
-| 重复 ffprobe | 作品级探测结果通过 `extract_clip(info=...)` 复用，重复探测已消除 | 默认采纳 |
-| ffmpeg preset veryfast → ultrafast | 5 片段 11.07s → 5.88s（1.88×）；临时体积约 2.35×；抽样 joint cos 最低 0.99918 | 本轮不改变默认（体积换时间，收益不足以改方案） |
-| 片段分辨率缩放到高 336 | extract 12.88s → 4.43s（2.91×）；preprocess 3.52s → 1.03s（3.43×）；单作品 19.53s → 8.26s（2.36×）；work joint cos 最低 0.99812 | 会改变向量，需新 `embedding_version` + 整批重跑，留作 v0.3 后续评估 |
-
-结论：v0.2 只采纳“零向量漂移”的两项（去 AAC 音轨、复用 ffprobe），其余作为 v0.3 的候选，
-通过新向量版本对照验证后再切换。
 
 ### 6.1 数值一致性边界（device / dtype）
 
@@ -286,6 +303,50 @@ PE-AV 向量存在**硬件相关的数值差异**，这决定了什么可以比�
   - 需要严格复现实验（例如对比两次训练、两个参数或两个模型版本）时，应在同一硬件、
     同一 dtype 下重算，并保留版本与参数记录；
   - P0 的消融实验（静音/遮蔽画面）只回答“联合向量是否变化”，不依赖跨硬件可比性。
+
+### 6.2 A5 低风险提速实测（v0.2）
+
+提速原则：**不改变 `embedding_version` 的行为才可直接采纳**；任何会改变向量的优化必须
+发布新向量版本并整批重跑。以下数据来自 T1 的基准工具（`tools/bench_peav.py` /
+`tools/verify_peav.py`）在真实视频上的实测：
+
+| 优化项 | 实测结果 | 结论 |
+| --- | --- | --- |
+| 切片 mp4 去掉 AAC 音轨 | 真实 3 部作品 4 类向量 sha1 全等，max abs diff = 0；joint cos = 0.99999994 | 零漂移，v0.2 起默认采纳 |
+| 重复 ffprobe | 作品级探测结果通过 `extract_clip(info=...)` 复用，重复探测已消除 | 默认采纳 |
+| ffmpeg preset veryfast → ultrafast | 5 片段 11.07s → 5.88s（1.88×）；临时体积约 2.35×；抽样 joint cos 最低 0.99918 | 本轮不改变默认（体积换时间，收益不足以改方案） |
+| 片段分辨率缩放到高 336 | extract 12.88s → 4.43s（2.91×）；preprocess 3.52s → 1.03s（3.43×）；单作品 19.53s → 8.26s（2.36×）；work joint cos 最低 0.99812 | 会改变向量，需新 `embedding_version` + 整批重跑，留作 v0.3 后续评估 |
+
+结论：v0.2 只采纳“零向量漂移”的两项（去 AAC 音轨、复用 ffprobe），其余作为 v0.3 的候选，
+通过新向量版本对照验证后再切换。
+
+### 6.3 A6 音画错位实验（v0.2.x）
+
+在真实作品上量化 PE-AV 联合向量对“音画时间对齐”的敏感度：同一片段分别构造
+A 原始、A-quality 轻画质退化基线、B 音频 +0.5s、C 音频 +1.0s、D 同作品换其他片段音频，
+比较 `Δ = 1 - cos`（joint 为主，audio/video 用于定位模态）。方法、选项与解读局限见
+`docs/adr/0008-av-sync-desync-experiment.md`。
+
+- 实验只写 `logs/av_desync_experiment.json/.csv` 与中文摘要，不写主向量库、不生成新
+  `embedding_version`、不参与星云；真实运行需要 GPU/权重并标 `model` marker；
+- A-quality 提供“重编码漂移”基线，只有超过它的 Δ 才能归因于音画错位；
+- 局限：仅约 10 部作品、单次实验、周期性音乐可能把错位落回相似小节，结论只作趋势说明，
+  不作为作品质量或模型优劣判断；完整数据与逐作品明细见 ADR-0008 与
+  `logs/av_desync_experiment.json`。
+
+**2026-10-25 实测（10 部 / 48 片段，CUDA bf16 autocast）**：
+
+| 变体 | joint Δ mean | joint Δ median | 相对 quality | 机制 |
+| --- | --- | --- | --- | --- |
+| Q 轻画质退化（CRF28） | 0.000964 | 0.000695 | 1×（噪声基线） | video 分支有小幅变化，audio 不变 |
+| B 音频 +0.5s | 0.004222 | 0.003260 | 4.38× | audio 分支敏感，video=0，joint 随音频变化 |
+| C 音频 +1.0s | 0.002364 | 0.001249 | 2.45× | 周期性音乐整拍偏移，Δ 反而更小 |
+| D 换同作品其他片段音频 | 0.087575 | 0.079961 | 90.85× | audio 大幅变化，video=0，joint 明显变化 |
+
+逐片段高于 quality 的比例：B 47/48、C 36/48、D 48/48；10 部逐部均值排序均为
+`swap >> shift0.5s > shift1.0s > quality`，无反例。结论：联合向量确实融合音画两路
+（纯音频变体 video Δ 严格为 0），轻微错位 Δ 显著高于重编码噪声但绝对值很小；
+`单点 Δ 不能证明同步敏感度`，需结合聚合分布与 swap 对照解读。
 
 ## 7. 扩展点
 
@@ -314,15 +375,18 @@ PE-AV 向量存在**硬件相关的数值差异**，这决定了什么可以比�
 | `nebula/pipeline.py` | 单部处理与批处理编排 |
 | `nebula/ingest.py` | 本地扫描、选票 CSV、周报导入 |
 | `nebula/download.py` | Bilibili 元数据 API 与 yt-dlp 下载 |
-| `nebula/similarity.py` | 高维余弦近邻索引、三模态 Top-k、第 k 近邻距离（A1/A2） |
+| `nebula/similarity.py` | 高维余弦近邻索引、三模态 Top-k、分位/互为/hubness、片段级相似（A1/A2/P2） |
 | `nebula/identity.py` | 标题规范化、本地↔BV 身份候选/关联、向量复制（B1） |
 | `nebula/stability.py` | 片段留一重聚合与 Top-k 稳定性报告（A3） |
+| `nebula/avsync.py` | 音画错位实验：WAV 偏移/交换、画质退化基线、Δ 计算与报告（A6） |
 | `nebula/mapplot.py` | UMAP 训练、筛选/变体版本落盘、transform |
 | `nebula/appdata.py` | 可视化数据准备（纯函数，含近邻密度与筛选） |
 | `app.py` | Streamlit 应用（近邻面板、密度、筛选） |
 | `ingest.py/pipeline.py/map.py/qa.py` | 顶层 CLI（含 link-local、variants） |
 | `tools/clip_stability.py` | A3 稳定性报告 CLI（只读、离线） |
-| `tools/bench_peav.py` / `tools/verify_peav.py` | 模型/性能基准与真实模型验证证据脚本 |
+| `tools/desync_experiment.py` | A6 音画错位实验 CLI（真实模型，输出 logs） |
+| `tools/preflight_works.py` | 2025 选票 89 部扩量预检 CLI（只读 DB，真实 API） |
+| `tools/bench_ffmpeg.py` / `bench_preprocess.py` / `bench_peav.py` / `verify_peav.py` | 提速/推理基准与真实模型验证证据脚本 |
 | `tests/` | 单元、不变量、E2E 测试；`tests/fixtures/` 合成视频与临时配置 |
 | `docs/` | 契约（V1/V2）、ADR、质量规范、执行方案 |
 
@@ -331,11 +395,13 @@ PE-AV 向量存在**硬件相关的数值差异**，这决定了什么可以比�
 - **唯一门禁**：`python qa.py`（ruff + pytest 快速离线 + 文档/入口/配置检查）；
   `--full` 额外运行 `model` / `network` 标记测试；
 - **测试分层**：单元（config/db/sampling/media/embed/ingest/mapplot/appdata/similarity/
-  identity/stability）、不变量（`tests/test_invariants.py`：模块边界、版本、状态机、去重、
-  schema v2/身份关联/计时/filter_json/采样/gitignore/CLI）、端到端（`tests/test_e2e.py`：
-  合成视频 → 流水线 → 向量 → 近邻/稳定性 → 筛选星云 → appdata → Streamlit AppTest）；
-- **v0.2 独立验收**：近邻与密度结果与手算高维余弦对比；filter_json 与作品集合一致、跨版本坐标确实
-  不同；身份关联后 duplicate 默认排除、`include_duplicates` 对照版本包含；A3 报告只读不加载模型；
+  identity/stability/avsync）、不变量（`tests/test_invariants.py`：模块边界、版本、状态机、去重、
+  schema v2/身份关联/计时/filter_json/采样/gitignore/CLI/近邻解释字段/片段数据层/avsync 导入边界）、
+  端到端（`tests/test_e2e.py`：合成视频 → 流水线 → 向量 → 近邻解释/稳定性 → 筛选星云 →
+  appdata → Streamlit AppTest）；
+- **v0.2.x 独立验收**：全库分位/互为 Top-k/hubness 与手算全库成对相似度矩阵对照；片段热图/最高配对
+  schema 与手算片段余弦对照；AppTest 检查解释列、枢纽表、片段热图与模态切换；
+  A6 实验检查 Δ 数学与“不写主向量库”；扩量预检 JSON 与 DB 状态一致性核对；
 - **独立预言机**：E2E 使用 `tests/fixtures/video_factory.py` 现场合成的素材与独立断言，
   不复用实现方测试的断言逻辑；`qa.py` 的入口检查与 pytest 独立失败；
 - **默认离线**：网络/模型测试必须打 marker，默认测试不触网、不加载权重；

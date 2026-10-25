@@ -36,7 +36,13 @@
 - **身份关联去重（B1）**：本地视频与 Bilibili 条目自动（标题+时长双校验）/ 手动（CSV）关联；
   duplicate 默认不进星云与近邻索引，已有本地向量可复制给 canonical，避免重复下载编码；
 - **片段稳定性报告（A3）**：对片段级向量做留一重聚合，量化单个片段对作品 Top-k 近邻结论的影响，
-  输出 JSON/CSV，只用于风险评估，不参与坐标与质量评价。
+  输出 JSON/CSV，只用于风险评估，不参与坐标与质量评价；
+- **近邻解释（v0.2.x）**：近邻表带“全库分位 / 双向”解释列，并展示枢纽作品（hubness），
+  避免把“小样本 Top5”误读为强相似；
+- **片段级对应探索（v0.2.x）**：选两部作品查看片段对余弦热图与最高片段配对表，
+  区分“整体平均向量相近”与“局部片段相近”；
+- **音画错位实验（A6，v0.2.x）**：离线证据工具，对比原始 / 轻画质退化 / 音频偏移 / 换音频后的
+  `Δ=1-cos`；只写日志，不改主向量与星云。
 
 ## 环境要求
 
@@ -76,11 +82,11 @@ uv pip install -e ".[ml,dev]"
 PyTorch 官网选择，注意 Python 版本为 cp310）：
 
 ```powershell
-uv pip install --python ..venvScriptspython.exe --index-url https://download.pytorch.org/whl/cu126 ^
+uv pip install --python .\.venv\Scripts\python.exe --index-url https://download.pytorch.org/whl/cu126 ^
   "torch==2.14.1+cu126" "torchvision==0.29.1+cu126"
 
 # 确认 CUDA 可用
-..venvScriptspython.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+.\.venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
 `config.yaml` 的 `model.device: auto` 会自动选择 CUDA；有 GPU 时 5 个片段/部约
@@ -132,8 +138,10 @@ otomad-nebula/
 ├── temp/                      # 流水线临时目录（成功自动清理，失败保留排查）
 ├── logs/                      # 运行日志
 ├── nebula/                    # 核心库：config/db/sampling/media/embed/pipeline/
-│                              #   similarity(近邻) identity(身份关联) stability(稳定性) mapplot/appdata
-├── tools/                     # 证据/报告工具：bench_peav.py、verify_peav.py、clip_stability.py
+│                              #   similarity(近邻/解释/片段) identity(身份关联) stability(稳定性)
+│                              #   avsync(错位实验) mapplot/appdata
+├── tools/                     # 证据/报告工具：clip_stability.py、desync_experiment.py、
+│                              #   preflight_works.py、bench_ffmpeg/preprocess/peav、verify_peav
 ├── tests/                     # pytest 测试（含 tests/fixtures 合成视频工厂）
 ├── docs/                      # 契约（CONTRACTS/CONTRACTS_V2）、ADR、质量规范
 ├── ingest.py                  # 导入本地视频 / 选票 / 周报 / link-local 身份关联
@@ -269,7 +277,14 @@ otomad-nebula/
 
 ### v0.2：观察、筛选与运维（迭代 A/B）
 
-现有 33 部作品与 map_v001 可以直接使用本节功能，不需要重新编码。
+v0.2 起所有观察功能都直接复用已保存向量，不需要重新编码。当前数据状态（2026-10-25，扩量已完成）：
+
+- 89 部 2025 选票作品全部导入；累计 **120 completed**（33 部本地 + 87 部 Bilibili）+ 2 failed
+  （8.71h 直播回放、API -404 已删除视频），pending=0；
+- 10 条身份关联（duplicate 默认不进星云）；appearances 89 条；
+- 星云：`map_v007` = 2025 全量星云 87 部（filter_json `list_key=votes_2025`）；
+  `map_v008` = 总星云 110 部（33 + 87 − 10 duplicate），当前界面默认为 `map_v008`；
+- 旧版本 `map_v001`–`map_v006` 保留，用于历史对比（不同版本坐标不可直接比较）。
 
 #### A1 高维近邻探索（界面）
 
@@ -277,6 +292,35 @@ otomad-nebula/
 三个模态的 Top5 近邻与余弦值；缺失模态显示“无该模态向量”。2D 视图默认高亮 Top5 并画出
 选中点到近邻的连线，3D 视图提供“显示近邻连线”开关（默认关闭）。
 近邻与相似度全部来自高维余弦（nebula.similarity），与 UMAP 平面距离无关。
+
+近邻表还带两个解释列（v0.2.x）：
+
+- **全库分位（pair_percentile）**：该余弦值高于当前 canonical 集合中多少比例的作品对；
+  分位接近 100 表示这种相似度在库里很罕见，而不是用绝对阈值判断“强相似”；
+- **双向（is_mutual）**：目标作品是否也把当前作品列入同一 Top-k；单向命中可能是 hub 效应，
+  双向证据更强；
+- 分位/入度按当前向量版本的 canonical 集合计算，不受界面筛选影响，且跨集合不可横向比较；
+- 近邻面板下方有“枢纽作品（被最多作品列为 Top5）”折叠区：展示 hubness 入度最高的作品，
+  这是高维嵌入的统计现象，不代表作品质量或重要性。
+
+真实数据样例（110 部 canonical，2026-10-25）：work 1 的 joint Top5 相似度
+0.8625/0.8582/0.8562/0.8538/0.8481，对应全库分位 82.5/80.7/79.6/78.5/76.1；
+hubness 最高为 work 104 被 40 部作品列为 Top5。可见“Top5 也只处于中高分位”，
+需要结合分位与双向解释阅读。
+
+#### P2 片段级相似探索（整体 vs 局部）
+
+在近邻面板的“片段级对应（整体平均向量 vs 局部片段）”折叠区：
+
+1. 勾选“显示片段级对应热图（需要加载片段向量）”；
+2. 选择对比的近邻作品与片段模态（联合片段 / 音频片段）；
+3. 查看片段对余弦热图、最高片段配对表（含两侧片段序号与起始秒）以及最高/平均余弦统计。
+
+用途：作品级平均向量接近，不代表局部片段也接近；热图能定位具体相似/不相似的片段。
+片段级接口是纯数据层（`appdata.clip_heatmap_data / clip_pair_rows`），不依赖 Plotly。
+
+真实数据样例（2026-10-25）：work 1 × work 93 的 5×5 联合片段热图最高 cos=0.8095
+（A 片段 26.4s ↔ B 片段 97.1s），25 个片段对全部 >0.5；这类信息无法从作品级 Top5 直接看出。
 
 #### A2 高维近邻密度与筛选星云
 
@@ -313,6 +357,10 @@ python tools/clip_stability.py --version peav-small-16f__f16_clip8s_x5_48k --out
   也不作为作品质量指标；输出目录可用 `--out-dir` 指定；
 - 可用 `--work-ids 1 2 3 ...` 只评估部分作品（例如只复盘 P0 的 33 部），
   近邻空间仍是全部 canonical 作品，不会因筛选而改变比较基准。
+- 当前真实数据报告（2026-10-25）：`logs/clip_stability_p0.*`（P0 33 部，mean_overlap=0.8978，
+  不稳定 1/33）、`logs/clip_stability_v02.*`（v0.2 canonical 56 部，mean_overlap=0.875，
+  不稳定 6/56）、`logs/clip_stability_v03.*`（扩量后 canonical 110 部，mean_overlap=0.8488，
+  不稳定 21/110）；三份报告均只读、离线、不加载模型。
 
 #### A4 性能与分阶段计时
 
@@ -359,13 +407,56 @@ python ingest.py link-local --list-key votes_2025 --manual
   `--no-copy` 只建立关联、不复制向量；
 - 关联可撤销（数据库 `unlink_work`）；拿不准的候选不会自动合并。
 
+#### A6 音画错位实验（离线证据）
+
+```powershell
+python tools/desync_experiment.py --limit 10          # 10 部本地已完成作品
+python tools/desync_experiment.py --work-ids 6 12 20  # 指定作品（需为本地已完成）
+```
+
+- 每个片段生成 5 类输入：A 原始、A-quality 轻画质退化基线、B 音频 +0.5s、C 音频 +1.0s、
+  D 同作品换其他片段音频；用真实 PE-AV 编码后比较 `Δ=1-cos`（joint/audio/video）。
+- 只写 `logs/av_desync_experiment.json/.csv` 与中文摘要，不修改主向量库、不生成新
+  `embedding_version`、不参与星云；方法与解读边界见 ADR-0008。
+- 需要 GPU/模型权重（真实运行标记为 `model`）；默认测试离线不跑。
+
+**实测（2026-10-25，10 部真实作品 / 48 个 8s 片段，CUDA bf16）**：
+quality（CRF28 轻画质退化基线）joint Δ mean=0.000964；音频 +0.5s=0.004222（4.38×）；
++1.0s=0.002364（2.45×，周期性音乐整拍偏移导致反而更小）；换音频=0.087575（90.85×）；
+逐片段高于 quality 的比例：+0.5s 47/48、+1.0s 36/48、换音频 48/48；纯音频变体的 video 分支 Δ=0。
+注意：绝对 Δ 很小且仅 10 部单次实验，单点 Δ 不能证明同步敏感度（详见 ADR-0008）。
+
+#### 数据扩量：2025 年 89 部选票（已完成）
+
+- 选票 CSV 已全部导入（89 条 appearances / 89 个 Bilibili 作品登记），身份关联 10 条，
+  duplicate 默认不进入星云；
+- 预检 `python tools/preflight_works.py` 输出 `logs/preflight_89.json`：
+  89 部中 80 normal / 7 multi（多分P）/ 1 long（8.71h 直播回放，failed）/
+  1 unavailable（API -404 已删除，failed），并给出建议 batch/skip/done 清单；
+- 扩量批处理（run_id=5）：54 部 **54 completed / 0 failed**，总耗时 730.51s（模型加载 17.05s）；
+  累计 120 completed + 2 failed、pending=0；
+- 扩量后重建星云：`map_v007`（2025 全量 87 部，filter_json list_key=votes_2025）与
+  `map_v008`（总星云 110 部，当前默认）。不同版本坐标不可直接比较；
+- 查看最新状态与重试：
+
+```powershell
+python pipeline.py status
+python pipeline.py retry <work_id>
+python map.py list
+```
+
+> 实时数据状态以 `pipeline.py status` 输出为准；本仓库不提交实时运行数据，
+> 地图版本由 `map.py list` 查看。
+
 ### 界面使用
 
 - 侧栏：星云版本、2D/3D 切换、染色维度（含“高维近邻密度”）、按文件名/标题/BV 搜索、
   点大小/透明度、数据集筛选（来源 / 榜单 / 年份）；
 - 主图：Plotly 散点图，支持缩放、旋转、悬浮；点击点（或搜索 + 下拉选择）显示详情；
 - 详情：标题、BV/URL（可点击跳转 Bilibili）、时长、发布日期、作者、选票排名/得分、本地文件，
-  以及三个模态的 Top5 近邻（余弦值）；2D 高亮近邻并连线，3D 可开关连线；
+  以及三个模态的 Top5 近邻（余弦值 + 全库分位 + 双向）；2D 高亮近邻并连线，3D 可开关连线；
+- 近邻面板还含“枢纽作品（被最多作品列为 Top5）”与“片段级对应（整体 vs 局部片段）”两个折叠区；
+  片段热图默认关闭，勾选后按需加载片段向量；
 - 3D 点击选择在部分浏览器/Plotly 版本下不可用，可用“搜索 + 下拉选择作品”的等价入口；
 - 无数据（尚未生成星云）时页面显示中文提示，而不是报错堆栈；筛选星云会标注
   “坐标仅在本版本内可比”。
@@ -424,14 +515,18 @@ python ingest.py link-local --list-key votes_2025 --manual
 - 需要真实 PE-AV 权重或网络的测试分别用 `model` / `network` / `integration` 标记标出；
 - E2E 测试使用 `tests/fixtures/video_factory.py` 现场合成的视频（首次会缓存到
   `tests/fixtures/out/`），不依赖任何私人素材；
-- v0.2 测试覆盖：`tests/test_similarity.py`（高维近邻/密度）、`tests/test_identity.py`
-  （身份关联与去重）、`tests/test_stability.py`（留一稳定性数学性质 + CLI）、
-  `tests/test_app.py`（近邻面板、筛选）、`tests/test_mapplot.py`（筛选星云与变体）、
+- v0.2 测试覆盖：`tests/test_similarity.py`（高维近邻/密度/解释字段/片段热图）、
+  `tests/test_identity.py`（身份关联与去重）、`tests/test_stability.py`（留一稳定性 + CLI）、
+  `tests/test_avsync.py`（错位实验 WAV/Δ 数学与离线 CLI）、`tests/test_app.py`
+  （近邻面板、解释列、枢纽、片段探索、筛选）、`tests/test_mapplot.py`（筛选星云与变体）、
   `tests/test_db.py`（schema v2 迁移、work_links、计时）；
-- `tests/test_invariants.py` 静态检查 similarity / stability / identity 的导入边界
-  （不依赖 UMAP / 模型 / UI），并覆盖 filter_json 落库、duplicate 默认排除、计时非负等 v2 不变量；
+- `tests/test_invariants.py` 静态检查 similarity / stability / identity / avsync 的导入边界
+  （不依赖 UMAP / 模型 / UI），并覆盖 filter_json 落库、duplicate 默认排除、计时非负、
+  近邻解释字段仅展示、片段级数据层纯净等不变量；
+- `tests/test_e2e.py` 的 v0.2.x 独立验收：全库分位/双向/hubness 与手算矩阵逐项对照、
+  片段热图/最高配对 schema、AppTest 枢纽表与片段热图；
 - QA 的 CLI 冒烟额外覆盖 `map.py variants`、`ingest.py link-local`、
-  `tools/clip_stability.py --help`。
+  `tools/clip_stability.py`、`tools/desync_experiment.py`、`tools/preflight_works.py`。
 
 ## 常见问题
 
@@ -478,6 +573,17 @@ UMAP 是非线性降维，训练集变化会让整个布局重新排布：筛选
 近邻/相似度/近邻密度都使用高维余弦（模型向量空间），主图是 UMAP 二维/三维投影；
 投影只近似保持邻域关系，所以“图上距离”不能当作语义相似度。
 
+**Top5 近邻余弦只有 0.6，算不算“很像”？**
+不要只看绝对值：近邻表里的“全库分位”表示该相似度高于当前 canonical 集合多少比例的作品对；
+接近 100% 才表示这种相似度在库里很罕见。“双向”表示对方也把当前作品列入 Top5，证据更强；
+“枢纽作品”折叠区展示被最多作品列为 Top5 的 hub 点——这是高维嵌入的统计现象，
+不代表作品质量。小样本/筛选子集上分位与 hubness 都不稳定，只作观察线索。
+
+**音画错位实验说明什么？**
+`tools/desync_experiment.py` 用真实作品对比原始/轻画质退化/音频偏移 +0.5s/+1.0s/换音频的
+`Δ=1-cos`，用于评估联合向量对同步破坏的敏感度；方法与局限（仅约 10 部、单次实验、
+周期性音乐可能低估错位影响）见 `docs/adr/0008-av-sync-desync-experiment.md`。
+
 **3D 图上点击没有反应？**
 Plotly/Streamlit 在部分环境不支持 3D 点击选择，使用侧栏搜索 + 下拉选择作品即可。
 
@@ -495,6 +601,9 @@ qa.py 已强制 UTF-8 输出；其他命令行建议使用 PowerShell 7，且
 | P3 | 新一期周报出现后自动/半自动增量收录 | `ingest.py import-weekly ...`、`pipeline.py run-pending`、`map.py transform` |
 | v0.2 A1/A2 | 近邻面板三模态可切换；高维近邻密度染色；筛选星云 filter_json 正确、跨版本坐标不可比提示 | `streamlit run app.py`、`map.py build --dataset/--vote-year`、`map.py variants` |
 | v0.2 A3/A4/B1 | 稳定性报告 JSON+CSV 生成；`perf_<run_id>.csv` 生成且耗时非负；link-local 关联后 duplicate 默认不进星云 | `tools/clip_stability.py`、`pipeline.py status`、`ingest.py link-local` |
+| v0.2.x 解释/片段 | 近邻表出现“全库分位/双向”；枢纽表可渲染；片段热图与配对表 schema 正确且与手算余弦一致 | `streamlit run app.py`、`pytest -q tests/test_e2e.py -k "p1 or p2"` |
+| v0.2.x A6 实验 | 错位实验 JSON/CSV 生成，结论写入 ADR-0008，且未改动主向量/星云 | `tools/desync_experiment.py --limit 10` |
+| v0.2.x 扩量 | 89 部选票已导入；预检 JSON 给出建议 batch/skip/done；失败项可读 | `tools/preflight_works.py`、`pipeline.py status` |
 
 交付前至少确认：
 
@@ -508,6 +617,10 @@ qa.py 已强制 UTF-8 输出；其他命令行建议使用 PowerShell 7，且
 - [ ] `tools/clip_stability.py` 能生成 `logs/clip_stability.json` 与 `.csv`，且不加载模型；
 - [ ] `logs/perf_<run_id>.csv` 与 `work_timings` 字段齐全且非负；
 - [ ] `ingest.py link-local` 关联后 duplicate 默认不出现在星云/近邻索引，unlink 可恢复；
+- [ ] 近邻表显示“全库分位/双向”，枢纽表可渲染；分位/入度与手算全库成对相似度一致；
+- [ ] 片段热图为 5×5（或实际片段数）矩阵，最高配对表含起始秒，`Δ` 统计正确；
+- [ ] `tools/desync_experiment.py` 报告有 A/A-quality/B/C/D 五类结果且未修改主向量库；
+- [ ] `tools/preflight_works.py` 的 `logs/preflight_89.json` 覆盖 89 行并给出 batch/skip/done 建议；
 - [ ] `data/` 已备份，临时目录与下载原视频已清理。
 
 ## 文档索引
@@ -516,7 +629,8 @@ qa.py 已强制 UTF-8 输出；其他命令行建议使用 PowerShell 7，且
 - `docs/CONTRACTS.md`：v0.1 模块接口与写权限契约；
 - `docs/CONTRACTS_V2.md`：v0.2/v0.3 迭代契约（DB v2、近邻、筛选、身份关联、稳定性、计时）；
 - `docs/adr/`：关键决策记录——0001-0004（PE-AV 选型、采样规则、星云版本、测试嵌入器边界），
-  0005（身份关联与星云去重）、0006（筛选地图与坐标不可比）、0007（高维近邻密度）；
+  0005（身份关联与星云去重）、0006（筛选地图与坐标不可比）、0007（高维近邻密度）、
+  0008（音画错位实验方法与局限）、0009（近邻解释：相对分位/互为 Top-k/hubness）；
 - `docs/agents/QUALITY.md`：质量与验证原则；
 - `音MAD星云计划 · 完整执行方案.md`：项目背景与分阶段计划。
 

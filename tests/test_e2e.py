@@ -29,9 +29,12 @@ import pytest
 from nebula.appdata import (
     apply_color,
     available_color_fields,
+    clip_heatmap_data,
+    clip_pair_rows,
     external_url,
     filter_frame,
     hover_text,
+    hub_rows,
     load_nebula_frame,
     neighbor_rows,
     search_frame,
@@ -596,6 +599,12 @@ def vector_env(tmp_path_factory: pytest.TempPathFactory) -> VectorEnv:
             "joint": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             "audio": [1.0, 0.0, 0.0, 0.0],
             "video": [1.0, 0.0, 0.0, 0.0],
+            "clip_joint": [
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.6, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            "clip_audio": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.5, 0.5, 0.0, 0.0]],
             "lists": [("votes_2025", 1, 500)],
         },
         {
@@ -607,6 +616,16 @@ def vector_env(tmp_path_factory: pytest.TempPathFactory) -> VectorEnv:
             "joint": [0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             "audio": [0.8, 0.6, 0.0, 0.0],
             "video": [0.6, 0.8, 0.0, 0.0],
+            "clip_joint": [
+                [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.9, 0.435889894, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            "clip_audio": [
+                [0.0, 1.0, 0.0, 0.0],
+                [0.9, 0.435889894, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
             "lists": [("votes_2025", 2, 400)],
         },
         {
@@ -618,6 +637,11 @@ def vector_env(tmp_path_factory: pytest.TempPathFactory) -> VectorEnv:
             "joint": [0.6, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             "audio": [0.0, 1.0, 0.0, 0.0],
             "video": None,
+            "clip_joint": [
+                [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            "clip_audio": [[0.0, 0.0, 1.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
             "lists": [("votes_2025", 3, 300)],
         },
         {
@@ -683,6 +707,25 @@ def vector_env(tmp_path_factory: pytest.TempPathFactory) -> VectorEnv:
                     kind=kind,
                     path=cfg.data_relpath(work_dir / f"{kind}.npy"),
                     dim=int(array.shape[0]),
+                )
+            for clip_kind in ("clip_joint", "clip_audio"):
+                clip_rows = spec.get(clip_kind)
+                if clip_rows is None:
+                    continue
+                clip_matrix = np.stack([_unit64(row) for row in clip_rows]).astype(np.float32)
+                save_vector(work_dir / f"{clip_kind}.npy", clip_matrix)
+                catalog.register_embedding(
+                    work_id,
+                    version=version,
+                    kind=clip_kind,
+                    path=cfg.data_relpath(work_dir / f"{clip_kind}.npy"),
+                    dim=int(clip_matrix.shape[1]),
+                    n_clips=int(clip_matrix.shape[0]),
+                )
+                catalog.replace_clips(
+                    work_id,
+                    version=version,
+                    clips=[(index, index * 8.0, 8.0) for index in range(clip_matrix.shape[0])],
                 )
             catalog.complete(work_id)
             for list_key, rank, votes in spec["lists"]:
@@ -859,6 +902,212 @@ def test_a2_density_knn_matches_hand_computed(vector_env: VectorEnv) -> None:
     }
     assert "density_knn" in with_similarity
     assert "density_knn" not in without_similarity
+
+# ---------------------------------------------------------------- P1 近邻解释
+
+def _hand_topk_sets(vectors: dict[int, np.ndarray], k: int) -> dict[int, set[int]]:
+    """手算每部作品的 Top-k work_id 集合（相似度降序、work_id 升序并列）。"""
+
+    return {
+        work_id: {neighbor_id for neighbor_id, _sim in _expected_ranked(vectors, work_id)[:k]}
+        for work_id in vectors
+    }
+
+
+def test_p1_pair_percentile_and_mutual_hand_computed(vector_env: VectorEnv) -> None:
+    """P1：全库分位与互为 Top-k 标记必须与手算全库成对相似度分布一致。"""
+
+    index = load_similarity_index(vector_env.catalog, vector_env.cfg, version=vector_env.version)
+    try:
+        vectors = _direct_work_vectors(vector_env)
+        ids = sorted(vectors)
+        pair_sims = sorted(
+            float(np.dot(vectors[first], vectors[second]))
+            for position, first in enumerate(ids)
+            for second in ids[position + 1 :]
+        )
+        assert pair_sims
+
+        def hand_percentile_range(similarity: float) -> tuple[float, float]:
+            """分位定义用严格小于；合成向量存在精确并列，允许 ±1e-6 并列边界区间。"""
+
+            epsilon = 1e-6
+            lower = sum(1 for value in pair_sims if value < similarity - epsilon)
+            upper = sum(1 for value in pair_sims if value <= similarity + epsilon)
+            return (
+                100.0 * lower / len(pair_sims),
+                100.0 * upper / len(pair_sims),
+            )
+
+        for work_id in ids:
+            ranked = _expected_ranked(vectors, work_id)
+            neighbors = index.neighbors(work_id, k=3)
+            assert [neighbor.work_id for neighbor in neighbors] == [
+                pair[0] for pair in ranked[:3]
+            ]
+            for neighbor in neighbors:
+                assert 0.0 <= neighbor.pair_percentile <= 100.0
+                lower, upper = hand_percentile_range(neighbor.similarity)
+                assert lower - 1e-6 <= neighbor.pair_percentile <= upper + 1e-6, (
+                    neighbor,
+                    lower,
+                    upper,
+                )
+                target_topk = {
+                    item[0] for item in _expected_ranked(vectors, neighbor.work_id)[:3]
+                }
+                assert neighbor.is_mutual == (work_id in target_topk)
+                # 独立方法（pair_percentile / similarity）与近邻行字段一致
+                assert index.pair_percentile(work_id, neighbor.work_id) == pytest.approx(
+                    neighbor.pair_percentile, abs=1e-6
+                )
+                assert index.similarity(work_id, neighbor.work_id) == pytest.approx(
+                    neighbor.similarity, abs=1e-6
+                )
+            # 分位随相似度单调不减，且相似度按 rank 降序
+            similarities = [neighbor.similarity for neighbor in neighbors]
+            percentiles = [neighbor.pair_percentile for neighbor in neighbors]
+            assert similarities == sorted(similarities, reverse=True)
+            assert percentiles == sorted(percentiles, reverse=True)
+        # 成对分位对称
+        for first in ids:
+            for second in ids:
+                if first == second:
+                    continue
+                assert index.pair_percentile(first, second) == pytest.approx(
+                    index.pair_percentile(second, first), abs=1e-9
+                )
+    finally:
+        index.close()
+
+
+def test_p1_hubness_matches_hand_computed_in_degree(vector_env: VectorEnv) -> None:
+    """P1：hubness 应等于“被多少部作品列入 Top-k”的手算入度。"""
+
+    index = load_similarity_index(vector_env.catalog, vector_env.cfg, version=vector_env.version)
+    try:
+        vectors = _direct_work_vectors(vector_env)
+        ids = sorted(vectors)
+        k = 3
+        hand_topk = _hand_topk_sets(vectors, k)
+        expected_counts = {
+            work_id: sum(1 for targets in hand_topk.values() if work_id in targets)
+            for work_id in ids
+        }
+        actual = index.hubness(k=k)
+        assert actual == expected_counts
+        assert sum(actual.values()) == len(ids) * min(k, len(ids) - 1)
+        assert all(count >= 0 for count in actual.values())
+
+        expected_top = sorted(expected_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+        assert index.hub_top(k=k, n=3) == [(int(work_id), int(count)) for work_id, count in expected_top]
+
+        frame = pd.DataFrame(
+            [{"work_id": work_id, "title": f"作品{work_id}"} for work_id in ids]
+        )
+        rows = hub_rows(frame, index, kind="work_joint", k=k, n=3)
+        assert [row["work_id"] for row in rows] == [item[0] for item in expected_top]
+        assert [row["count"] for row in rows] == [item[1] for item in expected_top]
+        assert all(row["in_map"] is True for row in rows)
+        assert [row["rank"] for row in rows] == [1, 2, 3]
+    finally:
+        index.close()
+
+
+# ---------------------------------------------------------------- P2 片段级相似探索
+
+def _direct_clip_rows(env: VectorEnv, work_id: int, kind: str) -> np.ndarray:
+    row = env.catalog.get_embedding(work_id, version=env.version, kind=kind)
+    assert row is not None, f"work {work_id} 缺少 {kind} 登记"
+    array = np.asarray(
+        np.load(env.cfg.data_path(str(row["path"])), allow_pickle=False), dtype=np.float64
+    )
+    if array.ndim == 1:
+        array = array.reshape(1, -1)
+    norms = np.linalg.norm(array, axis=1, keepdims=True)
+    return array / norms
+
+
+def test_p2_clip_similarity_heatmap_and_pairing_schema(vector_env: VectorEnv) -> None:
+    """P2：片段热图/最高配对/解释字段与手算片段余弦一致，schema 稳定。"""
+
+    index = load_similarity_index(vector_env.catalog, vector_env.cfg, version=vector_env.version)
+    try:
+        a = vector_env.work_ids["w1"]
+        b = vector_env.work_ids["w2"]
+        for clip_kind in ("clip_joint", "clip_audio"):
+            clips_a = _direct_clip_rows(vector_env, a, clip_kind)
+            clips_b = _direct_clip_rows(vector_env, b, clip_kind)
+            manual = np.clip(clips_a @ clips_b.T, -1.0, 1.0)
+            actual = index.clip_similarity(a, b, kind=clip_kind)
+            assert actual.shape == manual.shape
+            assert np.allclose(actual, manual, atol=1e-6)
+
+        kind = "clip_joint"
+        clips_a = _direct_clip_rows(vector_env, a, kind)
+        clips_b = _direct_clip_rows(vector_env, b, kind)
+        manual = np.clip(clips_a @ clips_b.T, -1.0, 1.0)
+        rows = manual.shape[0]
+        columns = manual.shape[1]
+        flattened = [
+            (float(manual[row, column]), row * columns + column)
+            for row in range(rows)
+            for column in range(columns)
+        ]
+        flattened.sort(key=lambda item: (-item[0], item[1]))
+        expected_pairs = [
+            (int(flat // columns), int(flat % columns), similarity)
+            for similarity, flat in flattened[:3]
+        ]
+        best = index.best_clip_pairs(a, b, kind=kind, k=3)
+        assert [(item["a_idx"], item["b_idx"]) for item in best] == [
+            (pair[0], pair[1]) for pair in expected_pairs
+        ]
+        for item, expected in zip(best, expected_pairs, strict=True):
+            assert item["similarity"] == pytest.approx(expected[2], abs=1e-6)
+
+        frame = pd.DataFrame(
+            [
+                {"work_id": a, "title": "作品A"},
+                {"work_id": b, "title": "作品B"},
+            ]
+        )
+        heatmap = clip_heatmap_data(index, frame, a, b, kind=kind)
+        assert heatmap["kind"] == kind
+        assert (heatmap["a_work_id"], heatmap["b_work_id"]) == (a, b)
+        assert heatmap["n_a"] == rows and heatmap["n_b"] == columns
+        assert np.allclose(np.asarray(heatmap["matrix"]), manual, atol=1e-6)
+        assert len(heatmap["row_labels"]) == rows
+        assert len(heatmap["col_labels"]) == columns
+        # 片段标签包含起始秒（w1/w2 的 clips 为 idx*8.0 秒）
+        assert any("8.0s" in label for label in heatmap["row_labels"]), heatmap["row_labels"]
+
+        pair_rows = clip_pair_rows(index, frame, a, b, kind=kind, k=3)
+        assert [row["rank"] for row in pair_rows] == [1, 2, 3]
+        for row, expected in zip(pair_rows, expected_pairs, strict=True):
+            assert (row["a_idx"], row["b_idx"]) == (expected[0], expected[1])
+            assert row["a_start_s"] == pytest.approx(expected[0] * 8.0)
+            assert row["b_start_s"] == pytest.approx(expected[1] * 8.0)
+            assert row["similarity"] == pytest.approx(expected[2], abs=1e-6)
+            assert row["a_title"] and row["b_title"]
+
+        explanation = index.explain_pair(a, b, kind=kind, threshold=0.5)
+        assert explanation["n_a"] == rows and explanation["n_b"] == columns
+        assert explanation["max"] == pytest.approx(float(np.max(manual)), abs=1e-6)
+        assert explanation["mean"] == pytest.approx(float(np.mean(manual)), abs=1e-6)
+        assert explanation["count_above_threshold"] == int(np.count_nonzero(manual >= 0.5))
+        assert explanation["threshold"] == pytest.approx(0.5)
+
+        # 片段级接口的边界：无片段向量的作品应报中文 NebulaError；阈值非法同样拒绝
+        with pytest.raises(NebulaError):
+            index.clip_similarity(a, vector_env.work_ids["w4"], kind=kind)
+        with pytest.raises(NebulaError):
+            index.explain_pair(a, b, kind=kind, threshold=2.0)
+        assert "clip_joint" in index.available_clip_kinds
+        assert index.has_clip_vector(a, "clip_joint") is True
+    finally:
+        index.close()
+
 
 
 # ---------------------------------------------------------------- A2 筛选星云
@@ -1409,6 +1658,33 @@ def app_env(tmp_path_factory: pytest.TempPathFactory) -> AppEnv:
                     path=cfg.data_relpath(work_dir / f"{kind}.npy"),
                     dim=int(array.shape[0]),
                 )
+            if name in {"app1", "app2"}:
+                clip_matrices = {
+                    "clip_joint": np.stack(
+                        [
+                            _unit64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                            _unit64([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                        ]
+                    ),
+                    "clip_audio": np.stack(
+                        [_unit64([1.0, 0.0, 0.0, 0.0]), _unit64([0.0, 1.0, 0.0, 0.0])]
+                    ),
+                }
+                for clip_kind, matrix in clip_matrices.items():
+                    save_vector(work_dir / f"{clip_kind}.npy", matrix)
+                    catalog.register_embedding(
+                        work_id,
+                        version=version,
+                        kind=clip_kind,
+                        path=cfg.data_relpath(work_dir / f"{clip_kind}.npy"),
+                        dim=int(matrix.shape[1]),
+                        n_clips=int(matrix.shape[0]),
+                    )
+                    catalog.replace_clips(
+                        work_id,
+                        version=version,
+                        clips=[(index, index * 8.0, 8.0) for index in range(matrix.shape[0])],
+                    )
             catalog.complete(work_id)
             catalog.add_appearance(work_id, target_list, rank=rank, votes=100 - rank)
             work_ids[name] = int(work_id)
@@ -1520,6 +1796,68 @@ def test_v02_app_neighbor_panel_density_filters_and_3d(
     assert jump_similarity == pytest.approx(max(
         sim for work_id, sim in _expected_ranked(vectors, app_env.work_ids["app1"])
     ))
+
+def test_v02_app_hubness_and_clip_explorer(
+    app_env: AppEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1/P2 界面独立验收：近邻解释列、枢纽作品表、片段热图与配对表。"""
+
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setenv("NEBULA_CONFIG", str(app_env.cfg.path))
+    at = AppTest.from_file(str(REPO_ROOT / "app.py"), default_timeout=120)
+    at.run()
+    assert len(at.exception) == 0, f"页面出现异常: {list(at.exception)}"
+
+    first = app_env.work_ids["app1"]
+    compare = app_env.work_ids["app2"]
+    at.selectbox(key="manual_work").set_value(first).run()
+    assert len(at.exception) == 0
+
+    # 近邻表必须带“全库分位/双向”解释列
+    tables = [element.value for element in at.dataframe]
+    assert tables, "近邻表应渲染"
+    columns = set(str(column) for column in tables[0].columns)
+    assert {"全库分位", "双向"} <= columns, columns
+
+    # 枢纽作品表（st.table）
+    hub_tables = at.get("table")
+    assert len(hub_tables) >= 1, "枢纽作品表应渲染"
+    assert len(hub_tables[0].value) >= 1
+
+    # 片段级对应：默认关闭；勾选后出现对比下拉、热图与配对表
+    checkbox = at.checkbox(key="show_clip_panel")
+    assert checkbox.value is False
+    at.checkbox(key="show_clip_panel").set_value(True).run()
+    assert len(at.exception) == 0
+    at.selectbox(key="clip_compare_work").set_value(compare).run()
+    assert len(at.exception) == 0
+
+    charts = at.get("plotly_chart")
+    assert len(charts) == 2, f"应有星云图 + 片段热图两张图，实际 {len(charts)}"
+    specs = [json.loads(chart.proto.spec) for chart in charts]
+    assert any(
+        str(trace.get("type", "")).lower() == "heatmap"
+        for spec in specs
+        for trace in spec.get("data", [])
+    ), "片段级对应应渲染 Plotly heatmap"
+    captions = [str(element.value) for element in at.caption]
+    assert any("片段级统计" in caption for caption in captions), captions
+    # 3 个模态近邻表 + 1 个最高片段配对表
+    assert len([element for element in at.dataframe]) >= 4
+
+    # 片段模态可切换（clip_joint / clip_audio 都有数据）
+    clip_kind = at.selectbox(key="clip_kind")
+    kind_labels = [str(option) for option in clip_kind.options]
+    assert {"联合片段", "音频片段"} <= set(kind_labels), kind_labels
+    at.selectbox(key="clip_kind").set_value("clip_audio").run()
+    assert len(at.exception) == 0
+    assert len(at.get("plotly_chart")) == 2
+
+    # 关闭热图后回到单图，且不残留异常
+    at.checkbox(key="show_clip_panel").set_value(False).run()
+    assert len(at.exception) == 0
+    assert len(at.get("plotly_chart")) == 1
 
 
 

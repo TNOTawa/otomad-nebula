@@ -91,6 +91,40 @@ def _add_work(
     return work_id
 
 
+def _add_clip_vectors(
+    catalog: Catalog,
+    config: Config,
+    work_id: int,
+    *,
+    matrices: dict[str, np.ndarray],
+    version: str | None = None,
+    start_step: float = 10.0,
+) -> None:
+    """为一部作品登记片段级向量（堆叠 npy）与 clips 表起始时间。"""
+
+    target_version = version or config.embedding_version
+    max_clips = 0
+    for kind, matrix in matrices.items():
+        array = np.asarray(matrix, dtype=np.float32)
+        path = config.paths.embeddings / target_version / str(work_id) / f"{kind}.npy"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, array)
+        catalog.register_embedding(
+            work_id,
+            version=target_version,
+            kind=kind,
+            path=config.data_relpath(path),
+            dim=int(array.shape[1]),
+            n_clips=int(array.shape[0]),
+        )
+        max_clips = max(max_clips, int(array.shape[0]))
+    catalog.replace_clips(
+        work_id,
+        version=target_version,
+        clips=[(idx, start_step * idx, 8.0) for idx in range(max_clips)],
+    )
+
+
 def _seed_axes_works(catalog: Catalog, config: Config) -> dict[int, int]:
     """4 部作品，joint 向量在几个正交方向上，便于手算余弦。"""
 
@@ -366,3 +400,243 @@ def test_zero_vector_rejected(config: Config, catalog: Catalog):
     np.save(path, np.zeros(8, dtype=np.float32))
     with pytest.raises(NebulaError, match="零向量"):
         load_similarity_index(catalog, config)
+
+
+# --------------------------------------------------------------------------- P1 近邻解释
+def test_neighbor_dataclass_backward_compatible():
+    neighbor = Neighbor(work_id=1, similarity=0.9, rank=1)
+    assert neighbor.pair_percentile == 0.0
+    assert neighbor.is_mutual is False
+
+
+def test_neighbor_explanation_fields(config: Config, catalog: Catalog):
+    ids = _seed_axes_works(catalog, config)
+    index = load_similarity_index(catalog, config)
+    try:
+        neighbors = index.neighbors(ids[2], k=5)
+        assert len(neighbors) == 3
+        work_ids = index.work_ids
+        matrix = index.matrix("work_joint")
+        pair_similarities = [
+            float(np.dot(matrix[first], matrix[second]))
+            for first in range(len(work_ids))
+            for second in range(first + 1, len(work_ids))
+        ]
+        for neighbor in neighbors:
+            assert 0.0 <= neighbor.pair_percentile <= 100.0
+            assert isinstance(neighbor.is_mutual, bool)
+            similarity = index.similarity(ids[2], neighbor.work_id)
+            below = sum(1 for value in pair_similarities if value < similarity - 1e-12)
+            expected = 100.0 * below / len(pair_similarities)
+            assert neighbor.pair_percentile == pytest.approx(expected, abs=1e-6)
+        # 互为近邻的定义：目标作品的 Top-k 里也包含当前作品
+        for neighbor in neighbors:
+            target_top = index.neighbors(neighbor.work_id, k=5)
+            target_ids = {item.work_id for item in target_top}
+            assert neighbor.is_mutual is (ids[2] in target_ids)
+    finally:
+        index.close()
+
+
+def test_pair_percentile_hand_calculated(config: Config, catalog: Catalog):
+    # 3 部作品：A-B=0，A-C=B-C=0.7071 -> C 与 A 的分位 = 100 * 1 / 3
+    vectors = {
+        1: {"work_joint": _unit([1.0, 0.0, 0.0, 0.0])},
+        2: {"work_joint": _unit([0.0, 1.0, 0.0, 0.0])},
+        3: {"work_joint": _unit([1.0, 1.0, 0.0, 0.0])},
+    }
+    ids = {
+        number: _add_work(catalog, config, number, vectors=payload, kinds=("work_joint",))
+        for number, payload in vectors.items()
+    }
+    index = load_similarity_index(catalog, config)
+    try:
+        similarity_ab = index.similarity(ids[1], ids[2])
+        similarity_ac = index.similarity(ids[1], ids[3])
+        assert similarity_ab == pytest.approx(0.0, abs=1e-6)
+        assert similarity_ac == pytest.approx(0.70710678, abs=1e-6)
+        # A-B: 没有任何作品对低于 0
+        assert index.pair_percentile(ids[1], ids[2]) == pytest.approx(0.0, abs=1e-6)
+        # A-C: 只有 A-B=0 低于 0.7071 -> 1/3
+        assert index.pair_percentile(ids[1], ids[3]) == pytest.approx(100.0 / 3.0, abs=1e-6)
+        neighbors = {item.work_id: item for item in index.neighbors(ids[1], k=2)}
+        assert neighbors[ids[3]].pair_percentile == pytest.approx(100.0 / 3.0, abs=1e-6)
+    finally:
+        index.close()
+
+
+def test_hubness_and_hub_top_hand_calculated(config: Config, catalog: Catalog):
+    # 1、2 向量相同；3/4/5 互相正交。k=1 时所有人都把 1 当作最近邻（2 也把 1 当最近）
+    vectors = {
+        1: {"work_joint": _unit([1.0, 0.0, 0.0, 0.0])},
+        2: {"work_joint": _unit([1.0, 0.0, 0.0, 0.0])},
+        3: {"work_joint": _unit([0.0, 1.0, 0.0, 0.0])},
+        4: {"work_joint": _unit([0.0, 0.0, 1.0, 0.0])},
+        5: {"work_joint": _unit([0.0, 0.0, 0.0, 1.0])},
+    }
+    ids = {
+        number: _add_work(catalog, config, number, vectors=payload, kinds=("work_joint",))
+        for number, payload in vectors.items()
+    }
+    index = load_similarity_index(catalog, config)
+    try:
+        counts = index.hubness(k=1)
+        assert counts == {ids[1]: 4, ids[2]: 1, ids[3]: 0, ids[4]: 0, ids[5]: 0}
+        assert sum(counts.values()) == len(ids)
+        assert index.hub_top(k=1, n=3) == [(ids[1], 4), (ids[2], 1), (ids[3], 0)]
+
+        # k=2 时每部作品出 2 票
+        counts_k2 = index.hubness(k=2)
+        assert sum(counts_k2.values()) == 2 * len(ids)
+        # 互为近邻标记与 hubness 一致：1 的近邻 2 的 Top-k 包含 1
+        top_pair = index.neighbors(ids[1], k=1)[0]
+        assert top_pair.work_id == ids[2] and top_pair.is_mutual is True
+        with pytest.raises(NebulaError):
+            index.hubness(k=0)
+        with pytest.raises(NebulaError):
+            index.hub_top(n=0)
+    finally:
+        index.close()
+
+
+# --------------------------------------------------------------------------- P2 片段级
+def _seed_clip_pair(catalog: Catalog, config: Config):
+    """两部作品，每部 3 个片段；片段向量按已知方向构造便于手算。"""
+
+    ids = {
+        number: _add_work(catalog, config, number, kinds=("work_joint",))
+        for number in (1, 2)
+    }
+    clips_a = np.vstack(
+        [
+            _unit([1.0, 0.0, 0.0, 0.0]),
+            _unit([0.0, 1.0, 0.0, 0.0]),
+            _unit([1.0, 1.0, 0.0, 0.0]),
+        ]
+    ).astype(np.float32)
+    clips_b = np.vstack(
+        [
+            _unit([1.0, 0.0, 0.0, 0.0]),
+            _unit([0.0, 0.0, 1.0, 0.0]),
+            _unit([1.0, 0.0, 1.0, 0.0]),
+        ]
+    ).astype(np.float32)
+    _add_clip_vectors(catalog, config, ids[1], matrices={"clip_joint": clips_a})
+    _add_clip_vectors(catalog, config, ids[2], matrices={"clip_joint": clips_b})
+    return ids, clips_a, clips_b
+
+
+def test_clip_matrix_and_similarity(config: Config, catalog: Catalog):
+    ids, clips_a, clips_b = _seed_clip_pair(catalog, config)
+    index = load_similarity_index(catalog, config)
+    try:
+        matrix_a = index.clip_matrix(ids[1])
+        matrix_b = index.clip_matrix(ids[2], "clip_joint")
+        assert matrix_a.shape == (3, 4)
+        assert matrix_b.shape == (3, 4)
+        np.testing.assert_allclose(np.linalg.norm(matrix_a, axis=1), np.ones(3), atol=1e-6)
+        similarities = index.clip_similarity(ids[1], ids[2])
+        expected = clips_a.astype(np.float64) @ clips_b.astype(np.float64).T
+        assert similarities.shape == (3, 3)
+        np.testing.assert_allclose(similarities, np.clip(expected, -1.0, 1.0), atol=1e-6)
+        assert index.has_clip_vector(ids[1], "clip_joint") is True
+        assert index.has_clip_vector(ids[1], "clip_audio") is False
+        assert index.available_clip_kinds == ("clip_joint",)
+        with pytest.raises(NebulaError):
+            index.clip_matrix(ids[1], "clip_audio")
+    finally:
+        index.close()
+
+
+def test_best_clip_pairs_and_explain(config: Config, catalog: Catalog):
+    ids, clips_a, clips_b = _seed_clip_pair(catalog, config)
+    index = load_similarity_index(catalog, config)
+    try:
+        pairs = index.best_clip_pairs(ids[1], ids[2], "clip_joint", 2)
+        assert len(pairs) == 2
+        assert set(pairs[0]) == {"a_idx", "b_idx", "similarity"}
+        assert pairs[0]["a_idx"] == 0 and pairs[0]["b_idx"] == 0
+        assert pairs[0]["similarity"] == pytest.approx(1.0, abs=1e-6)
+        # 第二高是一对 0.707 的片段（A0-B2 与 A2-B0 并列，行优先稳定排序取前者）
+        assert (pairs[1]["a_idx"], pairs[1]["b_idx"]) in {(0, 2), (2, 0)}
+        assert pairs[1]["similarity"] == pytest.approx(np.sqrt(0.5), abs=1e-6)
+        assert [pair["similarity"] for pair in pairs] == sorted(
+            [pair["similarity"] for pair in pairs], reverse=True
+        )
+
+        explanation = index.explain_pair(ids[1], ids[2], "clip_joint")
+        expected = clips_a.astype(np.float64) @ clips_b.astype(np.float64).T
+        assert explanation["max"] == pytest.approx(float(np.max(expected)), abs=1e-6)
+        assert explanation["mean"] == pytest.approx(float(np.mean(expected)), abs=1e-6)
+        assert explanation["count_above_threshold"] == int(np.count_nonzero(expected >= 0.5))
+        assert explanation["n_a"] == 3 and explanation["n_b"] == 3
+        custom = index.explain_pair(ids[1], ids[2], "clip_joint", threshold=0.9)
+        assert custom["count_above_threshold"] == 1
+        with pytest.raises(NebulaError):
+            index.explain_pair(ids[1], ids[2], "clip_joint", threshold=2.0)
+    finally:
+        index.close()
+
+
+def test_clip_times(config: Config, catalog: Catalog):
+    ids, _, _ = _seed_clip_pair(catalog, config)
+    index = load_similarity_index(catalog, config)
+    try:
+        times = index.clip_times(ids[1])
+        assert [item["idx"] for item in times] == [0, 1, 2]
+        assert [item["start_s"] for item in times] == [0.0, 10.0, 20.0]
+        assert all(item["duration_s"] == 8.0 for item in times)
+        # 返回副本，外部修改不影响缓存
+        times[0]["start_s"] = 999.0
+        assert index.clip_times(ids[1])[0]["start_s"] == 0.0
+        with pytest.raises(NebulaError):
+            index.clip_times(99999)
+    finally:
+        index.close()
+
+
+def test_clip_cache_reads_each_npy_once(config: Config, catalog: Catalog, monkeypatch):
+    ids, _, _ = _seed_clip_pair(catalog, config)
+    reads: list[str] = []
+    original = similarity._read_vector_file
+
+    def counting_reader(path):
+        reads.append(str(path))
+        return original(path)
+
+    monkeypatch.setattr(similarity, "_read_vector_file", counting_reader)
+    index = load_similarity_index(catalog, config)
+    work_reads = len(reads)  # 2 部作品 × work_joint 1 种 = 2
+    try:
+        index.clip_matrix(ids[1])
+        index.clip_matrix(ids[1])  # 命中缓存
+        index.clip_similarity(ids[1], ids[2])
+        index.best_clip_pairs(ids[1], ids[2])
+        index.explain_pair(ids[1], ids[2])
+        assert len(reads) == work_reads + 2  # 两部作品各读一次片段 npy
+        index.clip_matrix(ids[2])
+        assert len(reads) == work_reads + 2
+    finally:
+        index.close()
+
+
+def test_close_clears_clip_cache(config: Config, catalog: Catalog):
+    ids, _, _ = _seed_clip_pair(catalog, config)
+    index = load_similarity_index(catalog, config)
+    assert index.clip_matrix(ids[1]).shape == (3, 4)
+    index.close()
+    with pytest.raises(NebulaError):
+        index.clip_matrix(ids[1])
+
+
+def test_clip_registered_count_mismatch(config: Config, catalog: Catalog):
+    ids, clips_a, _ = _seed_clip_pair(catalog, config)
+    version = config.embedding_version
+    path = config.paths.embeddings / version / str(ids[1]) / "clip_joint.npy"
+    np.save(path, np.vstack([clips_a[0], clips_a[1]]))  # 登记 3 段，文件 2 段
+    index = load_similarity_index(catalog, config)
+    try:
+        with pytest.raises(NebulaError, match="片段数量与登记不一致"):
+            index.clip_matrix(ids[1])
+    finally:
+        index.close()

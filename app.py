@@ -34,8 +34,11 @@ from nebula.appdata import (
     ColorSpec,
     apply_color,
     available_color_fields,
+    clip_heatmap_data,
+    clip_pair_rows,
     external_url,
     filter_frame,
+    hub_rows,
     load_nebula_frame,
     neighbor_rows,
     search_frame,
@@ -43,7 +46,13 @@ from nebula.appdata import (
 from nebula.config import Config, load_config
 from nebula.db import Catalog
 from nebula.errors import NebulaError
-from nebula.similarity import KIND_LABELS, KINDS, SimilarityIndex, load_similarity_index
+from nebula.similarity import (
+    CLIP_KIND_LABELS,
+    KIND_LABELS,
+    KINDS,
+    SimilarityIndex,
+    load_similarity_index,
+)
 
 _DEFAULT_CONFIG = Path(__file__).resolve().parent / "config.yaml"
 _MISSING_COLOR = "#b0b0b0"
@@ -52,6 +61,7 @@ _NEIGHBOR_COLOR = "#ef476f"
 _LINE_COLOR = "rgba(255, 209, 102, 0.55)"
 _HEIGHT_2D = 680
 _HEIGHT_3D = 720
+_HEIGHT_CLIP_HEATMAP = 520
 _NEIGHBOR_K = 5
 
 _PROJECTION_LABELS = {"2d": "2D（平面）", "3d": "3D（三维）"}
@@ -519,7 +529,7 @@ def _render_neighbor_panel(
     selected_work_id: int,
     error: str | None,
 ) -> None:
-    """显示选中作品三个模态的 Top5 近邻，并提供跳到近邻作品的下拉入口。"""
+    """显示三模态 Top5 近邻（含解释列）、枢纽作品与片段级对应探索。"""
 
     st.markdown("#### 高维近邻（真实余弦相似度）")
     if index is None:
@@ -528,6 +538,7 @@ def _render_neighbor_panel(
 
     by_id = frame.set_index("work_id")
     jump_ids: list[int] = []
+    compare_candidates: list[int] = []
     for kind in KINDS:
         st.markdown(f"**{KIND_LABELS[kind]} Top{_NEIGHBOR_K}**")
         if not index.has_vector(selected_work_id, kind):
@@ -547,32 +558,194 @@ def _render_neighbor_panel(
                     "排名": row["rank"],
                     "作品": row["title"],
                     "余弦相似度": f"{float(row['similarity']):.4f}",
+                    "全库分位": f"{float(row['pair_percentile']):.1f}%",
+                    "双向": "是" if row["is_mutual"] else "",
                 }
                 for row in rows
             ]
         )
         st.dataframe(table, width="stretch", hide_index=True)
-        jump_ids.extend(int(row["work_id"]) for row in rows)
+        for row in rows:
+            work_key = int(row["work_id"])
+            jump_ids.append(work_key)
+            if work_key not in compare_candidates:
+                compare_candidates.append(work_key)
 
-    if not jump_ids:
-        return
-    unique_ids = list(dict.fromkeys(jump_ids))
-    jump_labels: dict[int, str] = {}
-    for work_id in unique_ids:
-        row = by_id.loc[work_id] if work_id in by_id.index else None
-        jump_labels[work_id] = _work_label(row) if row is not None else f"作品 {work_id}"
-    if st.session_state.get("neighbor_jump") not in unique_ids:
-        st.session_state.pop("neighbor_jump", None)
-    st.selectbox(
-        "跳到近邻作品继续探索",
-        options=unique_ids,
-        index=None,
-        placeholder="选择一部近邻作品…",
-        format_func=lambda work_id: jump_labels.get(int(work_id), str(work_id)),
-        key="neighbor_jump",
-        on_change=_on_neighbor_jump,
-        args=("neighbor_jump",),
+    st.caption(
+        "全库分位：该相似度高于全库全部作品对（不含自身）的百分比；"
+        "双向：目标作品也把你列入同一 Top-k。分位接近 100 表示这种相似度在库里很罕见。"
     )
+
+    # ---------------------------------------------------------------- 枢纽作品
+    with st.expander("枢纽作品（被最多作品列为 Top5）", expanded=False):
+        st.caption(
+            "hubness 统计每部作品被多少部其他作品列为 Top5。注意：小样本/筛选子集上该统计不稳定，"
+            "只作为观察“哪些作品常被当作近邻”的线索，不代表作品质量或重要性。"
+        )
+        try:
+            hubs = hub_rows(frame, index, kind="work_joint", k=_NEIGHBOR_K, n=8)
+        except NebulaError as exc:
+            st.caption(f"枢纽统计不可用：{exc}")
+        else:
+            if hubs:
+                hub_table = pd.DataFrame(
+                    [
+                        {
+                            "排名": row["rank"],
+                            "作品": row["title"],
+                            "被列次数": row["count"],
+                        }
+                        for row in hubs
+                    ]
+                )
+                st.table(hub_table, hide_index=True)
+            else:
+                st.caption("作品数量太少，暂无枢纽统计")
+
+    # ---------------------------------------------------------------- 片段级对应
+    if jump_ids:
+        unique_ids = list(dict.fromkeys(jump_ids))
+        jump_labels: dict[int, str] = {}
+        for work_id in unique_ids:
+            row = by_id.loc[work_id] if work_id in by_id.index else None
+            jump_labels[work_id] = _work_label(row) if row is not None else f"作品 {work_id}"
+        if st.session_state.get("neighbor_jump") not in unique_ids:
+            st.session_state.pop("neighbor_jump", None)
+        st.selectbox(
+            "跳到近邻作品继续探索",
+            options=unique_ids,
+            index=None,
+            placeholder="选择一部近邻作品…",
+            format_func=lambda work_id: jump_labels.get(int(work_id), str(work_id)),
+            key="neighbor_jump",
+            on_change=_on_neighbor_jump,
+            args=("neighbor_jump",),
+        )
+        _render_clip_panel(frame, index, selected_work_id, compare_candidates)
+
+
+def _render_clip_panel(
+    frame: pd.DataFrame,
+    index: SimilarityIndex,
+    selected_work_id: int,
+    compare_candidates: list[int],
+) -> None:
+    """片段级对应面板：可选近邻 B，展示片段余弦热图与最高片段配对。
+
+    默认折叠且需要勾选才渲染热图：避免每次打开页面都加载片段矩阵与额外图表。
+    """
+
+    selected_clip_kinds = [
+        kind for kind in index.available_clip_kinds if index.has_clip_vector(selected_work_id, kind)
+    ]
+    if not selected_clip_kinds:
+        return
+    with st.expander("片段级对应（整体平均向量 vs 局部片段）", expanded=False):
+        st.caption(
+            "作品级平均向量相近，不代表局部片段也相近；热图颜色为片段对余弦，"
+            "越亮表示这两个具体片段越相似。"
+        )
+        show_clip = st.checkbox(
+            "显示片段级对应热图（需要加载片段向量）",
+            value=False,
+            key="show_clip_panel",
+        )
+        if not show_clip:
+            return
+        if not compare_candidates:
+            st.caption("该作品暂无可比较的近邻作品")
+            return
+        if st.session_state.get("clip_compare_work") not in compare_candidates:
+            st.session_state.pop("clip_compare_work", None)
+        compare_labels: dict[int, str] = {}
+        for work_id in compare_candidates:
+            row = _lookup_row(frame, work_id)
+            compare_labels[int(work_id)] = (
+                _work_label(row) if row is not None else f"作品 {work_id}"
+            )
+        compare_id = st.selectbox(
+            "对比的近邻作品",
+            options=compare_candidates,
+            index=0,
+            format_func=lambda work_id: compare_labels.get(int(work_id), str(work_id)),
+            key="clip_compare_work",
+        )
+        compare_id = int(compare_id)
+        valid_kinds = [
+            kind
+            for kind in selected_clip_kinds
+            if index.has_clip_vector(compare_id, kind)
+        ]
+        if not valid_kinds:
+            st.caption("两部作品没有共同的片段级模态向量")
+            return
+        if st.session_state.get("clip_kind") not in valid_kinds:
+            st.session_state.pop("clip_kind", None)
+        clip_kind = st.selectbox(
+            "片段模态",
+            options=valid_kinds,
+            format_func=lambda kind: CLIP_KIND_LABELS.get(kind, kind),
+            key="clip_kind",
+        )
+        clip_kind = str(clip_kind)
+        try:
+            data = clip_heatmap_data(index, frame, selected_work_id, compare_id, clip_kind)
+            pairs = clip_pair_rows(
+                index, frame, selected_work_id, compare_id, clip_kind, _NEIGHBOR_K
+            )
+            explanation = index.explain_pair(
+                selected_work_id, compare_id, kind=clip_kind
+            )
+        except NebulaError as exc:
+            st.caption(f"片段级对应不可用：{exc}")
+            return
+
+        heatmap = go.Figure(
+            go.Heatmap(
+                z=data["matrix"],
+                x=data["col_labels"],
+                y=data["row_labels"],
+                colorscale="Viridis",
+                zmin=-1.0,
+                zmax=1.0,
+                colorbar={"title": "片段余弦"},
+                hovertemplate="A %{y}<br>B %{x}<br>余弦 %{z:.4f}<extra></extra>",
+            )
+        )
+        heatmap.update_layout(
+            title=f"片段级对应：{data['a_title']} × {data['b_title']}",
+            template="plotly_dark",
+            height=_HEIGHT_CLIP_HEATMAP,
+            margin={"l": 10, "r": 10, "t": 60, "b": 10},
+            xaxis_title="B 片段",
+            yaxis_title="A 片段",
+        )
+        st.plotly_chart(heatmap, width="stretch", key="clip_heatmap_chart")
+
+        pair_table = pd.DataFrame(
+            [
+                {
+                    "排名": row["rank"],
+                    "A 片段": int(row["a_idx"]) + 1,
+                    "A 起始(s)": (
+                        "-" if row["a_start_s"] is None else f"{float(row['a_start_s']):.1f}"
+                    ),
+                    "B 片段": int(row["b_idx"]) + 1,
+                    "B 起始(s)": (
+                        "-" if row["b_start_s"] is None else f"{float(row['b_start_s']):.1f}"
+                    ),
+                    "余弦": f"{float(row['similarity']):.4f}",
+                }
+                for row in pairs
+            ]
+        )
+        st.dataframe(pair_table, width="stretch", hide_index=True)
+        st.caption(
+            f"片段级统计：最高余弦 {explanation['max']:.3f}，平均 {explanation['mean']:.3f}；"
+            f"阈值 {explanation['threshold']:.1f} 以上共 {explanation['count_above_threshold']} 对"
+            f"（共 {explanation['n_a']}×{explanation['n_b']} 对）。"
+            "整体平均向量接近时，局部片段仍可能只在对少数片段上高度相似。"
+        )
 
 
 def _on_neighbor_jump(selectbox_key: str) -> None:

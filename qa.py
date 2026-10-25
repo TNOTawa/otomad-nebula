@@ -4,11 +4,12 @@
 
 1. ruff 静态检查：nebula/、tests/、项目根目录与 tools/ 下的 Python 脚本；
 2. pytest：tests/ 全量测试，默认排除 model / network 标记；
-3. 文档检查：README.md、ARCHITECTURE.md 存在且包含 v0.2 关键内容；docs/adr/ 至少 7 篇
-   （含 0005 身份关联 / 0006 筛选地图 / 0007 高维近邻密度）并包含
-   Decision / Why / Options / Chosen / Consequences / How verified 章节；
+3. 文档检查：README.md、ARCHITECTURE.md 存在且包含 v0.2 关键内容；docs/adr/ 至少 9 篇
+   （含 0005 身份关联 / 0006 筛选地图 / 0007 高维近邻密度 / 0008 音画错位实验 /
+   0009 近邻解释）并包含 Decision / Why / Options / Chosen / Consequences / How verified 章节；
 4. CLI 入口冒烟：ingest.py、pipeline.py、map.py 及其 v0.2 子命令（map.py variants、
-   ingest.py link-local）、tools/clip_stability.py 的 --help 均能成功运行；
+   ingest.py link-local）、tools/clip_stability.py、tools/desync_experiment.py、
+   tools/preflight_works.py 的 --help 均能成功运行；
 5. 配置有效性：config.yaml 可加载；可据此生成并加载一份临时隔离配置；ffmpeg/ffprobe 可用。
 
 --full 额外运行带 model / network 标记的测试（需要 PE-AV 权重和网络；
@@ -50,21 +51,31 @@ CLI_CHECKS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("map.py", ("variants",)),
     ("ingest.py", ("link-local",)),
     ("tools/clip_stability.py", ()),
+    ("tools/desync_experiment.py", ()),
+    ("tools/preflight_works.py", ()),
 )
 """必须能以 --help 成功运行的 CLI 入口（脚本, 子命令参数）。"""
 
 REQUIRED_DOC_FILES: tuple[str, ...] = ("README.md", "ARCHITECTURE.md")
 
 V02_DOC_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "README.md": ("v0.2", "近邻", "稳定性", "身份关联", "筛选"),
-    "ARCHITECTURE.md": ("work_links", "filter_json", "stability", "余弦"),
+    "README.md": ("v0.2", "近邻", "稳定性", "身份关联", "筛选", "分位", "错位", "片段级"),
+    "ARCHITECTURE.md": (
+        "work_links",
+        "filter_json",
+        "stability",
+        "余弦",
+        "avsync",
+        "分位",
+        "坐标不可",
+    ),
 }
 """v0.2 文档必须覆盖的关键内容（存在性检查，不校验具体措辞）。"""
 
-REQUIRED_ADR_PREFIXES: tuple[str, ...] = ("0005", "0006", "0007")
-"""v0.2 必需的 ADR 编号前缀（身份关联、筛选地图、高维近邻密度）。"""
+REQUIRED_ADR_PREFIXES: tuple[str, ...] = ("0005", "0006", "0007", "0008", "0009")
+"""v0.2 必需的 ADR 编号前缀（身份关联、筛选地图、高维近邻密度、错位实验、近邻解释）。"""
 
-MIN_ADR_COUNT = 7
+MIN_ADR_COUNT = 9
 ADR_SECTIONS: tuple[str, ...] = (
     "Decision",
     "Why",
@@ -331,7 +342,8 @@ def check_cli(*, verbose: bool = False) -> CheckResult:
         return CheckResult("cli", False, "；".join(problems), duration, "\n".join(outputs))
     detail = (
         f"{len(passed)} 个 CLI 入口 --help 均可运行"
-        "（含 map.py variants、ingest.py link-local、tools/clip_stability.py）"
+        "（含 map.py variants、ingest.py link-local、tools/clip_stability.py、"
+        "tools/desync_experiment.py、tools/preflight_works.py）"
     )
     return CheckResult("cli", True, detail, duration)
 

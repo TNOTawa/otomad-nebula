@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import inspect
 import json
 import random
@@ -145,6 +146,79 @@ def test_stability_report_is_offline_and_plan_distance_free() -> None:
     if not tool.is_file():
         pytest.skip("tools/clip_stability.py 尚未交付")
     _assert_no_import(tool, ("torch", "transformers", "streamlit", "plotly", "umap"))
+
+
+def test_avsync_import_boundaries() -> None:
+    """A6 错位实验模块：不导入 UI 库，导入模块本身不得加载 torch/transformers。"""
+
+    path = _module_file("avsync")
+    _assert_no_import(path, ("streamlit", "plotly"))
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys, nebula.avsync; "
+                "print(int('torch' in sys.modules), int('transformers' in sys.modules), "
+                "int('streamlit' in sys.modules), int('plotly' in sys.modules))"
+            ),
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr[-800:]
+    assert probe.stdout.strip() == "0 0 0 0", f"导入 nebula.avsync 意外加载了模型/UI 库: {probe.stdout}"
+
+
+def test_similarity_explanation_fields_are_display_only() -> None:
+    """A1 近邻解释字段（相对分位/互为）有默认值、不改变既有构造与排序语义。"""
+
+    module = importlib.import_module("nebula.similarity")
+    neighbor_cls = module.Neighbor
+    plain = neighbor_cls(work_id=1, similarity=0.5, rank=1)
+    assert plain.pair_percentile == 0.0
+    assert plain.is_mutual is False
+    detailed = neighbor_cls(
+        work_id=2,
+        similarity=0.1,
+        rank=2,
+        pair_percentile=42.5,
+        is_mutual=True,
+    )
+    assert detailed.pair_percentile == 42.5
+    assert detailed.is_mutual is True
+    assert (detailed.work_id, detailed.similarity, detailed.rank) == (2, 0.1, 2)
+
+
+def test_segment_explorer_is_pure_data_layer() -> None:
+    """片段级探索接口位于纯数据层（appdata/similarity），不接收 UI 对象。"""
+
+    appdata_path = _module_file("appdata")
+    for function_name in ("hub_rows", "clip_heatmap_data", "clip_pair_rows"):
+        params = _function_param_names(appdata_path, function_name)
+        assert params is not None, f"appdata 缺少纯数据函数 {function_name}"
+        assert not set(params) & {"fig", "figure", "st", "plotly"}, (
+            f"{function_name} 不应接收 UI 对象参数: {params}"
+        )
+    similarity_path = _module_file("similarity")
+    for method_name in (
+        "pair_percentile",
+        "hubness",
+        "hub_top",
+        "clip_similarity",
+        "best_clip_pairs",
+        "explain_pair",
+    ):
+        assert _function_param_names(similarity_path, method_name) is not None, (
+            f"similarity 缺少 {method_name}"
+        )
+    # appdata 仍是纯数据层（不 import streamlit/plotly）
+    _assert_no_import(appdata_path, ("streamlit", "plotly"))
 
 
 # ──────────────────────────────────────────────────────────────────────────────

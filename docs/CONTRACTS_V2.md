@@ -1,6 +1,34 @@
 # 迭代 v0.2/v0.3 契约（内部约定）
 
 > 在 v0.1 的 docs/CONTRACTS.md 基础上新增。共享文件仍归 Lead；本文件是新增模块的接口依据。
+>
+> **阅读提示**：本文件最初写于 v0.2 实现之前，正文中“将新增 / 追加 / 待实现”等未来时措辞
+> 属于历史设计记录；当前真实行为以下方“实现状态”表与实际代码为准。
+
+## 实现状态（v0.2.x）
+
+更新时间：2026-10-25；代码基线：公开 main `b0a2dfb`（v0.2.0）。
+公开 main 的 `app.py` 已实际接入 `SimilarityIndex` / `_render_neighbor_panel` /
+`total_versions`，`density_knn` 由 `nebula/appdata.py` 的 `apply_color` 生效；
+本文件不再是“待实现清单”。
+
+| 项 | 状态 | 实现位置 | 测试 / QA 证据 |
+| --- | --- | --- | --- |
+| DB schema v2（§1） | ✅ 已实现（v0.2.0） | `nebula/db.py`：SCHEMA_VERSION=2、v1→v2 自动迁移、work_links / pipeline_runs / work_timings / map_runs.filter_json | `tests/test_db.py` 19 项（含 v2 迁移、work_links、filter_json、计时） |
+| A1 高维近邻（§2） | ✅ 已实现（v0.2.0；v0.2.x 增加解释字段/片段级） | `nebula/similarity.py`；`app.py` 近邻面板/高亮/连线；`appdata.neighbor_rows`；`st.cache_resource` 缓存（key 含 db mtime + 版本）；v0.2.x：`pair_percentile / is_mutual / hubness / hub_top / clip_similarity / best_clip_pairs / explain_pair` | `tests/test_similarity.py` 26 项、`tests/test_app.py` 21 项、`tests/test_appdata.py` 28 项；独立验收手算高维余弦/分位/互为/hubness/片段配对对照 |
+| A2 数据准备/界面（§3） | ✅ 已实现（v0.2.0；v0.2.x 增加解释列/枢纽/片段面板） | `nebula/appdata.py`：list_keys/vote_years/is_canonical/density_knn/filter_frame/neighbor_rows/hub_rows/clip_heatmap_data/clip_pair_rows；`app.py`：侧栏筛选/密度染色/近邻解释表/枢纽/片段面板/3D 连线开关 | `tests/test_appdata.py` 28 项、`tests/test_app.py` 21 项；真实 AppTest（map_v002/v003/v004-006）通过 |
+| A2 筛选星云与变体（§4） | ✅ 已实现（v0.2.0） | `nebula/mapplot.py`：filter_spec / build_map_variants；`map.py`：--dataset/--vote-year/--list-key/--n-neighbors/variants | `tests/test_mapplot.py` 30 项；真实 map_v002(votes_2025,29)、map_v003(全量,56)、v004-006(n_neighbors 变体) filter_json/坐标核对通过 |
+| B1 身份关联与去重（§5） | ✅ 已实现（v0.2.0） | `nebula/identity.py`；`ingest.py link-local`；`work_links` canonical/duplicate 单层关系 | `tests/test_identity.py` 47 项；真实数据 6 条关联、`62 completed/1 failed`、总星云 56=62−6，独立扫描无未关联高置信重复 |
+| A3 片段稳定性（§6） | ✅ 已实现（v0.2.0） | `nebula/stability.py`；`tools/clip_stability.py` | `tests/test_stability.py` 30 项；三份真实报告：P0 33 部（mean_overlap=0.8978，不稳定 1/33）、v0.2 canonical 56 部（0.875，6/56）、扩量后 canonical 110 部（0.8488，21/110），文件为 `logs/clip_stability_{p0,v02,v03}.json/.csv` |
+| A4 分阶段计时（§7） | ✅ 已实现（v0.2.0） | `pipeline_runs / work_timings`；`pipeline.py timings`；`logs/perf_<run_id>.csv` | `tests/test_pipeline.py` 12 项、`tests/test_db.py` 19 项、`tests/test_embed.py` 40 项；真实批次 CSV 已生成 |
+| A5 低风险提速 | ✅ 已实现（v0.2.0，零漂移项） | 切片 mp4 去 AAC 音轨、`extract_clip(info=...)` 复用 ffprobe；preset/336p 对照数据见 ARCHITECTURE §6.2（未采纳） | `tests/test_media.py` 22 项、`tests/test_embed.py` 40 项；T1 基准工具 `tools/bench_ffmpeg.py` / `bench_preprocess.py` / `bench_peav.py` |
+| A6 音画错位实验（v0.2.x 新增） | ✅ 已实现并完成真实 GPU 实验（2026-10-25） | `nebula/avsync.py`、`tools/desync_experiment.py`；输出 `logs/av_desync_experiment.json/.csv`；方法见 ADR-0008 | `tests/test_avsync.py` 37 项；10 部/48 片段实测：Δ_quality=0.000964、+0.5s=0.004222(4.38×)、+1.0s=0.002364(2.45×)、换音频=0.087575(90.85×)；video 分支对纯音频变体 Δ=0 |
+| §8 真实 2025 数据 | ✅ 已完成（2026-10-25） | 89 部全部导入；累计 120 completed + 2 failed（8.71h 直播回放、API -404 已删除）、pending=0；身份关联 10 条；预检 `logs/preflight_89.json`（80 normal / 7 multi / 1 long / 1 unavailable）；批处理 run_id=5：54 部全部成功（730.51s，模型加载 17.05s） | 独立只读核对（120/2/10/89）+ 真实 AppTest + map_v007(87)/map_v008(110) 通过；A3 v0.3 报告已生成 |
+| §9 验收与汇报 | 流程有效 | — | 本文件每项均按“证据式完成报告”验证 |
+
+**当前门禁**（2026-10-25 v0.2.x）：仓库内 `python qa.py` = PASS 5/5（ruff 全绿；
+pytest 524 收集 / 518 passed + 6 个 model/network deselected；docs/CLI/config 全过；
+干净临时目录复跑同样通过）。后续迭代以本文档顶部状态表与代码为准，正文历史措辞不再表示待办。
 
 ## 0. 现状与硬约束
 
@@ -11,6 +39,8 @@
 - 默认测试离线、快速、不加载模型、不访问网络；模型/网络测试用 marker。
 - 只改自己任务写权限内的文件；共享文件（config.yaml、pyproject.toml、nebula/config.py、nebula/db.py、nebula/pipeline.py、pipeline.py、tests/conftest.py、AGENTS.md、执行方案文档）归 Lead，需要新能力先发消息。
 - 不要运行 git 写命令；Lead 统一提交。
+- **实现状态**：本文件描述的功能已在 v0.2.0（公开 main b0a2dfb）实现，详见顶部“实现状态”表；
+  阅读正文时请把未来时措辞视为历史设计记录。
 
 ## 1. SQLite schema v2（Lead 已实现，直接使用）
 
@@ -50,7 +80,7 @@ cat.create_map_run(..., filter_spec={"dataset": "bilibili", "vote_year": 2025,
 - 每个 duplicate 只能属于一个 canonical；canonical 本身不能是别人的 duplicate。
 - 地图/近邻索引/界面默认都用 "canonical 集合"（排除 duplicate_work_ids）。
 
-## 2. A1 nebula/similarity.py（T2 负责）
+## 2. A1 nebula/similarity.py（T2 负责，✅ 已实现 v0.2.0）
 
 ~~~python
 KINDS = ("work_joint", "work_audio", "work_video")
@@ -85,7 +115,7 @@ def load_similarity_index(catalog, config, *, version=None) -> SimilarityIndex
 - app.py 用 st.cache_resource 包一层（key 含 db 文件 mtime + embedding version）。
 - 单元测试用临时 DB + 合成 npy；覆盖：近邻排序正确、排除自身、k 截断、缺失模态、duplicate 排除、缓存不再重复读文件（可注入读取计数）。
 
-## 3. A2 appdata.py / app.py（T2 负责）
+## 3. A2 appdata.py / app.py（T2 负责，✅ 已实现 v0.2.0）
 
 appdata 追加（保持纯数据，不 import streamlit/plotly）：
 - load_nebula_frame 的 DataFrame 增加列：list_keys、list_names、vote_years、rank、votes、local_file（从关联的 duplicate 本地作品补充）、is_canonical。
@@ -94,7 +124,7 @@ appdata 追加（保持纯数据，不 import streamlit/plotly）：
 - filter_frame(df, *, sources=None, list_keys=None, vote_years=None)：空值表示不过滤；用于界面筛选。
 - neighbor_rows(df, index, work_id, kind, k) -> 带标题/相似度的展示行（app 用）。
 
-app.py 追加：
+app.py（✅ 已实现 v0.2.0，以下为设计记录）：
 - 侧栏：星云版本、2D/3D、染色维度（含“高维近邻密度”）、搜索、点大小/透明度、数据集筛选（来源：全部/本地/Bilibili；榜单多选；年份多选）。
 - 选中作品（2D 点击 / 3D 下的下拉选择）后：
   - 详情面板显示三个模态的 Top5 近邻（标题 + 余弦值），缺失模态显示“无该模态向量”；
@@ -102,7 +132,7 @@ app.py 追加：
   - 近邻列表可点击/下拉切换选中作品（等价入口，避免 3D 点击限制）。
 - 现有 AppTest 必须继续通过；新增测试覆盖：近邻面板、三模态切换、高亮 trace 出现、筛选控件、density_knn 染色。
 
-## 4. A2 mapplot.py / map.py 筛选与变体（T2 负责）
+## 4. A2 mapplot.py / map.py 筛选与变体（T2 负责，✅ 已实现 v0.2.0）
 
 ~~~python
 def load_embedding_matrix(cat, cfg, *, version=None, filter_spec=None
@@ -124,10 +154,10 @@ filter_spec 支持键（都可省略）：
 ~~~
 - build_map 把 filter_spec 写入 map_runs.filter_json（create_map_run(filter_spec=...)），并在 meta.json/params 里记录；构建前若过滤后作品数 < 3 抛中文 MapError。
 - n_neighbors 覆盖 config 值并写入 params；2D/3D 仍分别训练。
-- CLI：map.py build 增加 --dataset、--vote-year、--list-key、--n-neighbors；新增 map.py variants --n-neighbors 8 15 30 [--vote-year ...] [--list-key ...] 依次生成多个版本。
+- CLI（✅ 已实现 v0.2.0）：map.py build 增加 --dataset、--vote-year、--list-key、--n-neighbors；新增 map.py variants --n-neighbors 8 15 30 [--vote-year ...] [--list-key ...] 依次生成多个版本。
 - 注意：筛选后的 UMAP 坐标与总星云不可直接比较；文档/输出要提示。
 
-## 5. B1 nebula/identity.py（T3 负责）
+## 5. B1 nebula/identity.py（T3 负责，✅ 已实现 v0.2.0）
 
 ~~~python
 @dataclass(frozen=True)
@@ -169,11 +199,11 @@ MANUAL_LINKS_FILENAME = "local_bv_links.csv"   # 放在 input/lists/，列：loc
 def load_manual_links(cat, config) -> list[tuple[int, int]]   # 本地相对路径 -> bilibili work_id
 ~~~
 
-- ingest.py 增加 link-local 子命令：--list-key votes_2025、--dry-run、--no-copy、--manual；输出候选表与统计。
+- ingest.py（✅ 已实现 v0.2.0）link-local 子命令：--list-key votes_2025、--dry-run、--no-copy、--manual；输出候选表与统计。
 - 不自动合并可疑项；标题规范化后必须完全相等，且时长差 <= 3s。
 - 测试：规范化边界、标题不匹配不链接、时长不符拒绝、手动覆盖、复制向量后 has_embedding=true、duplicate 排除集合正确、不删除原文件。
 
-## 6. A3 nebula/stability.py + tools/clip_stability.py（T4 负责）
+## 6. A3 nebula/stability.py + tools/clip_stability.py（T4 负责，✅ 已实现 v0.2.0）
 
 ~~~python
 def leave_one_out_vectors(clip_matrix: np.ndarray) -> np.ndarray
@@ -188,10 +218,10 @@ def write_report(report: dict, *, json_path, csv_path) -> None
 ~~~
 
 - 只用已保存向量，不重新提取、不重新编码、不参与坐标训练，也不作为作品质量指标。
-- CLI：tools/clip_stability.py（支持 --config/--version/--k/--out-dir），中文摘要。
+- CLI（✅ 已实现 v0.2.0）：tools/clip_stability.py（支持 --config/--version/--k/--out-dir，另有可选 --work-ids），中文摘要。
 - 测试用合成 clips/工作向量，验证 LOO 数学性质与 overlap 计算。
 
-## 7. A4 计时（Lead + T1）
+## 7. A4 计时（Lead + T1，✅ 已实现 v0.2.0）
 
 - EmbeddingBatch 新增 preprocess_s / forward_s（默认 0.0，CUDA 同步计时）；PEAVEmbedder 新增 model_load_s。
 - pipeline 负责：download_s / probe_s / extract_s / save_s / total_s，写 work_timings + pipeline_runs，并输出 logs/perf_<run_id>.csv。
@@ -204,6 +234,9 @@ def write_report(report: dict, *, json_path, csv_path) -> None
 - 本轮只处理 **前 30 部**（按 CSV 顺序），由 Lead 导入/关联/下载/编码；用户确认后再扩大。
 - 本地已有 33 部作品；其中约 10 部与榜单标题完全匹配（身份关联候选）。
 - 任何真实下载/长时间 GPU 运行由 Lead 统一调度，避免重复占用 GPU。
+- 状态（v0.2.x，2026-10-25）：前 30 部已完成（29 completed / 1 failed：8.7h 直播回放，已知边界），
+  得到 6 条身份关联与 map_v002/map_v003；89 部选票已全部导入并完成预检（身份关联增至 10 条），
+  首批 54 部批处理进行中；扩量完成后重建总星云/2025 星云。
 
 ## 9. 验收与汇报
 

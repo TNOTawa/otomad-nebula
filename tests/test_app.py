@@ -138,8 +138,14 @@ def _add_vectors(
     *,
     seed: int = 0,
     kinds_by_work: dict[int, tuple[str, ...]] | None = None,
+    with_clips: bool = False,
+    n_clips: int = 5,
 ) -> None:
-    """为作品写三种模态的合成 npy，供高维近邻功能使用。"""
+    """为作品写三种模态的合成 npy，供高维近邻功能使用。
+
+    with_clips=True 时同时写片段级堆叠向量（5×8）与 clips 起始时间，
+    供片段级对应面板测试使用。
+    """
 
     version = config.embedding_version
     rng = np.random.default_rng(seed)
@@ -159,6 +165,24 @@ def _add_vectors(
                 kind=kind,
                 path=config.data_relpath(path),
                 dim=8,
+            )
+        if with_clips:
+            for clip_kind in ("clip_joint", "clip_audio", "clip_video"):
+                matrix = rng.normal(size=(n_clips, 8)).astype(np.float32)
+                path = config.paths.embeddings / version / str(work_id) / f"{clip_kind}.npy"
+                np.save(path, matrix)
+                catalog.register_embedding(
+                    work_id,
+                    version=version,
+                    kind=clip_kind,
+                    path=config.data_relpath(path),
+                    dim=8,
+                    n_clips=n_clips,
+                )
+            catalog.replace_clips(
+                work_id,
+                version=version,
+                clips=[(idx, float(idx) * 10.0, 8.0) for idx in range(n_clips)],
             )
 
 
@@ -324,7 +348,7 @@ def test_app_neighbor_panel_three_modalities(
     tables = [element.value for element in app_test.dataframe]
     assert len(tables) == 3  # 三个模态各一张 Top5 表
     for table in tables:
-        assert list(table.columns) == ["排名", "作品", "余弦相似度"]
+        assert list(table.columns) == ["排名", "作品", "余弦相似度", "全库分位", "双向"]
         assert len(table) == 5
         assert table["排名"].tolist() == [1, 2, 3, 4, 5]
         values = [float(value) for value in table["余弦相似度"]]
@@ -572,3 +596,119 @@ def test_app_default_falls_back_to_latest_when_all_maps_filtered(
     assert app_test.selectbox(key="map_version").value == "map_v002"
     spec = _chart_spec(app_test)
     assert len(_decode_array(spec["data"][0]["x"])) == 2
+
+
+# --------------------------------------------------------------------------- P1 近邻解释与枢纽
+def test_app_neighbor_table_has_explanation_columns(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids = _seed_app_data(catalog, config)
+    _add_vectors(catalog, config, work_ids)
+    app_test = _run_app(monkeypatch, repo_root, config)
+
+    assert not app_test.exception
+    tables = [element.value for element in app_test.dataframe]
+    assert len(tables) == 3
+    for table in tables:
+        assert "全库分位" in table.columns
+        assert "双向" in table.columns
+        assert all(str(value).endswith("%") for value in table["全库分位"])
+        assert set(table["双向"]) <= {"", "是"}
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("全库分位" in caption for caption in captions)
+
+
+def test_app_hubness_table(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids = _seed_app_data(catalog, config)
+    _add_vectors(catalog, config, work_ids)
+    app_test = _run_app(monkeypatch, repo_root, config)
+
+    assert not app_test.exception
+    tables = at_tables = app_test.get("table")
+    assert len(tables) == 1, "应有一个枢纽作品静态表（st.table，不计入 dataframe）"
+    hub_table = tables[0].value
+    assert list(hub_table.columns) == ["排名", "作品", "被列次数"]
+    assert 1 <= len(hub_table) <= 8
+    counts = [int(value) for value in hub_table["被列次数"]]
+    assert counts == sorted(counts, reverse=True)
+    assert [int(value) for value in hub_table["排名"]] == list(range(1, len(hub_table) + 1))
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("hubness" in caption for caption in captions)
+    assert len(at_tables) == 1
+
+
+# --------------------------------------------------------------------------- P2 片段级对应面板
+def test_app_clip_panel(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids = _seed_app_data(catalog, config)
+    _add_vectors(catalog, config, work_ids, with_clips=True)
+    app_test = _run_app(monkeypatch, repo_root, config)
+
+    assert not app_test.exception
+    # 默认不加载片段面板：只有主图与三张近邻表
+    assert len(app_test.get("plotly_chart")) == 1
+    assert len(app_test.dataframe) == 3
+    assert app_test.checkbox(key="show_clip_panel").value is False
+
+    app_test.checkbox(key="show_clip_panel").set_value(True).run()
+    assert not app_test.exception
+    charts = app_test.get("plotly_chart")
+    assert len(charts) == 2
+    heatmap_spec = json.loads(charts[1].proto.spec)
+    heatmap_trace = heatmap_spec["data"][0]
+    assert heatmap_trace["type"] == "heatmap"
+    matrix = np.asarray(_decode_array(heatmap_trace["z"]), dtype=float)
+    assert matrix.shape == (5, 5)
+    assert np.all(matrix >= -1.0) and np.all(matrix <= 1.0)
+
+    tables = [element.value for element in app_test.dataframe]
+    assert len(tables) == 4
+    pair_table = tables[3]
+    assert list(pair_table.columns) == [
+        "排名",
+        "A 片段",
+        "A 起始(s)",
+        "B 片段",
+        "B 起始(s)",
+        "余弦",
+    ]
+    assert len(pair_table) == 5
+    similarities = [float(value) for value in pair_table["余弦"]]
+    assert similarities == sorted(similarities, reverse=True)
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("片段级统计" in caption for caption in captions)
+
+    # 切换片段模态与对比作品都不应报错
+    assert app_test.selectbox(key="clip_kind").value == "clip_joint"
+    app_test.selectbox(key="clip_kind").set_value("clip_audio").run()
+    assert not app_test.exception
+    assert app_test.selectbox(key="clip_kind").value == "clip_audio"
+    compare_options = app_test.selectbox(key="clip_compare_work").options
+    assert len(compare_options) >= 1
+    new_compare = app_test.selectbox(key="clip_compare_work").value
+    other_ids = [
+        work_id
+        for work_id in work_ids
+        if work_id != int(app_test.selectbox(key="manual_work").value)
+    ]
+    app_test.selectbox(key="clip_compare_work").set_value(other_ids[0]).run()
+    assert not app_test.exception
+    assert app_test.selectbox(key="clip_compare_work").value == other_ids[0]
+    assert new_compare is not None
+    assert len(app_test.get("plotly_chart")) == 2
+
+
+def test_app_clip_panel_absent_without_clip_vectors(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids = _seed_app_data(catalog, config)
+    _add_vectors(catalog, config, work_ids)  # 只有作品级向量
+    app_test = _run_app(monkeypatch, repo_root, config)
+
+    assert not app_test.exception
+    checkbox_keys = [element.key for element in app_test.checkbox]
+    assert "show_clip_panel" not in checkbox_keys
+    assert len(app_test.get("plotly_chart")) == 1

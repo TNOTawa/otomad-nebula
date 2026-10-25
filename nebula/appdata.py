@@ -723,6 +723,38 @@ def filter_frame(
     return result
 
 
+def _record_lookup(df: pd.DataFrame) -> dict[int, Mapping[str, Any]]:
+    """按 work_id 建立展示行索引。"""
+
+    records: dict[int, Mapping[str, Any]] = {}
+    if "work_id" in df.columns:
+        for record in df.to_dict("records"):
+            records[int(record["work_id"])] = record
+    return records
+
+
+def _record_title(record: Mapping[str, Any] | None, work_id: int) -> str:
+    if record is None:
+        return f"作品 {work_id}"
+    title = record.get("title") or record.get("file_name") or record.get("work_key")
+    return str(title) if title else f"作品 {work_id}"
+
+
+def _clip_start(times: Mapping[int, Mapping[str, Any]], idx: int) -> float | None:
+    item = times.get(int(idx))
+    if item is None:
+        return None
+    start = item.get("start_s")
+    return None if start is None else float(start)
+
+
+def _clip_label(times: Mapping[int, Mapping[str, Any]], idx: int) -> str:
+    start = _clip_start(times, idx)
+    if start is None:
+        return f"片段 {int(idx) + 1}"
+    return f"片段 {int(idx) + 1}（{start:.1f}s）"
+
+
 def neighbor_rows(
     df: pd.DataFrame,
     index: "SimilarityIndex",
@@ -732,32 +764,124 @@ def neighbor_rows(
 ) -> list[dict[str, Any]]:
     """把某部作品在指定模态下的 Top-k 近邻整理成展示行。
 
-    每行包含 rank / work_id / title / file_name / similarity / in_map；
-    in_map 表示该近邻是否也出现在当前 DataFrame（当前星云/筛选视图）里。
+    每行包含 rank / work_id / title / file_name / similarity / pair_percentile /
+    is_mutual / in_map；其中 pair_percentile 是该相似度在全库作品对中的百分位，
+    is_mutual 表示目标作品是否也把当前作品列为 Top-k，in_map 表示该近邻是否
+    也出现在当前 DataFrame（当前星云/筛选视图）里。
     作品没有该模态向量时由 SimilarityIndex 抛 NebulaError。
     """
 
     neighbors = index.neighbors(int(work_id), kind=kind, k=k)
-    records: dict[int, Mapping[str, Any]] = {}
-    if "work_id" in df.columns:
-        for record in df.to_dict("records"):
-            records[int(record["work_id"])] = record
+    records = _record_lookup(df)
     rows: list[dict[str, Any]] = []
     for neighbor in neighbors:
         record = records.get(int(neighbor.work_id))
-        title = (
-            (record.get("title") or record.get("file_name") or record.get("work_key"))
-            if record is not None
-            else None
-        )
         rows.append(
             {
                 "rank": neighbor.rank,
                 "work_id": neighbor.work_id,
-                "title": str(title) if title else f"作品 {neighbor.work_id}",
+                "title": _record_title(record, neighbor.work_id),
                 "file_name": str(record.get("file_name") or "") if record is not None else "",
                 "similarity": float(neighbor.similarity),
+                "pair_percentile": float(neighbor.pair_percentile),
+                "is_mutual": bool(neighbor.is_mutual),
                 "in_map": record is not None,
+            }
+        )
+    return rows
+
+
+def hub_rows(
+    df: pd.DataFrame,
+    index: "SimilarityIndex",
+    *,
+    kind: str = "work_joint",
+    k: int = 5,
+    n: int = 8,
+) -> list[dict[str, Any]]:
+    """枢纽作品展示行：被最多作品列入 Top-k 的作品。
+
+    注意：hubness 在小样本/筛选子集上不稳定，仅作为观察线索。
+    """
+
+    records = _record_lookup(df)
+    rows: list[dict[str, Any]] = []
+    for rank, (work_id, count) in enumerate(index.hub_top(k=k, n=n, kind=kind), start=1):
+        record = records.get(int(work_id))
+        rows.append(
+            {
+                "rank": rank,
+                "work_id": int(work_id),
+                "title": _record_title(record, int(work_id)),
+                "count": int(count),
+                "in_map": record is not None,
+            }
+        )
+    return rows
+
+
+def clip_heatmap_data(
+    index: "SimilarityIndex",
+    df: pd.DataFrame,
+    a_work_id: int,
+    b_work_id: int,
+    kind: str = "clip_joint",
+) -> dict[str, Any]:
+    """片段级相似热图的纯数据（不依赖 plotly）。
+
+    返回 matrix（n_a × n_b 余弦值，list[list[float]]）、行列标签（含片段起始秒）、
+    两侧作品标题与模态，供 app 直接构造 Plotly 热图。
+    """
+
+    matrix = index.clip_similarity(a_work_id, b_work_id, kind=kind)
+    times_a = {int(item["idx"]): item for item in index.clip_times(a_work_id)}
+    times_b = {int(item["idx"]): item for item in index.clip_times(b_work_id)}
+    records = _record_lookup(df)
+    return {
+        "kind": kind,
+        "a_work_id": int(a_work_id),
+        "b_work_id": int(b_work_id),
+        "a_title": _record_title(records.get(int(a_work_id)), int(a_work_id)),
+        "b_title": _record_title(records.get(int(b_work_id)), int(b_work_id)),
+        "matrix": matrix.astype(float).tolist(),
+        "row_labels": [_clip_label(times_a, idx) for idx in range(matrix.shape[0])],
+        "col_labels": [_clip_label(times_b, idx) for idx in range(matrix.shape[1])],
+        "n_a": int(matrix.shape[0]),
+        "n_b": int(matrix.shape[1]),
+    }
+
+
+def clip_pair_rows(
+    index: "SimilarityIndex",
+    df: pd.DataFrame,
+    a_work_id: int,
+    b_work_id: int,
+    kind: str = "clip_joint",
+    k: int = 5,
+) -> list[dict[str, Any]]:
+    """最高片段配对的展示行（含两侧作品标题、片段序号、起始秒与余弦）。"""
+
+    records = _record_lookup(df)
+    times_a = {int(item["idx"]): item for item in index.clip_times(a_work_id)}
+    times_b = {int(item["idx"]): item for item in index.clip_times(b_work_id)}
+    a_title = _record_title(records.get(int(a_work_id)), int(a_work_id))
+    b_title = _record_title(records.get(int(b_work_id)), int(b_work_id))
+    rows: list[dict[str, Any]] = []
+    for rank, pair in enumerate(
+        index.best_clip_pairs(a_work_id, b_work_id, kind=kind, k=k), start=1
+    ):
+        a_idx = int(pair["a_idx"])
+        b_idx = int(pair["b_idx"])
+        rows.append(
+            {
+                "rank": rank,
+                "a_title": a_title,
+                "a_idx": a_idx,
+                "a_start_s": _clip_start(times_a, a_idx),
+                "b_title": b_title,
+                "b_idx": b_idx,
+                "b_start_s": _clip_start(times_b, b_idx),
+                "similarity": float(pair["similarity"]),
             }
         )
     return rows

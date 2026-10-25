@@ -15,9 +15,12 @@ from nebula.appdata import (
     ColorSpec,
     apply_color,
     available_color_fields,
+    clip_heatmap_data,
+    clip_pair_rows,
     external_url,
     filter_frame,
     hover_text,
+    hub_rows,
     load_nebula_frame,
     neighbor_rows,
     search_frame,
@@ -93,6 +96,40 @@ def _add_embeddings(
                 dim=dim,
             )
     return version
+
+
+def _add_clip_embeddings(
+    catalog: Catalog,
+    config: Config,
+    work_ids: list[int],
+    *,
+    seed: int = 100,
+    n_clips: int = 5,
+    dim: int = 8,
+) -> None:
+    """为作品登记三种片段级向量（堆叠 npy）与 clips 表起始时间。"""
+
+    version = config.embedding_version
+    rng = np.random.default_rng(seed)
+    for work_id in work_ids:
+        for kind in ("clip_joint", "clip_audio", "clip_video"):
+            matrix = rng.normal(size=(n_clips, dim)).astype(np.float32)
+            path = config.paths.embeddings / version / str(work_id) / f"{kind}.npy"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(path, matrix)
+            catalog.register_embedding(
+                work_id,
+                version=version,
+                kind=kind,
+                path=config.data_relpath(path),
+                dim=dim,
+                n_clips=n_clips,
+            )
+        catalog.replace_clips(
+            work_id,
+            version=version,
+            clips=[(idx, float(idx) * 10.0, 8.0) for idx in range(n_clips)],
+        )
 
 
 def _seed_appearances(catalog: Catalog, work_ids: list[int]) -> None:
@@ -617,6 +654,12 @@ def test_neighbor_rows(seeded_with_vectors):
         assert row["similarity"] == pytest.approx(
             index.similarity(work_ids[1], row["work_id"]), abs=1e-6
         )
+        # 迭代 P1：解释字段
+        assert 0.0 <= row["pair_percentile"] <= 100.0
+        assert isinstance(row["is_mutual"], bool)
+        assert row["pair_percentile"] == pytest.approx(
+            index.pair_percentile(work_ids[1], row["work_id"]), abs=1e-6
+        )
 
     # 近邻不在当前 DataFrame 时仍返回占位标题
     partial = frame.iloc[[0]]
@@ -633,3 +676,94 @@ def test_neighbor_rows_missing_modality(seeded_with_vectors):
     with pytest.raises(NebulaError, match="没有 work_audio 向量"):
         neighbor_rows(frame, index, 99999, "work_audio", 5)
     assert len(neighbor_rows(frame, index, work_ids[0], "work_audio", 5)) == 5
+
+
+# --------------------------------------------------------------------------- P1 枢纽作品
+def test_hub_rows(seeded_with_vectors):
+    config, catalog, work_ids, index = seeded_with_vectors
+    _, frame = load_nebula_frame(catalog, config)
+
+    rows = hub_rows(frame, index, kind="work_joint", k=5, n=3)
+    assert len(rows) == 3
+    assert [row["rank"] for row in rows] == [1, 2, 3]
+    counts = [row["count"] for row in rows]
+    assert counts == sorted(counts, reverse=True)
+    by_id = frame.set_index("work_id")
+    for row in rows:
+        assert row["title"] == by_id.loc[row["work_id"], "title"]
+        assert row["in_map"] is True
+    # hubness 每部作品 k=5 时总票数 = 作品数 × 5（作品数 > k）
+    assert sum(index.hubness(k=5).values()) == len(work_ids) * 5
+
+    # n 大于作品数时不会报错
+    wide = hub_rows(frame, index, kind="work_joint", k=2, n=99)
+    assert len(wide) == len(work_ids)
+
+
+# --------------------------------------------------------------------------- P2 片段级展示数据
+@pytest.fixture
+def seeded_with_clips(seeded):
+    """作品级 + 片段级向量都注册好之后再构造索引。"""
+
+    config, catalog, work_ids = seeded
+    _add_embeddings(catalog, config, work_ids)
+    _add_clip_embeddings(catalog, config, work_ids)
+    index = load_similarity_index(catalog, config)
+    try:
+        yield config, catalog, work_ids, index
+    finally:
+        index.close()
+
+
+def test_clip_heatmap_data(seeded_with_clips):
+    config, catalog, work_ids, index = seeded_with_clips
+    _, frame = load_nebula_frame(catalog, config)
+
+    data = clip_heatmap_data(index, frame, work_ids[1], work_ids[2], "clip_joint")
+    assert data["a_work_id"] == work_ids[1]
+    assert data["b_work_id"] == work_ids[2]
+    assert data["kind"] == "clip_joint"
+    assert data["n_a"] == 5 and data["n_b"] == 5
+    assert len(data["matrix"]) == 5
+    assert all(len(row) == 5 for row in data["matrix"])
+    assert all(-1.0 <= float(value) <= 1.0 for row in data["matrix"] for value in row)
+    assert len(data["row_labels"]) == 5 and len(data["col_labels"]) == 5
+    assert all(label.startswith("片段 ") for label in data["row_labels"])
+    assert "0.0s" in data["row_labels"][0]
+    by_id = frame.set_index("work_id")
+    assert data["a_title"] == by_id.loc[work_ids[1], "title"]
+    assert data["b_title"] == by_id.loc[work_ids[2], "title"]
+
+    with pytest.raises(NebulaError):
+        clip_heatmap_data(index, frame, 99999, work_ids[2], "clip_joint")
+
+
+def test_clip_pair_rows(seeded_with_clips):
+    config, catalog, work_ids, index = seeded_with_clips
+    _, frame = load_nebula_frame(catalog, config)
+
+    rows = clip_pair_rows(index, frame, work_ids[1], work_ids[2], "clip_joint", 5)
+    assert len(rows) == 5
+    assert [row["rank"] for row in rows] == [1, 2, 3, 4, 5]
+    similarities = [row["similarity"] for row in rows]
+    assert similarities == sorted(similarities, reverse=True)
+    by_id = frame.set_index("work_id")
+    for row in rows:
+        assert set(row) == {
+            "rank",
+            "a_title",
+            "a_idx",
+            "a_start_s",
+            "b_title",
+            "b_idx",
+            "b_start_s",
+            "similarity",
+        }
+        assert row["a_title"] == by_id.loc[work_ids[1], "title"]
+        assert row["b_title"] == by_id.loc[work_ids[2], "title"]
+        assert row["a_start_s"] == pytest.approx(row["a_idx"] * 10.0)
+        assert row["b_start_s"] == pytest.approx(row["b_idx"] * 10.0)
+        assert row["similarity"] == pytest.approx(
+            index.clip_similarity(work_ids[1], work_ids[2])[row["a_idx"], row["b_idx"]],
+            abs=1e-6,
+        )
