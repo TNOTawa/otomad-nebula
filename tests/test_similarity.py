@@ -688,7 +688,12 @@ def _seed_representation_case(config: Config, catalog: Catalog):
     }
     ids = {
         number: _add_work(
-            catalog, config, number, vectors={"work_joint": vector}, kinds=("work_joint",)
+            catalog,
+            config,
+            number,
+            vectors={"work_joint": vector},
+            kinds=("work_joint",),
+            version=config.legacy_embedding_version,
         )
         for number, vector in joint_vectors.items()
     }
@@ -740,7 +745,9 @@ def test_representation_mode_uses_representation_vectors(config: Config, catalog
     finally:
         index.close()
 
-    legacy = load_similarity_index(catalog, config)
+    legacy = load_similarity_index(
+        catalog, config, version=config.legacy_embedding_version
+    )
     try:
         assert set(legacy.work_ids) == {ids[1], ids[2], ids[3]}
         assert legacy.version == config.legacy_embedding_version
@@ -785,10 +792,28 @@ def test_representation_mode_missing_representation(config: Config, catalog: Cat
 
 
 def test_legacy_representation_id_matches_none_mode(config: Config, catalog: Catalog):
-    ids = _seed_axes_works(catalog, config)
+    vectors = {
+        1: {"work_joint": _unit([1.0, 0.0, 0.0, 0.0])},
+        2: {"work_joint": _unit([0.9, 0.43589, 0.0, 0.0])},
+        3: {"work_joint": _unit([0.0, 1.0, 0.0, 0.0])},
+        4: {"work_joint": _unit([0.0, 0.0, 1.0, 0.0])},
+    }
+    ids = {
+        number: _add_work(
+            catalog,
+            config,
+            number,
+            vectors=payload,
+            kinds=("work_joint",),
+            version=config.legacy_embedding_version,
+        )
+        for number, payload in vectors.items()
+    }
     legacy_id = catalog.ensure_legacy_representation(config.legacy_embedding_version)
     rep_index = load_similarity_index(catalog, config, representation_id=legacy_id)
-    plain_index = load_similarity_index(catalog, config)
+    plain_index = load_similarity_index(
+        catalog, config, version=config.legacy_embedding_version
+    )
     try:
         assert rep_index.representation_name == "legacy_5clip_mean"
         assert rep_index.work_ids == plain_index.work_ids

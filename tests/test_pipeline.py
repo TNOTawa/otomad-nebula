@@ -131,11 +131,14 @@ def _open_catalog(config: Config) -> Catalog:
 
 
 def _pipeline(config: Config, catalog: Catalog) -> Pipeline:
+    """legacy 专用流水线：显式切回 legacy 模式，不依赖 config.yaml 的默认值。"""
+
     return Pipeline(
         config,
         catalog=catalog,
         embedder=HashTestEmbedder(),
         allow_test_embedder=True,
+        sampling_mode="legacy",
     )
 
 
@@ -861,6 +864,8 @@ def test_legacy_mode_regression_columns_and_version(config, sample_video):
     catalog = _open_catalog(config)
     try:
         pipeline = _pipeline(config, catalog)
+        # legacy 测试必须显式切回 legacy，不能依赖 config.yaml 默认（已切到 full_coverage）
+        assert pipeline.sampling_mode == "legacy"
         register_local_videos(catalog, config)
         stats = pipeline.process_pending(source="local")
         assert stats.completed == 1
@@ -876,6 +881,40 @@ def test_legacy_mode_regression_columns_and_version(config, sample_video):
         assert clips[0]["weight"] is None
         assert not (_work_dir(config, version, int(work["id"])) / ".partial").exists()
         pipeline.close()
+    finally:
+        catalog.close()
+
+
+def test_default_sampling_mode_follows_config(config):
+    """config.yaml 默认已是 full_coverage：不传 sampling_mode 时 Pipeline 跟随配置。
+
+    同时验证显式 sampling_mode="legacy" 覆盖配置，避免旧测试依赖默认值。
+    """
+
+    assert config.sampling.mode == "full_coverage"
+    catalog = _open_catalog(config)
+    try:
+        default_pipeline = Pipeline(
+            config, catalog=catalog, embedder=HashTestEmbedder(), allow_test_embedder=True
+        )
+        try:
+            assert default_pipeline.sampling_mode == "full_coverage"
+            assert default_pipeline.embedding_version == "test-hash-v1__f16_full8s_ov0_48k"
+        finally:
+            default_pipeline.close()
+
+        explicit_legacy = Pipeline(
+            config,
+            catalog=catalog,
+            embedder=HashTestEmbedder(),
+            allow_test_embedder=True,
+            sampling_mode="legacy",
+        )
+        try:
+            assert explicit_legacy.sampling_mode == "legacy"
+            assert explicit_legacy.embedding_version.endswith("__f16_clip8s_x5_48k")
+        finally:
+            explicit_legacy.close()
     finally:
         catalog.close()
 

@@ -66,8 +66,8 @@
   - 筛选星云把条件写入 `map_runs.filter_json`；不同版本/不同筛选的 UMAP 坐标不可直接比较绝对位置。
   - 分阶段耗时写入 `work_timings`/`pipeline_runs`，明细 CSV 在 `logs/perf_<run_id>.csv`（`pipeline.py timings` 查看）。
   - 已知边界：超长活动直播回放（如 8.7h）暂不做全量下载，记录 failed；竖屏视频下载需 width 维度筛选（config.yt_dlp_format 已含）。
-  - **v0.4 分层**：序列层 `data/embeddings/<sequence_version>/` 只编码一次；表征层 `data/representations/<name>/<sequence_version>/` 只做聚合。聚合器变化（legacy→full_mean→temporal_stats）**禁止重新编码 PE-AV**，只新增 `representations` 行。
-  - **v0.4 全片覆盖**：`sampling.mode=full_coverage` 无片段数上限、末尾锚定、窗口权重和为 1；编码按 `.partial/batch_*.npz` 原子分批，重启经 `sequence_states` 只补缺失批；超长视频需 `--allow-long`。
+  - **v0.4 分层**：序列层 `data/embeddings/<sequence_version>/` 只编码一次；表征层 `data/representations/<name>/<sequence_version>/` 只做聚合。聚合器变化（legacy→full_mean→temporal_stats）**禁止重新编码 PE-AV**，只新增 `representations` 行。当前真实数据：110/110 canonical 全片 assembled；full_mean_v1(id=2)/temporal_stats_v1(id=3) 全量；地图 map_v011/map_v012（legacy=map_v008，默认 map_v012）。
+  - **v0.4 全片覆盖**：`sampling.mode=full_coverage`（当前默认）无片段数上限、末尾锚定、窗口权重和为 1；编码按 `.partial/batch_*.npz` 原子分批，重启经 `sequence_states` 只补缺失批；超长视频需 `--allow-long`。真实 110 部共 4130 窗口（legacy 536），事件三件套 110/110。Bilibili 下载失败时优先 playurl 回退（v0.4），仍失败才记 failed。
   - **v0.4 空间隔离**：不同 sequence/representation 的向量禁止混入同一 UMAP 或近邻矩阵；`map_runs.representation_id` 必须与地图的 sequence version 一致；旧 `embedding_version` 目录与旧地图只读、不覆盖。
   - **v0.4 事件/时间结构**：`event_scan.npz`/`event_features.npy`/`clip_times.npy` 与窗口一一对应；事件只是节奏/运动补充，不宣称逐帧语义理解；`clip_times` 的 `weight` 用于加权聚合，时间结构不进入坐标以外的任何元数据。
 

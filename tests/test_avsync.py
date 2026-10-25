@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -565,13 +566,17 @@ def test_evaluate_variants_rejects_bad_embedder_output():
 
 
 def test_cli_help_runs_offline():
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
     proc = subprocess.run(
         [sys.executable, str(REPO_ROOT / "tools" / "desync_experiment.py"), "--help"],
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=120,
         check=False,
+        env=env,
     )
     assert proc.returncode == 0, proc.stderr
     assert "音画错位实验" in proc.stdout

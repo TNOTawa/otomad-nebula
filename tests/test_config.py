@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -22,8 +23,11 @@ def test_repo_config_loads(repo_root: Path):
 
 
 def test_embedding_version_encodes_model_and_sampling(config):
-    version = config.embedding_version
-    assert version.startswith("peav-small-16f__f16_clip8s_x5_48k")
+    # v0.4 起默认 sampling.mode=full_coverage；legacy 公式仍可显式切换验证
+    assert config.embedding_version == config.full_sequence_version
+    assert config.embedding_version.startswith("peav-small-16f__f16_full8s_ov0_48k")
+    legacy_cfg = replace(config, sampling=replace(config.sampling, mode="legacy"))
+    assert legacy_cfg.embedding_version.startswith("peav-small-16f__f16_clip8s_x5_48k")
 
 
 def test_ensure_directories(config):

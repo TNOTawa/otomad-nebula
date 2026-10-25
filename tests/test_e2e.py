@@ -148,7 +148,11 @@ def e2e(tmp_path_factory: pytest.TempPathFactory) -> E2EState:
         pytest.skip("缺少 ffmpeg/ffprobe，跳过 E2E")
 
     root = tmp_path_factory.mktemp("e2e")
-    cfg = create_temp_config(root)
+    # 这段 E2E 验收的是 legacy 5 片段流水线；默认 sampling.mode 已切 full_coverage，
+    # 因此显式固定 legacy，避免默认模式变化改变该套用例的语义（v0.4 全链路另有 v04_e2e）。
+    cfg = create_temp_config(
+        root, overrides={"sampling": {"mode": "legacy", "overlap_seconds": 0.0}}
+    )
     library = build_video_library(root / "video_cache")
 
     installed: dict[str, Path] = {}

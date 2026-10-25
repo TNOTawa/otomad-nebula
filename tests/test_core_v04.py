@@ -44,8 +44,11 @@ def test_legacy_and_full_versions_are_distinct(config):
     assert legacy.startswith("peav-small-16f__f16_clip8s_x5_48k")
     assert full.startswith("peav-small-16f__f16_full8s_ov0_48k")
     full_cfg = replace(config, sampling=replace(config.sampling, mode="full_coverage"))
+    legacy_cfg = replace(config, sampling=replace(config.sampling, mode="legacy"))
     assert full_cfg.embedding_version == full
-    assert config.embedding_version == legacy
+    assert legacy_cfg.embedding_version == legacy
+    # v0.4 起仓库默认 = full_coverage
+    assert config.embedding_version == full
 
 
 def test_clip_height_changes_version(config):

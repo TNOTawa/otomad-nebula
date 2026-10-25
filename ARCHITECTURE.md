@@ -118,16 +118,20 @@ map_runs N────1 representations            （地图必须绑定一个�
 连接设置：WAL、`foreign_keys=ON`、`BEGIN IMMEDIATE` 事务、`busy_timeout`；
 所有写操作在事务内完成，读方法返回普通 `dict` 便于上层使用。
 
-**当前数据规模（2026-10-25 扩量后；真实运行数据不随仓库分发）**：
+**当前数据规模（2026-10-25 v0.4 全片升级后；真实运行数据不随仓库分发）**：
 
-- `works` 122 行：33 local completed + 87 bilibili completed + 2 bilibili failed
-  （8.71h 直播回放、API -404 已删除视频），pending = 0；
-- `embeddings` 720 条（120 部 × 6 类 npy）；`clips` 586 条；
+- `works` 122 行：33 local + 87 bilibili completed + 2 bilibili failed
+  （8.71h 直播回放、API -404 已删除视频），pending = 0；canonical = 110（10 条身份关联）；
 - `lists` 1 个（`votes_2025`，89 部）；`appearances` 89 条；
-  `work_links` 10 条（duplicate 默认不进星云，npy 保留）；
+- 序列层：legacy `peav-small-16f__f16_clip8s_x5_48k` 720 条 npy（120 部 × 6）；
+  full `peav-small-16f__f16_full8s_ov0_48k` 660 条（110 部 × 6，4130 个窗口）；
+  336p 对照 `_h336` 60 条（10 部）；事件层 110 部（约 131MB）；
+- 表征层：`legacy_5clip_mean`(id=1)、`full_mean_v1`(id=2, 1024 维)、
+  `temporal_stats_v1`(id=3, 6356 维)；后两者均为 110 部 × joint/audio/video；
 - 星云：`map_v001`(33, P0)、v002(29, votes_2025)、v003(56, 全量)、
   v004–v006(29, n_neighbors 变体)、`map_v007`(87, 2025 全量)、
-  `map_v008`(110, 总星云，当前默认)。所有版本永久保留，坐标跨版本不可直接比较。
+  `map_v008`(110, legacy 总星云)、`map_v011`(110, full_mean_v1)、
+  `map_v012`(110, temporal_stats_v1，当前默认)。所有版本永久保留，坐标跨版本/跨表征不可直接比较。
 
 ### 3.2 文件系统工件
 
@@ -386,6 +390,31 @@ A 原始、A-quality 轻画质退化基线、B 音频 +0.5s、C 音频 +1.0s、D
 （纯音频变体 video Δ 严格为 0），轻微错位 Δ 显著高于重编码噪声但绝对值很小；
 `单点 Δ 不能证明同步敏感度`，需结合聚合分布与 swap 对照解读。
 
+### 6.4 v0.4 全片覆盖实测（2026-10-25，真实数据 110/110 canonical）
+
+完整分析见 `docs/reports/full-coverage-analysis.md` 与 `logs/v04_data_analysis.json`；
+原始对比 JSON 在 `logs/space_compare_*.json/.csv`。核心数字：
+
+| 指标 | legacy | full（full_mean/temporal） | 336p 对照（10 部） |
+| --- | --- | --- | --- |
+| canonical 作品 | 110 | 110 | 10 |
+| 片段/窗口总数 | 536（≤5/部） | **4130**（min 3 / mean 37.55 / max 214） | 164 |
+| 覆盖率 / 末尾锚定 / 权重和 | — | 110/110；Σweight∈[0.99999992, 1.00000003] | 10/10 |
+| 事件三件套 | 无 | 110/110（`events_v1`，约 131MB） | 10/10 |
+| 单部耗时（均值） | total 16.57s | total 70.35s（extract 24.96 / events 7.53 / forward 22.45） | total 31.85s（1.60× 加速） |
+| 存储 | legacy 8.4MB | 序列层约 187MB + representations 9.7MB | h336 6.8MB |
+
+- 顺序敏感性（20 部反转顺序）：Full Mean cos_min=0.99999994（距离≤6e-8）；
+  Temporal Stats cos_min=0.67095 / mean 0.67777（1-cos 0.287–0.329）→ 时间结构确实进入表征；
+- 336p：work_joint cos min=0.997156 / mean=0.998590；video min=0.977239 / mean=0.986168；
+  extract 25.08→11.09s、total 51.08→31.85s → 可加速但视频分支变化不可忽略，**不转正**；
+- 邻域迁移（110 部）：legacy×full_mean Top5 平均 Jaccard=0.4068、完全稳定 8/110、
+  作品对余弦 Pearson=0.9569；full_mean×temporal Jaccard=0.2049、稳定 0/110、Pearson=0.8294；
+  legacy×temporal Jaccard=0.1734。全片覆盖与 Temporal Stats 都构成明显不同的邻域空间；
+  具体被替换作品（如 work 8 旧 Top1=104→新 Top1=35，仅保留 1/5 邻居）见报告 §3；
+- 默认 `sampling.mode` 已切到 `full_coverage`；地图默认 `map_v012`（Temporal Stats），
+  Legacy 空间仍保留 `map_v008`。
+
 ## 7. 扩展点
 
 - **升级模型**：改 `config.yaml` 的 `model.checkpoint/version/frames`（Base 版本同理）
@@ -448,9 +477,15 @@ A 原始、A-quality 轻画质退化基线、B 音频 +0.5s、C 音频 +1.0s、D
   schema 与手算片段余弦对照；AppTest 检查解释列、枢纽表、片段热图与模态切换；
   A6 实验检查 Δ 数学与“不写主向量库”；扩量预检 JSON 与 DB 状态一致性核对；
 - **v0.4 独立验收**：模式切换版本公式/格式、不同表征与序列隔离、地图代表征绑定与旧地图坐标不可覆盖、
-  schema v3 迁移幂等；全链路离线（HashTestEmbedder + 12s/40s 合成视频）覆盖中断恢复、Full Mean 构建、
-  表征地图、appdata 数据帧与 `tools/compare_spaces.py` 输出结构；真实数据阶段核对覆盖率/
-  n_clips/恢复/336p 对照/多空间邻域迁移数字（`docs/reports/full-coverage-analysis.md`）；
+  schema v3 迁移幂等；全链路离线（HashTestEmbedder + 4s/12s/17s/40s 合成视频）覆盖中断恢复、
+  Full Mean 构建、表征地图、appdata 数据帧与 `tools/compare_spaces.py` 输出结构；
+  真实数据验收（2026-10-25，110/110 canonical）：覆盖率 110/110、4130 窗口、权重和
+  ∈[0.99999992,1.00000003]、事件三件套 110/110；三组 compare（legacy×full_mean Jaccard=0.4068/
+  Pearson=0.9569；full_mean×temporal Jaccard=0.2049/Pearson=0.8294；legacy×temporal Jaccard=0.1734）；
+  336p 对照（10 部：joint cos min=0.9972、video min=0.9772、total 51.08→31.85s）；
+  真实 AppTest 默认 `map_v012`（Temporal Stats），三空间切换 map_v011/map_v008/map_v012，
+  时间轴与 full 序列片段面板正常（8 PASS / 0 FAIL）；报告见
+  `docs/reports/full-coverage-analysis.md`；
 - **独立预言机**：E2E 使用 `tests/fixtures/video_factory.py` 现场合成的素材与独立断言，
   不复用实现方测试的断言逻辑；`qa.py` 的入口检查与 pytest 独立失败；
 - **默认离线**：网络/模型测试必须打 marker，默认测试不触网、不加载权重；

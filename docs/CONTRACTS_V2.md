@@ -260,7 +260,7 @@ def write_report(report: dict, *, json_path, csv_path) -> None
 核心原则：**序列层（PE-AV 片段/事件）只编码一次；聚合器变化只新增 representation，绝不重新编码；
 不同 sequence/representation 的向量禁止混入同一矩阵；旧数据/旧地图不覆盖。**
 
-### 10.1 状态（2026-10-25，实现完成；真实数据阶段2 回填）
+### 10.1 状态（2026-10-25，实现与真实数据验收完成）
 
 | 项 | 状态 | 实现位置 | 证据 |
 | --- | --- | --- | --- |
@@ -274,12 +274,13 @@ def write_report(report: dict, *, json_path, csv_path) -> None
 | 构建 CLI | ✅ t5 完成 | `tools/build_representation.py` | CLI --help（qa.py 冒烟）+ 构建/增量/--force/事件变体；E2E 从已保存序列构建 full_mean |
 | 地图/空间切换/时间轴/近邻集成 | ✅ t2 完成 | `map.py` `--representation`/`--sequence-version`、`nebula/mapplot.py`、`app.py`（表征空间 + 完整时间轴）、`nebula/similarity.py`、`nebula/appdata.py` | t2 测试（mapplot/app/appdata/similarity）+ E2E 地图代表征绑定/AppTest |
 | 邻域迁移对比工具 | ✅ t4 完成 | `tools/compare_spaces.py` | 合成数据手算 Jaccard/hubness/Pearson + CLI；E2E 全链路 |
-| 独立验收 E2E / 不变量 | ✅ t4 完成（真实数据待阶段2） | `tests/test_e2e.py`、`tests/test_invariants.py` | invariants 55 项；E2E 27 项（v0.4 全链路 3 项） |
-| 文档与报告 | ✅ t4 完成骨架（真实数字待阶段2） | `ARCHITECTURE.md`、`README.md`、`AGENTS.md`、`docs/reports/full-coverage-analysis.md` | 本文件 §10 + 报告骨架（阶段2 回填真实数据/地图/迁移数字） |
+| 独立验收 E2E / 不变量 | ✅ t4 完成 | `tests/test_e2e.py`、`tests/test_invariants.py` | invariants 55 项（含默认 full 模式的版本断言）；E2E 27 项（v0.4 全链路 3 项） |
+| 文档与报告 | ✅ t4 完成（真实数字已回填） | `ARCHITECTURE.md`、`README.md`、`AGENTS.md`、`docs/reports/full-coverage-analysis.md` | 本文件 §10 + 报告（覆盖率/耗时/存储/336p/三组邻域迁移/替换案例） |
+| 真实数据（v0.4） | ✅ 全部完成（2026-10-25） | 110/110 canonical assembled；full_mean_v1(id=2,1024) / temporal_stats_v1(id=3,6356) 全量 ready；map_v011/map_v012=110；legacy=map_v008 | `logs/v04_data_analysis.json`、三组 `logs/space_compare_*.json/.csv`、336p `logs/seq_compare_*.json`；独立复核 8 PASS / 0 FAIL（覆盖率/表征/地图/三空间 compare/真实 AppTest） |
 
-**当前门禁（v0.4 实现完成、真实数据未跑）**：仓库内 `python qa.py` = PASS 5/5
-（ruff 全绿；pytest 671 passed + 6 model/network deselected，246s；docs 10 篇 ADR 章节完整；
-CLI 11 个入口 --help；config 含 v0.4 段校验）。
+**当前门禁（v0.4，默认 sampling.mode=full_coverage）**：仓库内 `python qa.py --full` = PASS 5/5
+（ruff 全绿；pytest 692 passed（model/network 已启用），174.85s；docs 10 篇 ADR 章节完整；
+CLI 11 个入口 --help；config 含 v0.4 段校验，embedding_version=full 序列版本）。
 
 
 ### 10.2 版本命名与配置
@@ -296,7 +297,7 @@ CLI 11 个入口 --help；config 含 v0.4 段校验）。
 
 ~~~yaml
 sampling:
-  mode: legacy            # legacy | full_coverage
+  mode: full_coverage     # v0.4 起默认全片覆盖；legacy 仅用于旧数据/旧地图
   overlap_seconds: 0.0
 events:
   enabled: true
@@ -344,13 +345,20 @@ python tools/compare_spaces.py --a legacy_5clip_mean --a-seq <sequence_version> 
 - 只读向量、不写 DB、不加载模型/UMAP；输出 `logs/space_compare_<a>_vs_<b>__<seqs>.json/.csv`；
 - 合成数据验收：手算 Jaccard/hubness/Pearson 一致、CLI --help 可跑、默认 space 解析正确。
 
-### 10.5 验收要求（阶段2）
+### 10.5 验收结果（2026-10-25）
 
-- `python qa.py --full` 通过（ruff + pytest + docs + CLI + config + model/network 标记测试）；
-- 全链路离线 E2E：12s/40s 合成视频 → HashTestEmbedder 全片编码 → 中断恢复 →
-  `tools/build_representation.py full_mean` → `map.py build --representation full_mean_v1` →
-  `appdata.load_nebula_frame` → `tools/compare_spaces.py legacy×full_mean`；
-- 不变量：模式切换/版本格式/legacy 公式、表征与序列隔离、地图绑定代表征且序列一致、
-  schema v3 迁移幂等、旧地图坐标不被覆盖、异空间矩阵不混用；
-- 真实数据：覆盖率、n_clips、恢复、336p 对照、全量地图（full_mean/temporal_stats）、
-  legacy×full_mean 邻域迁移数字回填到 `docs/reports/full-coverage-analysis.md`。
+- ✅ 全链路离线 E2E：4 部合成视频（4s/12s/17s/40s）→ HashTestEmbedder 全片编码 → 注入中断 →
+  只补缺失批 → `tools/build_representation.py full_mean` →
+  `map.py build --representation full_mean_v1` → `appdata.load_nebula_frame` →
+  `tools/compare_spaces.py legacy×full_mean` 输出 JSON/CSV；
+- ✅ 不变量：默认 full 模式/legacy 公式显式切换、full 版本格式、表征与序列隔离、地图绑定代表征且
+  序列一致、schema v3 迁移幂等、旧地图坐标不被覆盖、异空间矩阵不混用；
+- ✅ 真实数据：110/110 canonical 覆盖；4130 窗口（legacy 536）；权重和∈[0.99999992,1.00000003]；
+  事件三件套 110/110；336p 对照（10 部：joint cos min 0.9972、video min 0.9772，total 51.08→31.85s）；
+  map_v011/map_v012 均为 110 部；三组 compare（legacy×full_mean Jaccard 0.4068、Pearson 0.9569；
+  full_mean×temporal Jaccard 0.2049、Pearson 0.8294；legacy×temporal Jaccard 0.1734）；
+- ✅ 真实 AppTest：默认 map_v012（Temporal Stats），三空间切换 Full Mean→map_v011 /
+  Legacy→map_v008 / Temporal→map_v012，时间轴事件面板与 full 序列片段面板正常；
+- ✅ 报告已回填：`docs/reports/full-coverage-analysis.md`（含 replaced_works 案例与
+  `logs/v04_data_analysis.json` 引用）；
+- ⏳ 最终 `python qa.py --full` 在 t1/t2 默认模式测试修复后执行，结果随最终交付报告提交。

@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 import requests
 
+from nebula import download as download_module
 from nebula.download import (
     BILIBILI_VIEW_API,
     BilibiliClient,
     BilibiliMeta,
+    _playurl_qn,
     download_bilibili,
+    download_bilibili_playurl,
     http_get_text,
     is_valid_bvid,
 )
@@ -528,6 +534,7 @@ def test_download_bilibili_factory_error(config, tmp_path: Path) -> None:
             out_dir=tmp_path / "dl",
             download=config.download,
             ydl_factory=factory,
+            api_fallback=False,
         )
 
 
@@ -540,6 +547,7 @@ def test_download_bilibili_extract_error(config, tmp_path: Path) -> None:
             out_dir=tmp_path / "dl",
             download=config.download,
             ydl_factory=factory,
+            api_fallback=False,
         )
 
 
@@ -552,6 +560,7 @@ def test_download_bilibili_no_file(config, tmp_path: Path) -> None:
             out_dir=tmp_path / "dl",
             download=config.download,
             ydl_factory=factory,
+            api_fallback=False,
         )
 
 
@@ -587,6 +596,7 @@ def test_download_bilibili_ignores_partial_files(config, tmp_path: Path) -> None
             out_dir=out_dir,
             download=config.download,
             ydl_factory=factory,
+            api_fallback=False,
         )
 
 
@@ -616,7 +626,379 @@ def test_download_bilibili_out_dir_is_file(config, tmp_path: Path) -> None:
         )
 
 
+# ---------------------------------------------------------------- playurl 回退（离线）
+
+
+REAL_FALLBACK_BVID = "BV1LufpYGEb5"  # 全片批次里 yt-dlp 解析失败的真实案例
+
+
+class _JsonResponse:
+    """假 JSON API 响应。"""
+
+    status_code = 200
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+    def close(self) -> None:
+        pass
+
+
+class _BytesStreamResponse:
+    """假流式媒体响应。"""
+
+    status_code = 200
+
+    def __init__(self, content: bytes) -> None:
+        self._content = content
+
+    def iter_content(self, chunk_size: int = 1):
+        for index in range(0, len(self._content), chunk_size):
+            yield self._content[index : index + chunk_size]
+
+    def close(self) -> None:
+        pass
+
+
+class _RoutedSession:
+    """按 URL 前缀路由的假 requests.Session，记录调用参数。"""
+
+    def __init__(self, routes: list[tuple[str, Any]]) -> None:
+        self.routes = list(routes)
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def get(self, url: str, **kwargs: Any) -> Any:
+        self.calls.append((url, dict(kwargs)))
+        for prefix, value in self.routes:
+            if not url.startswith(prefix):
+                continue
+            if callable(value) and not isinstance(value, (_JsonResponse, _BytesStreamResponse)):
+                return value()
+            return value
+        raise requests.ConnectionError(f"未配置的 URL: {url}")
+
+    def close(self) -> None:
+        pass
+
+
+def _view_payload() -> dict[str, Any]:
+    return {
+        "code": 0,
+        "message": "OK",
+        "data": {"pages": [{"cid": 28112061734, "page": 1, "duration": 208}]},
+    }
+
+
+def _dash_payload() -> dict[str, Any]:
+    return {
+        "code": 0,
+        "message": "OK",
+        "data": {
+            "quality": 32,
+            "format": "flv480",
+            "dash": {
+                "video": [
+                    {
+                        "id": 32,
+                        "height": 480,
+                        "codec": "hev1.1.6.L120.90",
+                        "bandwidth": 900,
+                        "baseUrl": "https://media.example/hevc480.m4s",
+                    },
+                    {
+                        "id": 32,
+                        "height": 480,
+                        "codec": "avc1.64001F",
+                        "bandwidth": 500,
+                        "baseUrl": "https://media.example/avc480.m4s",
+                        "backupUrl": ["https://media.example/avc480_backup.m4s"],
+                    },
+                    {
+                        "id": 16,
+                        "height": 360,
+                        "codec": "avc1.64001E",
+                        "bandwidth": 100,
+                        "baseUrl": "https://media.example/avc360.m4s",
+                    },
+                ],
+                "audio": [
+                    {
+                        "id": 30216,
+                        "bandwidth": 50,
+                        "baseUrl": "https://media.example/audio_low.m4s",
+                    },
+                    {
+                        "id": 30280,
+                        "bandwidth": 200,
+                        "baseUrl": "https://media.example/audio_high.m4s",
+                    },
+                ],
+            },
+        },
+    }
+
+
+def _fake_ffmpeg_runner(captured: list[list[str]]):
+    def runner(command, *, capture_output: bool = False, timeout: float | None = None):
+        command_list = [str(item) for item in command]
+        captured.append(command_list)
+        target = Path(command_list[-1])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"MUXED")
+        return subprocess.CompletedProcess(command_list, 0, b"", b"")
+
+    return runner
+
+
+@pytest.mark.parametrize(
+    ("max_height", "expected_qn"),
+    [(360, 16), (480, 32), (720, 64), (1080, 80), (0, 80)],
+)
+def test_playurl_qn_mapping(max_height: int, expected_qn: int) -> None:
+    assert _playurl_qn(max_height) == expected_qn
+
+
+def test_playurl_dash_download_offline(
+    config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = _RoutedSession(
+        [
+            ("https://api.bilibili.com/x/web-interface/view", _JsonResponse(_view_payload())),
+            ("https://api.bilibili.com/x/player/playurl", _JsonResponse(_dash_payload())),
+            ("https://media.example/avc480.m4s", _BytesStreamResponse(b"VIDEO-DATA")),
+            ("https://media.example/audio_high.m4s", _BytesStreamResponse(b"AUDIO-DATA")),
+        ]
+    )
+    ffmpeg_commands: list[list[str]] = []
+    monkeypatch.setattr(
+        download_module.subprocess, "run", _fake_ffmpeg_runner(ffmpeg_commands)
+    )
+    out_dir = tmp_path / "dl"
+
+    path = download_bilibili_playurl(
+        VALID_BVID,
+        out_dir=out_dir,
+        download=config.download,
+        session=session,
+        ffmpeg="ffmpeg",
+    )
+
+    assert path == (out_dir / f"{VALID_BVID}_p1.mp4").resolve()
+    assert path.read_bytes() == b"MUXED"
+    # 临时 m4s / .part 文件全部清理，只剩最终 mp4
+    assert sorted(item.name for item in out_dir.iterdir()) == [f"{VALID_BVID}_p1.mp4"]
+
+    media_urls = [url for url, _ in session.calls if url.startswith("https://media.example/")]
+    assert media_urls == [
+        "https://media.example/avc480.m4s",
+        "https://media.example/audio_high.m4s",
+    ]
+    api_calls = {url: kwargs for url, kwargs in session.calls if "api.bilibili.com" in url}
+    playurl_params = api_calls[
+        "https://api.bilibili.com/x/player/playurl"
+    ]["params"]
+    assert playurl_params["qn"] == 32  # max_height=480 -> 480P
+    assert playurl_params["fnval"] == 4048
+    headers = api_calls["https://api.bilibili.com/x/player/playurl"]["headers"]
+    assert headers["Referer"] == f"https://www.bilibili.com/video/{VALID_BVID}/"
+    assert headers["User-Agent"]
+
+    assert len(ffmpeg_commands) == 1
+    command = ffmpeg_commands[0]
+    assert "-c" in command and "copy" in command
+    assert command.count("-i") == 2
+    # ffmpeg 先写 .mp4.part 再原子替换为最终文件
+    assert command[-1] == str(out_dir / f"{VALID_BVID}_p1.mp4.part")
+
+
+def test_playurl_progressive_download_offline(
+    config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {
+        "code": 0,
+        "message": "OK",
+        "data": {
+            "quality": 16,
+            "format": "mp4",
+            "durl": [
+                {"url": "https://media.example/progressive.mp4", "size": 123},
+            ],
+        },
+    }
+    session = _RoutedSession(
+        [
+            ("https://api.bilibili.com/x/web-interface/view", _JsonResponse(_view_payload())),
+            ("https://api.bilibili.com/x/player/playurl", _JsonResponse(payload)),
+            ("https://media.example/progressive.mp4", _BytesStreamResponse(b"PROGRESSIVE")),
+        ]
+    )
+
+    def ffmpeg_must_not_run(*args, **kwargs):
+        raise AssertionError("durl 渐进流不需要 ffmpeg 合并")
+
+    monkeypatch.setattr(download_module.subprocess, "run", ffmpeg_must_not_run)
+    out_dir = tmp_path / "dl"
+    path = download_bilibili_playurl(
+        VALID_BVID, out_dir=out_dir, download=config.download, session=session
+    )
+
+    assert path == (out_dir / f"{VALID_BVID}_p1.mp4").resolve()
+    assert path.read_bytes() == b"PROGRESSIVE"
+    assert sorted(item.name for item in out_dir.iterdir()) == [f"{VALID_BVID}_p1.mp4"]
+
+
+def test_playurl_api_error_raises(config, tmp_path: Path) -> None:
+    payload = {"code": -404, "message": "啥都木有"}
+    session = _RoutedSession(
+        [
+            ("https://api.bilibili.com/x/web-interface/view", _JsonResponse(_view_payload())),
+            ("https://api.bilibili.com/x/player/playurl", _JsonResponse(payload)),
+        ]
+    )
+    out_dir = tmp_path / "dl"
+    with pytest.raises(DownloadError) as info:
+        download_bilibili_playurl(
+            VALID_BVID, out_dir=out_dir, download=config.download, session=session
+        )
+    message = str(info.value)
+    assert "playurl API 不可用" in message
+    assert "-404" in message
+    assert "需要登录" in message
+    assert list(out_dir.iterdir()) == []
+
+
+def test_playurl_no_stream_raises(config, tmp_path: Path) -> None:
+    payload = {"code": 0, "message": "OK", "data": {}}
+    session = _RoutedSession(
+        [
+            ("https://api.bilibili.com/x/web-interface/view", _JsonResponse(_view_payload())),
+            ("https://api.bilibili.com/x/player/playurl", _JsonResponse(payload)),
+        ]
+    )
+    with pytest.raises(DownloadError, match="DASH 或 durl"):
+        download_bilibili_playurl(
+            VALID_BVID, out_dir=tmp_path / "dl", download=config.download, session=session
+        )
+
+
+def test_playurl_stream_failure_cleans_temp_files(config, tmp_path: Path) -> None:
+    session = _RoutedSession(
+        [
+            ("https://api.bilibili.com/x/web-interface/view", _JsonResponse(_view_payload())),
+            ("https://api.bilibili.com/x/player/playurl", _JsonResponse(_dash_payload())),
+            (
+                "https://media.example/avc480.m4s",
+                lambda: (_ for _ in ()).throw(requests.ConnectionError("stream boom")),
+            ),
+        ]
+    )
+    download = dataclasses.replace(config.download, retries=0)
+    out_dir = tmp_path / "dl"
+    with pytest.raises(DownloadError, match="视频流"):
+        download_bilibili_playurl(
+            VALID_BVID, out_dir=out_dir, download=download, session=session
+        )
+    assert list(out_dir.iterdir()) == []
+
+
+def test_download_bilibili_falls_back_and_cleans_partial(
+    config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = tmp_path / "dl"
+    out_dir.mkdir()
+    partial = out_dir / f"{VALID_BVID}_p1.mp4.part"
+    partial.write_bytes(b"half-downloaded")
+    fallback_path = out_dir / f"{VALID_BVID}_p1.mp4"
+
+    def fake_fallback(bvid, *, part=1, out_dir, download, **kwargs):
+        fallback_path.write_bytes(b"from-playurl")
+        return fallback_path
+
+    monkeypatch.setattr(
+        "nebula.download.download_bilibili_playurl", fake_fallback
+    )
+
+    def broken_factory(options: dict[str, Any]) -> Any:
+        raise RuntimeError("yt-dlp broken")
+
+    path = download_bilibili(
+        VALID_BVID,
+        out_dir=out_dir,
+        download=config.download,
+        ydl_factory=broken_factory,
+    )
+    assert path == fallback_path
+    assert not partial.exists()
+    assert fallback_path.read_bytes() == b"from-playurl"
+
+
+def test_download_bilibili_fallback_failure_reports_both(
+    config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_fallback(bvid, **kwargs):
+        raise DownloadError("playurl boom")
+
+    monkeypatch.setattr(
+        "nebula.download.download_bilibili_playurl", broken_fallback
+    )
+
+    def broken_factory(options: dict[str, Any]) -> Any:
+        raise RuntimeError("yt boom")
+
+    with pytest.raises(DownloadError) as info:
+        download_bilibili(
+            VALID_BVID,
+            out_dir=tmp_path / "dl",
+            download=config.download,
+            ydl_factory=broken_factory,
+        )
+    message = str(info.value)
+    assert "yt-dlp 与 playurl 回退均失败" in message
+    assert "yt boom" in message
+    assert "playurl boom" in message
+
+
 # ---------------------------------------------------------------- 真实网络（默认跳过）
+
+
+@pytest.mark.network
+@pytest.mark.skipif(
+    not NETWORK_ENABLED,
+    reason="网络测试默认跳过；设置 NEBULA_NETWORK_TESTS=1 后运行",
+)
+def test_download_bilibili_playurl_real_network(config, tmp_path: Path) -> None:
+    """真实网络验证 playurl 回退：BV1LufpYGEb5（208s）能下到含音视频的 mp4。"""
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        pytest.skip("缺少 ffprobe")
+    out_dir = tmp_path / "dl"
+    path = download_bilibili_playurl(
+        REAL_FALLBACK_BVID,
+        out_dir=out_dir,
+        download=config.download,
+        timeout_s=300.0,
+    )
+    assert path.is_file()
+    assert path.stat().st_size > 1_000_000
+    probe = subprocess.run(
+        [ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    payload = json.loads(probe.stdout or "{}")
+    kinds = {stream.get("codec_type") for stream in payload.get("streams", [])}
+    assert {"video", "audio"} <= kinds
+    duration = float((payload.get("format") or {}).get("duration") or 0.0)
+    assert duration > 150.0
+    assert path.parent == out_dir.resolve()
 
 
 @pytest.mark.network

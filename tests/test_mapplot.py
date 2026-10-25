@@ -26,6 +26,7 @@ from nebula.mapplot import (
     main,
     transform_new,
 )
+from nebula.representations import LEGACY_NAME
 
 VECTOR_DIM = 8
 WORK_COUNT = 8
@@ -35,7 +36,7 @@ WORK_COUNT = 8
 def _ensure_embedding_version(
     catalog: Catalog, config: Config, version: str | None = None
 ) -> str:
-    target = version or config.embedding_version
+    target = version or config.legacy_embedding_version
     catalog.register_embedding_version(
         target,
         model_checkpoint=config.model.checkpoint,
@@ -100,10 +101,19 @@ def _read_coords(result) -> pd.DataFrame:
     return pd.read_parquet(result.coords_path)
 
 
+def _load_legacy_matrix(
+    catalog: Catalog, config: Config, **kwargs
+) -> tuple[list[int], np.ndarray]:
+    """按旧版序列版本读取矩阵（默认配置已切 full_coverage）。"""
+
+    kwargs.setdefault("version", config.legacy_embedding_version)
+    return load_embedding_matrix(catalog, config, **kwargs)
+
+
 # --------------------------------------------------------------------------- 向量读取
 def test_load_embedding_matrix_normalizes(config: Config, catalog: Catalog):
     ids = _add_works(catalog, config, 4, normalize=False)
-    work_ids, matrix = load_embedding_matrix(catalog, config)
+    work_ids, matrix = _load_legacy_matrix(catalog, config)
 
     assert work_ids == ids
     assert matrix.shape == (4, VECTOR_DIM)
@@ -115,20 +125,20 @@ def test_load_embedding_matrix_normalizes(config: Config, catalog: Catalog):
 def test_load_embedding_matrix_too_few_works(config: Config, catalog: Catalog):
     _add_works(catalog, config, mapplot.MIN_WORKS - 1)
     with pytest.raises(MapError, match="作品数量不足"):
-        load_embedding_matrix(catalog, config)
+        _load_legacy_matrix(catalog, config)
 
 
 def test_load_embedding_matrix_missing_version(config: Config, catalog: Catalog):
     _add_works(catalog, config, 3)
     with pytest.raises(MapError, match="作品数量不足"):
-        load_embedding_matrix(catalog, config, version="不存在的向量版本")
+        _load_legacy_matrix(catalog, config, version="不存在的向量版本")
 
 
 def test_load_embedding_matrix_dim_mismatch(config: Config, catalog: Catalog):
     _add_works(catalog, config, 2, dim=8)
     _add_works(catalog, config, 1, dim=4, start=10)
     with pytest.raises(MapError, match="维度不一致"):
-        load_embedding_matrix(catalog, config)
+        _load_legacy_matrix(catalog, config)
 
 
 def test_load_embedding_matrix_missing_vector_file(config: Config, catalog: Catalog):
@@ -143,30 +153,30 @@ def test_load_embedding_matrix_missing_vector_file(config: Config, catalog: Cata
     )
     _add_works(catalog, config, 2, start=20)
     with pytest.raises(MapError, match="向量文件不存在"):
-        load_embedding_matrix(catalog, config)
+        _load_legacy_matrix(catalog, config)
 
 
 def test_load_embedding_matrix_zero_vector(config: Config, catalog: Catalog):
     ids = _add_works(catalog, config, 3)
-    np.save(_vector_path(config, config.embedding_version, ids[0]), np.zeros(VECTOR_DIM, dtype=np.float32))
+    np.save(_vector_path(config, config.legacy_embedding_version, ids[0]), np.zeros(VECTOR_DIM, dtype=np.float32))
     with pytest.raises(MapError, match="零向量"):
-        load_embedding_matrix(catalog, config)
+        _load_legacy_matrix(catalog, config)
 
 
 def test_load_embedding_matrix_registered_dim_mismatch(config: Config, catalog: Catalog):
     ids = _add_works(catalog, config, 3)
-    np.save(_vector_path(config, config.embedding_version, ids[1]), np.ones(5, dtype=np.float32))
+    np.save(_vector_path(config, config.legacy_embedding_version, ids[1]), np.ones(5, dtype=np.float32))
     with pytest.raises(MapError, match="维度与登记不一致"):
-        load_embedding_matrix(catalog, config)
+        _load_legacy_matrix(catalog, config)
 
 
 # --------------------------------------------------------------------------- 构建星云
 def test_build_map_outputs_and_registration(config: Config, catalog: Catalog):
     ids = _add_works(catalog, config, WORK_COUNT)
-    result = build_map(catalog, config, note="单元测试")
+    result = build_map(catalog, config, representation=LEGACY_NAME, note="单元测试")
 
     assert result.version == "map_v001"
-    assert result.embedding_version == config.embedding_version
+    assert result.embedding_version == config.legacy_embedding_version
     assert result.n_works == WORK_COUNT
     assert result.coords_path == config.paths.maps / "map_v001" / "coords.parquet"
     for path in (result.coords_path, result.model_2d_path, result.model_3d_path):
@@ -192,7 +202,7 @@ def test_build_map_outputs_and_registration(config: Config, catalog: Catalog):
 
     meta = json.loads((config.paths.maps / "map_v001" / "meta.json").read_text(encoding="utf-8"))
     assert meta["version"] == "map_v001"
-    assert meta["embedding_version"] == config.embedding_version
+    assert meta["embedding_version"] == config.legacy_embedding_version
     assert meta["n_works"] == WORK_COUNT
     assert meta["params"]["metric"] == "cosine"
     assert meta["params"]["random_state"] == config.umap.random_state
@@ -212,8 +222,8 @@ def test_build_map_outputs_and_registration(config: Config, catalog: Catalog):
 
 def test_build_map_versions_increment_and_determinism(config: Config, catalog: Catalog):
     _add_works(catalog, config, WORK_COUNT)
-    first = build_map(catalog, config)
-    second = build_map(catalog, config)
+    first = build_map(catalog, config, representation=LEGACY_NAME)
+    second = build_map(catalog, config, representation=LEGACY_NAME)
 
     assert first.version == "map_v001"
     assert second.version == "map_v002"
@@ -233,7 +243,7 @@ def test_build_map_with_minimum_works(config: Config, catalog: Catalog):
     """达到 MIN_WORKS 下限（3 部）也应能生成 2D/3D 星云（自动改用 random 初始化）。"""
 
     _add_works(catalog, config, mapplot.MIN_WORKS)
-    result = build_map(catalog, config)
+    result = build_map(catalog, config, representation=LEGACY_NAME)
     assert result.n_works == mapplot.MIN_WORKS
     frame = _read_coords(result)
     assert len(frame) == mapplot.MIN_WORKS
@@ -248,7 +258,7 @@ def test_build_map_cleans_up_on_failure(config: Config, catalog: Catalog, monkey
 
     monkeypatch.setattr(mapplot, "_dump_model", boom)
     with pytest.raises(MapError, match="生成星云失败"):
-        build_map(catalog, config)
+        build_map(catalog, config, representation=LEGACY_NAME)
 
     assert not (config.paths.maps / "map_v001").exists()
     assert catalog.list_maps() == []
@@ -257,7 +267,7 @@ def test_build_map_cleans_up_on_failure(config: Config, catalog: Catalog, monkey
 # --------------------------------------------------------------------------- 增量更新
 def test_transform_new_appends_and_keeps_old_coords(config: Config, catalog: Catalog):
     old_ids = _add_works(catalog, config, WORK_COUNT)
-    result = build_map(catalog, config)
+    result = build_map(catalog, config, representation=LEGACY_NAME)
     old_frame = _read_coords(result).set_index("work_id")
 
     new_ids = _add_works(catalog, config, 2, seed=99, start=100)
@@ -284,7 +294,7 @@ def test_transform_new_appends_and_keeps_old_coords(config: Config, catalog: Cat
 
 def test_transform_new_uses_latest_map(config: Config, catalog: Catalog):
     _add_works(catalog, config, 5)
-    build_map(catalog, config)
+    build_map(catalog, config, representation=LEGACY_NAME)
     _add_works(catalog, config, 1, start=50)
     assert transform_new(catalog, config) == 1
     assert catalog.latest_map()["n_works"] == 6
@@ -295,7 +305,7 @@ def test_transform_new_errors(config: Config, catalog: Catalog):
         transform_new(catalog, config)
 
     _add_works(catalog, config, 4)
-    result = build_map(catalog, config)
+    result = build_map(catalog, config, representation=LEGACY_NAME)
     with pytest.raises(MapError, match="星云版本不存在"):
         transform_new(catalog, config, map_version="map_v999")
 
@@ -309,7 +319,12 @@ def test_transform_new_errors(config: Config, catalog: Catalog):
 def test_cli_build_list_transform(config: Config, catalog: Catalog, capsys):
     _add_works(catalog, config, WORK_COUNT)
 
-    assert main(["build", "--config", str(config.path), "--note", "CLI 测试"]) == 0
+    assert (
+        main(
+            ["build", "--config", str(config.path), "--representation", LEGACY_NAME, "--note", "CLI 测试"]
+        )
+        == 0
+    )
     out = capsys.readouterr().out
     assert "map_v001" in out
     assert f"{WORK_COUNT} 部作品" in out
@@ -336,11 +351,17 @@ def test_cli_build_uses_embedding_version_option(config: Config, catalog: Catalo
     assert map_row["embedding_version"] == custom_version
 
 
-def test_cli_build_too_few_works_returns_error(config: Config, capsys):
-    assert main(["build", "--config", str(config.path)]) == 1
+def test_cli_build_too_few_works_returns_error(
+    config: Config, catalog: Catalog, capsys
+):
+    # 默认配置是 full_coverage；显式 legacy 表征 + 空库仍应给出“数量不足”的中文错误
+    _ensure_embedding_version(catalog, config, config.legacy_embedding_version)
+    assert (
+        main(["build", "--config", str(config.path), "--representation", LEGACY_NAME]) == 1
+    )
     captured = capsys.readouterr()
     assert "错误" in captured.err
-    assert "作品数量不足" in captured.err
+    assert "数量不足" in captured.err
 
 
 def test_cli_missing_config_returns_error(tmp_path: Path, capsys):
@@ -416,49 +437,49 @@ def _seed_mixed_works(
 def test_load_embedding_matrix_filter_spec(config: Config, catalog: Catalog):
     groups = _seed_mixed_works(catalog, config)
 
-    ids, matrix = load_embedding_matrix(catalog, config, filter_spec={"dataset": "local"})
+    ids, matrix = _load_legacy_matrix(catalog, config, filter_spec={"dataset": "local"})
     assert ids == groups["local"]
     assert matrix.shape == (len(groups["local"]), VECTOR_DIM)
 
-    ids, _ = load_embedding_matrix(catalog, config, filter_spec={"dataset": "bilibili"})
+    ids, _ = _load_legacy_matrix(catalog, config, filter_spec={"dataset": "bilibili"})
     assert ids == groups["bilibili"]
 
     expected_2024 = sorted(
         [groups["local"][0], groups["local"][1], groups["bilibili"][0]]
     )
-    ids, _ = load_embedding_matrix(catalog, config, filter_spec={"vote_year": 2024})
+    ids, _ = _load_legacy_matrix(catalog, config, filter_spec={"vote_year": 2024})
     assert ids == expected_2024
 
-    ids, _ = load_embedding_matrix(catalog, config, filter_spec={"list_key": "votes_2024"})
+    ids, _ = _load_legacy_matrix(catalog, config, filter_spec={"list_key": "votes_2024"})
     assert ids == expected_2024
 
-    ids, _ = load_embedding_matrix(
+    ids, _ = _load_legacy_matrix(
         catalog, config, filter_spec={"dataset": "local", "vote_year": 2025}
     )
     assert ids == groups["local"]
 
     # 默认不过滤 = 全部 canonical 作品
-    ids, _ = load_embedding_matrix(catalog, config)
+    ids, _ = _load_legacy_matrix(catalog, config)
     assert ids == sorted(groups["all"])
 
 
 def test_load_embedding_matrix_invalid_filter_spec(config: Config, catalog: Catalog):
     _seed_mixed_works(catalog, config)
     with pytest.raises(MapError, match="未知的筛选条件"):
-        load_embedding_matrix(catalog, config, filter_spec={"source": "local"})
+        _load_legacy_matrix(catalog, config, filter_spec={"source": "local"})
     with pytest.raises(MapError, match="dataset 只支持"):
-        load_embedding_matrix(catalog, config, filter_spec={"dataset": "youtube"})
+        _load_legacy_matrix(catalog, config, filter_spec={"dataset": "youtube"})
     with pytest.raises(MapError, match="vote_year 必须是整数"):
-        load_embedding_matrix(catalog, config, filter_spec={"vote_year": "2025年"})
+        _load_legacy_matrix(catalog, config, filter_spec={"vote_year": "2025年"})
     with pytest.raises(MapError, match="include_duplicates 必须是布尔值"):
-        load_embedding_matrix(catalog, config, filter_spec={"include_duplicates": "yes"})
+        _load_legacy_matrix(catalog, config, filter_spec={"include_duplicates": "yes"})
 
 
 def test_filter_too_few_works_raises(config: Config, catalog: Catalog):
     _seed_mixed_works(catalog, config)
     # 不存在的年份 -> 0 部作品，筛选后不足 MIN_WORKS
     with pytest.raises(MapError, match="筛选后作品数量不足"):
-        load_embedding_matrix(catalog, config, filter_spec={"vote_year": 2023})
+        _load_legacy_matrix(catalog, config, filter_spec={"vote_year": 2023})
 
 
 def test_duplicates_excluded_by_default(config: Config, catalog: Catalog):
@@ -467,12 +488,12 @@ def test_duplicates_excluded_by_default(config: Config, catalog: Catalog):
     duplicate = groups["local"][0]
     catalog.link_works(canonical, duplicate, method="title+duration", confidence=0.99)
 
-    ids, _ = load_embedding_matrix(catalog, config)
+    ids, _ = _load_legacy_matrix(catalog, config)
     assert duplicate not in ids
     assert canonical in ids
     assert len(ids) == len(groups["all"]) - 1
 
-    ids_included, _ = load_embedding_matrix(
+    ids_included, _ = _load_legacy_matrix(
         catalog, config, filter_spec={"include_duplicates": True}
     )
     assert duplicate in ids_included
@@ -484,6 +505,7 @@ def test_build_map_persists_filter_spec(config: Config, catalog: Catalog):
     result = build_map(
         catalog,
         config,
+        representation=LEGACY_NAME,
         filter_spec={"dataset": "bilibili", "vote_year": 2025},
         note="仅 B 站 2025",
     )
@@ -503,7 +525,7 @@ def test_build_map_persists_filter_spec(config: Config, catalog: Catalog):
     assert meta["params"]["filter_spec"] == {"dataset": "bilibili", "vote_year": 2025}
 
     # 无筛选的星云 filter_json 为 NULL
-    plain = build_map(catalog, config)
+    plain = build_map(catalog, config, representation=LEGACY_NAME)
     assert catalog.get_map(plain.version)["filter_json"] is None
 
 
@@ -512,34 +534,34 @@ def test_build_map_excludes_duplicates_by_default(config: Config, catalog: Catal
     catalog.link_works(
         groups["bilibili"][0], groups["local"][0], method="title+duration", confidence=0.99
     )
-    result = build_map(catalog, config)
+    result = build_map(catalog, config, representation=LEGACY_NAME)
     assert result.n_works == len(groups["all"]) - 1
     assert groups["local"][0] not in _read_coords(result)["work_id"].tolist()
 
-    included = build_map(catalog, config, filter_spec={"include_duplicates": True})
+    included = build_map(catalog, config, representation=LEGACY_NAME, filter_spec={"include_duplicates": True})
     assert included.n_works == len(groups["all"])
 
 
 def test_build_map_n_neighbors_override(config: Config, catalog: Catalog):
     _seed_mixed_works(catalog, config)
-    result = build_map(catalog, config, n_neighbors=4)
+    result = build_map(catalog, config, representation=LEGACY_NAME, n_neighbors=4)
     params = json.loads(catalog.get_map(result.version)["params_json"])
     assert params["n_neighbors"] == 4
     model_2d = joblib.load(result.model_2d_path)
     assert model_2d.get_params()["n_neighbors"] == 4
 
     # 覆盖值超过样本数时自动降为 n-1
-    capped = build_map(catalog, config, n_neighbors=100)
+    capped = build_map(catalog, config, representation=LEGACY_NAME, n_neighbors=100)
     params = json.loads(catalog.get_map(capped.version)["params_json"])
     assert params["n_neighbors"] == capped.n_works - 1
 
     with pytest.raises(MapError, match="n_neighbors 必须 >= 2"):
-        build_map(catalog, config, n_neighbors=1)
+        build_map(catalog, config, representation=LEGACY_NAME, n_neighbors=1)
 
 
 def test_build_map_variants(config: Config, catalog: Catalog):
     _seed_mixed_works(catalog, config)
-    results = build_map_variants(catalog, config, n_neighbors_list=(3, 5, 3))
+    results = build_map_variants(catalog, config, n_neighbors_list=(3, 5, 3), representation=LEGACY_NAME)
     assert [result.version for result in results] == ["map_v001", "map_v002"]
     neighbors = [
         json.loads(catalog.get_map(result.version)["params_json"])["n_neighbors"]
@@ -550,14 +572,14 @@ def test_build_map_variants(config: Config, catalog: Catalog):
     assert all("n_neighbors=" in note for note in notes)
 
     with pytest.raises(MapError, match="不能为空"):
-        build_map_variants(catalog, config, n_neighbors_list=())
+        build_map_variants(catalog, config, n_neighbors_list=(), representation=LEGACY_NAME)
     with pytest.raises(MapError, match="n_neighbors 必须 >= 2"):
-        build_map_variants(catalog, config, n_neighbors_list=(1,))
+        build_map_variants(catalog, config, n_neighbors_list=(1,), representation=LEGACY_NAME)
 
 
 def test_transform_new_respects_map_filter(config: Config, catalog: Catalog):
     groups = _seed_mixed_works(catalog, config)
-    result = build_map(catalog, config, filter_spec={"dataset": "bilibili"})
+    result = build_map(catalog, config, representation=LEGACY_NAME, filter_spec={"dataset": "bilibili"})
     assert result.n_works == len(groups["bilibili"])
 
     # 本地新作品不满足筛选条件，不应被 transform 进来
@@ -582,6 +604,8 @@ def test_cli_build_with_filter_and_neighbors(config: Config, catalog: Catalog, c
             "local",
             "--vote-year",
             "2025",
+            "--representation",
+            LEGACY_NAME,
             "--n-neighbors",
             "5",
             "--note",
@@ -609,6 +633,8 @@ def test_cli_variants(config: Config, catalog: Catalog, capsys):
             "variants",
             "--config",
             str(config.path),
+            "--representation",
+            LEGACY_NAME,
             "--n-neighbors",
             "3",
             "5",
@@ -632,7 +658,9 @@ def test_cli_variants(config: Config, catalog: Catalog, capsys):
 
 def test_cli_filter_error_returns_nonzero(config: Config, catalog: Catalog, capsys):
     _seed_mixed_works(catalog, config)
-    code = main(["build", "--config", str(config.path), "--vote-year", "2023"])
+    code = main(
+        ["build", "--config", str(config.path), "--representation", LEGACY_NAME, "--vote-year", "2023"]
+    )
     assert code == 1
     captured = capsys.readouterr()
     assert "错误" in captured.err
@@ -709,7 +737,7 @@ def test_build_map_representation_and_isolation(config: Config, catalog: Catalog
     assert meta["representation"]["sequence_version"] == "full-seq-v1"
 
     # 旧行为：不指定表征时按当前 sampling.mode（默认 legacy）建图，且使用旧序列版本
-    legacy = build_map(catalog, config, note="legacy 地图")
+    legacy = build_map(catalog, config, representation=LEGACY_NAME, note="legacy 地图")
     assert legacy.embedding_version == config.legacy_embedding_version
     assert legacy.representation_id is not None
     assert legacy.representation_id != rep_id
@@ -899,3 +927,30 @@ def test_cli_legacy_embedding_version_alias(config: Config, catalog: Catalog, ca
     assert rep is not None
     assert rep["name"] == "legacy_5clip_mean"
     assert len(groups["all"]) == 8
+
+
+def test_default_representation_follows_sampling_mode(config: Config, catalog: Catalog):
+    """默认配置 full_coverage 时默认解析 Full Mean；legacy 模式配置时默认解析 Legacy。"""
+
+    from dataclasses import replace
+
+    from nebula import representations
+
+    groups = _seed_mixed_works(catalog, config)
+    rep_id = _register_derived_representation(
+        catalog,
+        config,
+        sequence_version=config.full_sequence_version,
+        work_ids=groups["all"],
+        seed=17,
+    )
+    default = build_map(catalog, config, note="默认 full mean")
+    assert default.representation_name == representations.FULL_MEAN_V1
+    assert default.representation_id == rep_id
+    assert default.embedding_version == config.full_sequence_version
+    assert default.n_works == len(groups["all"])
+
+    legacy_config = replace(config, sampling=replace(config.sampling, mode="legacy"))
+    legacy_default = build_map(catalog, legacy_config, note="legacy 模式默认")
+    assert legacy_default.representation_name == representations.LEGACY_NAME
+    assert legacy_default.embedding_version == config.legacy_embedding_version

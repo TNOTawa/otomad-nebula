@@ -173,7 +173,7 @@ otomad-nebula/
 | `paths` | `input_local` / `input_lists` / `data` / `temp` / `logs` | 数据目录布局 |
 | `database` | `filename` | SQLite 文件名（位于 data 目录内，不能带子目录） |
 | `media` | `clip_seconds` / `clips_per_work` / `min_duration_seconds` / `audio_sample_rate` / `clip_height` / `long_video_seconds` | 采样与切片参数；改动会改变向量版本；`clip_height: 336` 生成 `_h336` 实验版本 |
-| `sampling` | `mode` / `overlap_seconds` | v0.4：`legacy`（旧 5 片段）或 `full_coverage`（全片覆盖）；overlap 必须小于片段长度 |
+| `sampling` | `mode` / `overlap_seconds` | v0.4：`full_coverage`（默认，全片覆盖）或 `legacy`（旧 5 片段，用于旧数据/对照）；overlap 必须小于片段长度 |
 | `events` | `enabled` / `audio_rate_hz` / `video_fps` / `version` | v0.4.1 高频事件扫描参数（音频 100Hz、视频 30fps） |
 | `temporal` | `stages` | v0.4.2 Temporal Stats 的相对时间阶段数（默认 4） |
 | `model` | `checkpoint` / `revision` / `version` / `frames` / `device` / `local_files_only` 等 | PE-AV 模型；`revision` 固定版本便于复现 |
@@ -295,14 +295,15 @@ otomad-nebula/
 
 ### v0.2：观察、筛选与运维（迭代 A/B）
 
-v0.2 起所有观察功能都直接复用已保存向量，不需要重新编码。当前数据状态（2026-10-25，扩量已完成）：
+v0.2 起所有观察功能都直接复用已保存向量，不需要重新编码。当前数据状态（2026-10-25，v0.4 全片升级完成）：
 
-- 89 部 2025 选票作品全部导入；累计 **120 completed**（33 部本地 + 87 部 Bilibili）+ 2 failed
-  （8.71h 直播回放、API -404 已删除视频），pending=0；
-- 10 条身份关联（duplicate 默认不进星云）；appearances 89 条；
-- 星云：`map_v007` = 2025 全量星云 87 部（filter_json `list_key=votes_2025`）；
-  `map_v008` = 总星云 110 部（33 + 87 − 10 duplicate），当前界面默认为 `map_v008`；
-- 旧版本 `map_v001`–`map_v006` 保留，用于历史对比（不同版本坐标不可直接比较）。
+- 89 部 2025 选票全部导入；累计 **120 completed**（33 本地 + 87 Bilibili）+ 2 failed
+  （8.71h 直播回放、API -404 已删除视频），pending=0；canonical = **110**（10 条身份关联去重）；
+- **v0.4 三种空间**（均 110 部）：legacy `map_v008`；Full Mean `map_v011`；Temporal Stats `map_v012`；
+  **当前界面默认 `map_v012`**（Temporal Stats）；侧栏可切换三空间；
+- 全片序列：110/110 canonical 覆盖，4130 个 8s 窗口（legacy 仅 536 个），
+  事件扫描 110/110（`events_v1`）；详细数字见 `docs/reports/full-coverage-analysis.md`；
+- 旧版本 `map_v001`–`map_v007` 保留，用于历史/筛选对比（不同版本坐标不可直接比较）。
 
 #### A1 高维近邻探索（界面）
 
@@ -454,7 +455,8 @@ quality（CRF28 轻画质退化基线）joint Δ mean=0.000964；音频 +0.5s=0.
 - 扩量批处理（run_id=5）：54 部 **54 completed / 0 failed**，总耗时 730.51s（模型加载 17.05s）；
   累计 120 completed + 2 failed、pending=0；
 - 扩量后重建星云：`map_v007`（2025 全量 87 部，filter_json list_key=votes_2025）与
-  `map_v008`（总星云 110 部，当前默认）。不同版本坐标不可直接比较；
+  `map_v008`（legacy 总星云 110 部）；v0.4 全片升级后又新增 `map_v011`（Full Mean）与
+  `map_v012`（Temporal Stats），均为 110 部。不同版本/不同表征的坐标不可直接比较；
 - 查看最新状态与重试：
 
 ```powershell
@@ -479,7 +481,27 @@ v0.4 把“均匀抽 ≤5×8s 片段再平均”升级为**覆盖整条时间轴
 - **三种空间**：Legacy（旧 5 片段平均）、Full Mean（全片平均）、Temporal Stats（时间结构）；
   各自使用独立地图，坐标不可跨空间比较。
 
-1. 切换采样模式并编码全片序列（先小批量试跑）：
+真实数据结果（2026-10-25，110/110 canonical；完整报告见
+`docs/reports/full-coverage-analysis.md`）：
+
+| 指标 | legacy | Full Mean / Temporal Stats |
+| --- | --- | --- |
+| 片段/窗口总数 | 536（≤5/部） | **4130**（min 3 / mean 37.55 / max 214） |
+| 覆盖率 / 权重和 | — | 110/110；Σweight∈[0.99999992, 1.00000003] |
+| 事件扫描 | 无 | 110/110（`events_v1`） |
+| 每部耗时（均值） | 16.57s | 70.35s（extract 24.96 / events 7.53 / forward 22.45） |
+| 地图 | map_v008 | map_v011 / map_v012（当前默认） |
+
+- 邻域迁移：legacy×Full Mean 平均 Top5 Jaccard=0.4068（完全稳定 8/110，余弦 Pearson=0.9569）；
+  Full Mean×Temporal Jaccard=0.2049（稳定 0/110，Pearson=0.8294）；Legacy×Temporal Jaccard=0.1734；
+  即“完整覆盖”和“时间结构”都显著改变邻域，换空间后近邻结论不能直接沿用；
+- Temporal Stats 顺序敏感性：20 部反转顺序后 Full Mean cos_min≈1.0，Temporal cos_min=0.671；
+- 336p 实验（10 部）：work_joint cos min=0.9972 / mean=0.9986，video min=0.9772；
+  extract 2.26×、total 1.60× 加速，但视频分支向量会变，**仅作候选，不转正**；
+- 存储：全片序列约 187MB（事件约 131MB）+ representations 9.7MB；legacy 向量 8.4MB。
+
+1. 切换采样模式并编码全片序列（当前 `config.yaml` 默认已是 `full_coverage`，旧空间用
+   `--sampling legacy` 或直接加载旧地图）：
 
    ```powershell
    # 覆盖 config.sampling.mode，只处理本地视频前 3 部
@@ -531,13 +553,16 @@ PE-AV 仍是 16 帧稀疏采样，事件层补充节奏/运动信息，但**不�
 
 ### 界面使用
 
-- 侧栏：星云版本、2D/3D 切换、染色维度（含“高维近邻密度”）、按文件名/标题/BV 搜索、
-  点大小/透明度、数据集筛选（来源 / 榜单 / 年份）；
+- 侧栏：**表征空间切换（Legacy / Full Mean / Temporal Stats）**、星云版本、2D/3D 切换、
+  染色维度（含“高维近邻密度”）、按文件名/标题/BV 搜索、点大小/透明度、数据集筛选（来源 / 榜单 / 年份）；
+  默认打开最新总星云所在空间（当前 `map_v012`，Temporal Stats）；
 - 主图：Plotly 散点图，支持缩放、旋转、悬浮；点击点（或搜索 + 下拉选择）显示详情；
 - 详情：标题、BV/URL（可点击跳转 Bilibili）、时长、发布日期、作者、选票排名/得分、本地文件，
   以及三个模态的 Top5 近邻（余弦值 + 全库分位 + 双向）；2D 高亮近邻并连线，3D 可开关连线；
 - 近邻面板还含“枢纽作品（被最多作品列为 Top5）”与“片段级对应（整体 vs 局部片段）”两个折叠区；
-  片段热图默认关闭，勾选后按需加载片段向量；
+  片段热图默认关闭，勾选后按需加载片段向量；全片模式下片段更多（按窗口一一对应）；
+- 详情面板还有“完整时间轴（音画事件 + 片段窗口）”折叠区：音频/视频/音画关系事件包络、
+  窗口起点竖线、覆盖率与事件版本；缺事件数据时显示提示；
 - 3D 点击选择在部分浏览器/Plotly 版本下不可用，可用“搜索 + 下拉选择作品”的等价入口；
 - 无数据（尚未生成星云）时页面显示中文提示，而不是报错堆栈；筛选星云会标注
   “坐标仅在本版本内可比”。
@@ -619,9 +644,11 @@ PE-AV 仍是 16 帧稀疏采样，事件层补充节奏/运动信息，但**不�
 - `tests/test_invariants.py` 的 v0.4 不变量：模式切换与 legacy 公式、full 版本格式、
   不同表征/序列不混矩阵、地图绑定同序列代表征、旧地图坐标不被覆盖、重复 initialize/登记幂等；
 - QA 的 CLI 冒烟额外覆盖 `map.py variants`、`ingest.py link-local`、
-  `tools/clip_stability.py`、`tools/desync_experiment.py`、`tools/preflight_works.py`；
+  `tools/clip_stability.py`、`tools/desync_experiment.py`、`tools/preflight_works.py`，
   v0.4 新 CLI（`build_representation.py` / `compare_spaces.py` / `events_probe.py`）
-  由各自测试的 `--help` 与端到端用例覆盖。
+  也纳入 qa.py 的 `--help` 冒烟；
+- v0.4 最终门禁：`python qa.py --full` = PASS 5/5（2026-10-25；pytest 692 passed 含 model/network，
+  174.85s；docs/CLI/config 全过）。
 
 ## 常见问题
 
@@ -664,9 +691,12 @@ UMAP 是非线性降维，训练集变化会让整个布局重新排布：筛选
 的 Top-k 重合率、稳定对比例与余弦矩阵相关等指标，而不是直接看坐标。
 
 **切换到 full_coverage 会重新下载视频吗？**
-会。全片模式需要从视频开头到结尾的完整时间轴，Bilibili 作品必须重新下载（低分辨率格式）
-再编码；这是预期的，旧 5 片段向量与旧地图仍保留、不覆盖。只有从已保存序列构建
-Full Mean / Temporal Stats 表征时不需要重新下载或编码。
+`config.yaml` 现在默认已是 `full_coverage`。对尚未做全片编码的作品，需要从视频开头到
+结尾的完整时间轴，Bilibili 作品必须重新下载（低分辨率格式）再编码；这是预期的，旧 5 片段向量、
+legacy 表征与旧地图（如 `map_v008`）仍保留、不覆盖。只有从已保存序列构建 Full Mean /
+Temporal Stats 表征（`tools/build_representation.py`）时不需要重新下载或编码。
+若某个 Bilibili 下载接口在部分地区失败，下载层会尝试 playurl 回退（v0.4 新增），失败仍会
+写入可读原因而不是静默跳过。
 
 **做了身份关联后，旧的星云会变吗？**
 不会。星云是构建时的快照：关联之前生成的旧版本（如 P0 的 `map_v001`）保留当时的作品集合，
@@ -709,6 +739,9 @@ qa.py 已强制 UTF-8 输出；其他命令行建议使用 PowerShell 7，且
 | v0.2.x 解释/片段 | 近邻表出现“全库分位/双向”；枢纽表可渲染；片段热图与配对表 schema 正确且与手算余弦一致 | `streamlit run app.py`、`pytest -q tests/test_e2e.py -k "p1 or p2"` |
 | v0.2.x A6 实验 | 错位实验 JSON/CSV 生成，结论写入 ADR-0008，且未改动主向量/星云 | `tools/desync_experiment.py --limit 10` |
 | v0.2.x 扩量 | 89 部选票已导入；预检 JSON 给出建议 batch/skip/done；失败项可读 | `tools/preflight_works.py`、`pipeline.py status` |
+| v0.4 全片序列 | 110/110 canonical 完成；任意时刻覆盖、末尾锚定、权重和=1；事件三件套齐全 | `pipeline.py run-pending --sampling full_coverage`、`pipeline.py status` |
+| v0.4 表征/地图 | full_mean_v1 / temporal_stats_v1 全量构建；map_v011/map_v012=110，默认 map_v012 | `tools/build_representation.py list`、`map.py list` |
+| v0.4 空间对比 | 三组 compare JSON/CSV 生成；Top-k 重合/稳定对/余弦相关/hubness 数字可复现 | `tools/compare_spaces.py`、`docs/reports/full-coverage-analysis.md` |
 
 交付前至少确认：
 

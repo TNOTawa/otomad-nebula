@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -384,11 +385,21 @@ def test_resolve_representation_and_list_available(config, catalog):
 
 
 def test_resolve_legacy_by_default_sampling_mode(config, catalog):
-    _register_sequence(catalog, config.legacy_embedding_version, clips_per_work=5)
-    _add_legacy_vectors(catalog, config, version=config.legacy_embedding_version)
-    rep = R.resolve_representation(catalog, config)
+    # config.yaml 默认已切到 full_coverage；legacy 语义需显式构造 legacy 模式配置
+    legacy_config = replace(config, sampling=replace(config.sampling, mode="legacy"))
+    assert legacy_config.embedding_version == legacy_config.legacy_embedding_version
+    _register_sequence(catalog, legacy_config.legacy_embedding_version, clips_per_work=5)
+    _add_legacy_vectors(catalog, config, version=legacy_config.legacy_embedding_version)
+    rep = R.resolve_representation(catalog, legacy_config)
     assert rep["name"] == R.LEGACY_NAME
-    assert rep["sequence_version"] == config.legacy_embedding_version
+    assert rep["sequence_version"] == legacy_config.legacy_embedding_version
+
+    # 当前默认 full_coverage 下 name=None 解析 Full Mean（尚未构建 -> 明确报错，不回退 legacy）
+    assert config.sampling.mode == "full_coverage"
+    full_config = replace(config, sampling=replace(config.sampling, mode="full_coverage"))
+    assert full_config.embedding_version == full_config.full_sequence_version
+    with pytest.raises(NebulaError):
+        R.resolve_representation(catalog, full_config)
 
 
 # --------------------------------------------------------------------------- 构建 CLI
@@ -544,11 +555,16 @@ def test_build_skips_incomplete_and_non_assembled_sequences(config, catalog):
 
 def test_build_sequence_resolution_and_errors(config, catalog):
     _register_sequence(catalog)
+    _register_sequence(catalog, config.full_sequence_version, params={"sampling_mode": "full_coverage"})
     _register_sequence(
         catalog, config.legacy_embedding_version, clips_per_work=5, params={"legacy": True}
     )
     _add_work(catalog, config, name="a.mp4", seed=1)
+    # config.yaml 默认 sampling.mode=full_coverage -> auto 解析当前激活的 full 序列版本
+    assert config.sampling.mode == "full_coverage"
+    assert config.embedding_version == config.full_sequence_version
     assert build_cli.resolve_sequence_version(catalog, config, "auto") == config.embedding_version
+    assert build_cli.resolve_sequence_version(catalog, config, "full") == config.full_sequence_version
     assert build_cli.resolve_sequence_version(catalog, config, "legacy") == config.legacy_embedding_version
     with pytest.raises(NebulaError):
         build_cli.resolve_sequence_version(catalog, config, "missing-version")
@@ -563,10 +579,13 @@ def test_build_sequence_resolution_and_errors(config, catalog):
 
 
 def test_build_sequence_auto_resolves_legacy_version(config, catalog):
-    legacy = config.legacy_embedding_version
+    # 显式 legacy 模式下 auto 才解析 legacy；默认 full_coverage 下 auto 解析 full 序列版本
+    legacy_config = replace(config, sampling=replace(config.sampling, mode="legacy"))
+    legacy = legacy_config.legacy_embedding_version
+    assert legacy_config.embedding_version == legacy
     _register_sequence(catalog, legacy, clips_per_work=5, params={"legacy": True})
     work_id, joint, _ = _add_work(catalog, config, version=legacy, name="legacy.mp4", state=None, seed=1)
-    summary = build_cli.build_representation(catalog, config, name="full_mean", sequence="auto")
+    summary = build_cli.build_representation(catalog, legacy_config, name="full_mean", sequence="auto")
     assert summary["sequence_version"] == legacy
     assert summary["n_built"] == 1
     rep = _representation_row(catalog, R.FULL_MEAN_V1, legacy)

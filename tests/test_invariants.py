@@ -319,6 +319,7 @@ def _variant_version(
     *,
     model: dict | None = None,
     media: dict | None = None,
+    sampling: dict | None = None,
     umap: dict | None = None,
     app: dict | None = None,
 ) -> str:
@@ -326,6 +327,7 @@ def _variant_version(
         config,
         model=replace(config.model, **model) if model else config.model,
         media=replace(config.media, **media) if media else config.media,
+        sampling=replace(config.sampling, **sampling) if sampling else config.sampling,
         umap=replace(config.umap, **umap) if umap else config.umap,
         app=replace(config.app, **app) if app else config.app,
     )
@@ -333,9 +335,11 @@ def _variant_version(
 
 
 def test_embedding_version_tracks_model_and_sampling(config: Config) -> None:
-    """模型版本或任一采样参数变化时，向量版本必须变化（旧向量不被覆盖）。"""
+    """legacy 模式的模型/采样参数与 full 模式的窗口参数都进入版本号（旧向量不被覆盖）。"""
 
-    base = config.embedding_version
+    legacy = replace(config, sampling=replace(config.sampling, mode="legacy"))
+    full = replace(config, sampling=replace(config.sampling, mode="full_coverage"))
+    base = legacy.embedding_version
     variants = {
         "视频帧数": {"model": {"frames": config.model.frames + 8}},
         "片段长度": {"media": {"clip_seconds": config.media.clip_seconds / 2}},
@@ -343,12 +347,34 @@ def test_embedding_version_tracks_model_and_sampling(config: Config) -> None:
         "音频采样率": {"media": {"audio_sample_rate": 16000}},
         "模型版本标签": {"model": {"version": "peav-base-16f"}},
     }
-    seen = {base}
+    seen = {base, full.embedding_version}
+    assert base != full.embedding_version
     for label, kwargs in variants.items():
-        version = _variant_version(config, **kwargs)
-        assert version != base, f"{label} 变化后 embedding_version 未变: {version}"
-        assert version not in seen, f"{label} 变化后与已有版本重复: {version}"
+        version = _variant_version(legacy, **kwargs)
+        assert version != base, f"legacy {label} 变化后 embedding_version 未变: {version}"
+        assert version not in seen, f"legacy {label} 变化后与已有版本重复: {version}"
         seen.add(version)
+
+    full_base = full.embedding_version
+    full_variants = {
+        "视频帧数": {"model": {"frames": config.model.frames + 8}},
+        "窗口长度": {"media": {"clip_seconds": config.media.clip_seconds / 2}},
+        "窗口重叠": {"sampling": {"overlap_seconds": config.sampling.overlap_seconds + 0.5}},
+        "音频采样率": {"media": {"audio_sample_rate": 16000}},
+        "模型版本标签": {"model": {"version": "peav-base-16f"}},
+    }
+    for label, kwargs in full_variants.items():
+        version = _variant_version(full, **kwargs)
+        assert version != full_base, f"full {label} 变化后 embedding_version 未变: {version}"
+        assert version not in seen, f"full {label} 变化后与已有版本重复: {version}"
+        seen.add(version)
+
+    # 片段数只属于 legacy 公式；overlap 只属于 full 公式，互不影响
+    assert (
+        _variant_version(full, media={"clips_per_work": config.media.clips_per_work + 1})
+        == full_base
+    )
+    assert _variant_version(legacy, sampling={"overlap_seconds": 1.0}) == base
 
 
 def test_embedding_version_ignores_runtime_only_settings(config: Config) -> None:
@@ -372,14 +398,21 @@ def test_embedding_version_ignores_runtime_only_settings(config: Config) -> None
 
 
 def test_embedding_version_format_and_content(config: Config) -> None:
-    """版本号可读且包含模型标签与关键采样参数，便于人工核对。"""
+    """legacy 与 full 版本号都可读、含模型/采样参数且互不混淆，便于人工核对。"""
 
-    version = config.embedding_version
-    assert slugify(config.model.version) in version
-    assert f"f{config.model.frames}" in version.split("_")
-    assert f"x{config.media.clips_per_work}" in version
-    assert f"{config.media.audio_sample_rate // 1000}k" in version
-    assert " " not in version and "/" not in version
+    legacy = replace(config, sampling=replace(config.sampling, mode="legacy"))
+    full = replace(config, sampling=replace(config.sampling, mode="full_coverage"))
+    for label, changed in (("legacy", legacy), ("full", full)):
+        version = changed.embedding_version
+        assert slugify(config.model.version) in version, label
+        assert f"f{config.model.frames}" in version.split("_"), (label, version)
+        assert f"{config.media.audio_sample_rate // 1000}k" in version, label
+        assert " " not in version and "/" not in version, label
+    assert f"x{config.media.clips_per_work}" in legacy.embedding_version
+    assert f"_full{config.media.clip_seconds:g}s" in full.embedding_version
+    assert f"_ov{config.sampling.overlap_seconds:g}" in full.embedding_version
+    assert "full" not in legacy.embedding_version
+    assert f"x{config.media.clips_per_work}" not in full.embedding_version
 
 
 def test_embedding_version_reproducible(config: Config) -> None:
@@ -790,6 +823,8 @@ def _v04_create_representation(
 def test_sampling_mode_switch_changes_active_version_not_legacy_formula(config: Config) -> None:
     """sampling.mode 只切换“当前激活序列版本”；legacy 公式必须与旧版完全一致。"""
 
+    legacy = replace(config, sampling=replace(config.sampling, mode="legacy"))
+    full = replace(config, sampling=replace(config.sampling, mode="full_coverage"))
     expected_legacy = (
         f"{slugify(config.model.version)}"
         f"__f{config.model.frames}"
@@ -799,14 +834,18 @@ def test_sampling_mode_switch_changes_active_version_not_legacy_formula(config: 
     )
     if config.media.clip_height:
         expected_legacy += f"_h{int(config.media.clip_height)}"
-    assert config.sampling.mode == "legacy"
-    assert config.legacy_embedding_version == expected_legacy
-    assert config.embedding_version == expected_legacy
-
-    full = replace(config, sampling=replace(config.sampling, mode="full_coverage"))
+    assert legacy.sampling.mode == "legacy"
+    assert full.sampling.mode == "full_coverage"
+    # legacy 公式与 sampling.mode 完全无关：两种模式下都返回旧公式
+    assert legacy.legacy_embedding_version == expected_legacy
     assert full.legacy_embedding_version == expected_legacy
+    assert legacy.embedding_version == expected_legacy
+    assert legacy.embedding_version != full.embedding_version
+
+    # 默认配置（当前仓库默认已切到 full_coverage）也应解析为 full 序列版本
+    assert config.legacy_embedding_version == expected_legacy
+    assert config.embedding_version == full.full_sequence_version
     assert full.embedding_version == full.full_sequence_version
-    assert full.embedding_version != config.embedding_version
     assert "full" in full.embedding_version
     assert f"_ov{full.sampling.overlap_seconds:g}" in full.embedding_version
     assert f"x{config.media.clips_per_work}" not in full.full_sequence_version
