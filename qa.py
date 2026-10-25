@@ -9,7 +9,8 @@
 4. CLI 入口冒烟：ingest.py、pipeline.py、map.py 的 --help 均能成功运行；
 5. 配置有效性：config.yaml 可加载；可据此生成并加载一份临时隔离配置；ffmpeg/ffprobe 可用。
 
---full 额外运行带 model / network 标记的测试（需要 PE-AV 权重和网络）。
+--full 额外运行带 model / network 标记的测试（需要 PE-AV 权重和网络；
+       会为子进程设置 NEBULA_MODEL_TESTS=1 / NEBULA_NETWORK_TESTS=1）。
 
 用法::
 
@@ -31,6 +32,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -100,10 +102,12 @@ def find_ruff() -> Path | None:
     return Path(found) if found else None
 
 
-def _child_env() -> dict[str, str]:
+def _child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
+    if extra:
+        env.update(extra)
     return env
 
 
@@ -112,6 +116,7 @@ def run_command(
     *,
     timeout_s: float,
     cwd: Path = ROOT,
+    extra_env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """运行子进程并捕获文本输出（统一 UTF-8，避免 Windows 控制台乱码）。"""
 
@@ -123,7 +128,7 @@ def run_command(
         encoding="utf-8",
         errors="replace",
         timeout=timeout_s,
-        env=_child_env(),
+        env=_child_env(extra_env),
         check=False,
     )
 
@@ -190,12 +195,17 @@ def check_pytest(*, full: bool = False, verbose: bool = False) -> CheckResult:
     started = time.perf_counter()
     python = project_python()
     command: list[str | Path] = [python, "-m", "pytest", "tests"]
-    mode = "全部标记"
+    extra_env: dict[str, str] | None = None
+    mode = "全部标记（model/network 已启用）"
     if not full:
         command += ["-m", "not model and not network"]
         mode = "排除 model/network"
+    else:
+        # 默认离线测试用 skipif 守卫；完整模式需要显式打开这两个环境开关，
+        # 否则会“收集到但全部 skip”，门禁看似通过却未真正验证模型/网络。
+        extra_env = {"NEBULA_MODEL_TESTS": "1", "NEBULA_NETWORK_TESTS": "1"}
     try:
-        proc = run_command(command, timeout_s=COMMAND_TIMEOUT_S)
+        proc = run_command(command, timeout_s=COMMAND_TIMEOUT_S, extra_env=extra_env)
     except subprocess.TimeoutExpired:
         return CheckResult(
             "pytest",
