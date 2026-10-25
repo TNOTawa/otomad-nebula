@@ -22,7 +22,7 @@ from . import EMBEDDING_KINDS
 from .errors import DatabaseError
 from .util import normalize_relpath, now_utc_iso
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 STATUSES = ("pending", "downloading", "encoding", "completed", "failed")
 
@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS map_runs (
     version TEXT PRIMARY KEY,
     embedding_version TEXT NOT NULL REFERENCES embedding_versions(version),
     params_json TEXT NOT NULL,
+    filter_json TEXT,
     coords_path TEXT,
     model_2d_path TEXT,
     model_3d_path TEXT,
@@ -173,6 +174,53 @@ CREATE TABLE IF NOT EXISTS map_coords (
     z3 REAL,
     PRIMARY KEY (map_version, work_id)
 );
+
+-- 身份关联：同一作品可能既有本地视频、又有 Bilibili 条目。
+-- canonical_work_id 是保留在星云/展示中的实体；duplicate_work_id 是重复实体，
+-- 默认不进入星云（其向量与原始文件仍然保留）。
+CREATE TABLE IF NOT EXISTS work_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    duplicate_work_id INTEGER NOT NULL UNIQUE REFERENCES works(id) ON DELETE CASCADE,
+    method TEXT NOT NULL,
+    confidence REAL,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    CHECK (canonical_work_id != duplicate_work_id)
+);
+CREATE INDEX IF NOT EXISTS ix_work_links_canonical ON work_links(canonical_work_id);
+
+-- 流水线批次级指标（模型加载属于批次级）
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    embedding_version TEXT,
+    model_load_s REAL,
+    n_selected INTEGER NOT NULL DEFAULT 0,
+    n_completed INTEGER NOT NULL DEFAULT 0,
+    n_failed INTEGER NOT NULL DEFAULT 0,
+    total_s REAL,
+    params_json TEXT
+);
+
+-- 单部作品的分阶段耗时（A4）
+CREATE TABLE IF NOT EXISTS work_timings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER REFERENCES pipeline_runs(id) ON DELETE SET NULL,
+    work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    embedding_version TEXT NOT NULL,
+    download_s REAL NOT NULL DEFAULT 0,
+    probe_s REAL NOT NULL DEFAULT 0,
+    extract_s REAL NOT NULL DEFAULT 0,
+    preprocess_s REAL NOT NULL DEFAULT 0,
+    forward_s REAL NOT NULL DEFAULT 0,
+    save_s REAL NOT NULL DEFAULT 0,
+    total_s REAL NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE (run_id, work_id)
+);
+CREATE INDEX IF NOT EXISTS ix_work_timings_work ON work_timings(work_id, embedding_version);
 """
 
 
@@ -242,7 +290,7 @@ class Catalog:
             conn.execute("COMMIT")
 
     def initialize(self) -> None:
-        """建表并校验 schema 版本；可重复调用。"""
+        """建表并校验/迁移 schema 版本；可重复调用。"""
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = self.conn
@@ -254,11 +302,26 @@ class Catalog:
                     "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
                     (SCHEMA_VERSION,),
                 )
-            elif str(row["value"]) != SCHEMA_VERSION:
-                raise DatabaseError(
-                    f"数据库 schema 版本不匹配: 文件为 {row['value']}, 程序需要 {SCHEMA_VERSION}; "
-                    "请备份后重建或执行迁移"
-                )
+            else:
+                current = str(row["value"])
+                if current != SCHEMA_VERSION:
+                    self._migrate_schema(tx, current)
+
+    def _migrate_schema(self, conn: sqlite3.Connection, current: str) -> None:
+        """把旧版本数据库原地迁移到当前 schema 版本。只做向后兼容的加表/加列。"""
+
+        if current == "1":
+            columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(map_runs)")}
+            if "filter_json" not in columns:
+                conn.execute("ALTER TABLE map_runs ADD COLUMN filter_json TEXT")
+            conn.execute(
+                "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (SCHEMA_VERSION,)
+            )
+            return
+        raise DatabaseError(
+            f"数据库 schema 版本不兼容: 文件为 {current}, 程序需要 {SCHEMA_VERSION}; "
+            "请备份后重建或手工迁移"
+        )
 
     # ------------------------------------------------------------------ 作品
     def upsert_work(
@@ -838,6 +901,7 @@ class Catalog:
         model_2d_path: str | None = None,
         model_3d_path: str | None = None,
         note: str | None = None,
+        filter_spec: Mapping[str, Any] | None = None,
     ) -> None:
         """原子地登记一次星云生成：版本信息 + 全部坐标。"""
 
@@ -854,14 +918,19 @@ class Catalog:
             conn.execute(
                 """
                 INSERT INTO map_runs (
-                    version, embedding_version, params_json, coords_path,
+                    version, embedding_version, params_json, filter_json, coords_path,
                     model_2d_path, model_3d_path, n_works, status, note, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
                 """,
                 (
                     version,
                     embedding_version,
                     json.dumps(dict(params), sort_keys=True, ensure_ascii=False),
+                    (
+                        json.dumps(dict(filter_spec), sort_keys=True, ensure_ascii=False)
+                        if filter_spec is not None
+                        else None
+                    ),
                     coords_path,
                     model_2d_path,
                     model_3d_path,
@@ -929,6 +998,323 @@ class Catalog:
                 "UPDATE map_runs SET n_works = ? WHERE version = ?", (len(coords), version)
             )
 
+    # ------------------------------------------------------------------ 榜单作品查询
+    def list_works_for_list(
+        self, list_key: str, *, only_canonical: bool = True
+    ) -> list[dict[str, Any]]:
+        """按榜单出现记录返回作品（按排名、票数、work_id 排序）。
+
+        only_canonical=True 时排除 work_links 里的 duplicate 实体。
+        """
+
+        sql = """
+            SELECT w.*, a.rank AS list_rank, a.votes AS list_votes,
+                   a.note AS list_note, l.list_key AS list_key,
+                   l.name AS list_name, l.vote_year AS list_vote_year
+            FROM works w
+            JOIN appearances a ON a.work_id = w.id
+            JOIN lists l ON l.id = a.list_id
+            WHERE l.list_key = ?
+        """
+        if only_canonical:
+            sql += " AND w.id NOT IN (SELECT duplicate_work_id FROM work_links)"
+        sql += " ORDER BY COALESCE(a.rank, 999999), COALESCE(a.votes, -1) DESC, w.id"
+        return _as_dicts(self.conn.execute(sql, (str(list_key),)).fetchall())
+
+    def work_ids_for_list(self, list_key: str, *, only_canonical: bool = True) -> set[int]:
+        sql = """
+            SELECT DISTINCT w.id AS work_id
+            FROM works w
+            JOIN appearances a ON a.work_id = w.id
+            JOIN lists l ON l.id = a.list_id
+            WHERE l.list_key = ?
+        """
+        if only_canonical:
+            sql += " AND w.id NOT IN (SELECT duplicate_work_id FROM work_links)"
+        return {
+            int(row["work_id"]) for row in self.conn.execute(sql, (str(list_key),)).fetchall()
+        }
+
+    def work_ids_for_vote_year(self, vote_year: int, *, only_canonical: bool = True) -> set[int]:
+        sql = """
+            SELECT DISTINCT w.id AS work_id
+            FROM works w
+            JOIN appearances a ON a.work_id = w.id
+            JOIN lists l ON l.id = a.list_id
+            WHERE l.vote_year = ?
+        """
+        if only_canonical:
+            sql += " AND w.id NOT IN (SELECT duplicate_work_id FROM work_links)"
+        return {
+            int(row["work_id"])
+            for row in self.conn.execute(sql, (int(vote_year),)).fetchall()
+        }
+
+    # ------------------------------------------------------------------ 身份关联
+    def link_works(
+        self,
+        canonical_work_id: int,
+        duplicate_work_id: int,
+        *,
+        method: str,
+        confidence: float | None = None,
+        note: str | None = None,
+    ) -> int:
+        """把 duplicate 关联到 canonical（同一作品的双重身份）。
+
+        canonical 是保留在星云/展示中的实体；duplicate 默认不进入星云。
+        每个 duplicate 只能属于一个 canonical；canonical 自身不能是 duplicate。
+        返回 link id。
+        """
+
+        canonical = int(canonical_work_id)
+        duplicate = int(duplicate_work_id)
+        if canonical == duplicate:
+            raise DatabaseError("canonical 与 duplicate 不能是同一作品")
+        if not method or not str(method).strip():
+            raise DatabaseError("身份关联必须说明 method")
+        if confidence is not None and not 0.0 <= float(confidence) <= 1.0:
+            raise DatabaseError("confidence 必须在 0..1")
+        now = now_utc_iso()
+        with self.transaction() as conn:
+            for work_id in (canonical, duplicate):
+                if conn.execute("SELECT 1 FROM works WHERE id = ?", (work_id,)).fetchone() is None:
+                    raise DatabaseError(f"作品不存在: {work_id}")
+            if conn.execute(
+                "SELECT 1 FROM work_links WHERE duplicate_work_id = ?", (canonical,)
+            ).fetchone():
+                raise DatabaseError(f"canonical 作品本身已被关联为重复实体: {canonical}")
+            if conn.execute(
+                "SELECT 1 FROM work_links WHERE duplicate_work_id = ?", (duplicate,)
+            ).fetchone():
+                raise DatabaseError(f"作品已有身份关联: {duplicate}")
+            cur = conn.execute(
+                """
+                INSERT INTO work_links (
+                    canonical_work_id, duplicate_work_id, method, confidence, note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (canonical, duplicate, str(method), confidence, note, now),
+            )
+            self._event(
+                conn,
+                duplicate,
+                "linked",
+                json.dumps(
+                    {"canonical_work_id": canonical, "method": method},
+                    ensure_ascii=False,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def unlink_work(self, duplicate_work_id: int, *, reason: str | None = None) -> str:
+        """解除一条身份关联（保留两个作品），返回原 canonical id。"""
+
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT canonical_work_id FROM work_links WHERE duplicate_work_id = ?",
+                (int(duplicate_work_id),),
+            ).fetchone()
+            if row is None:
+                raise DatabaseError(f"作品没有身份关联: {duplicate_work_id}")
+            canonical = int(row["canonical_work_id"])
+            conn.execute(
+                "DELETE FROM work_links WHERE duplicate_work_id = ?", (int(duplicate_work_id),)
+            )
+            self._event(
+                conn,
+                int(duplicate_work_id),
+                "unlinked",
+                f"canonical={canonical}" + (f" | {reason}" if reason else ""),
+            )
+            return canonical
+
+    def get_work_links(self) -> list[dict[str, Any]]:
+        return _as_dicts(
+            self.conn.execute("SELECT * FROM work_links ORDER BY id").fetchall()
+        )
+
+    def get_work_link(self, work_id: int) -> dict[str, Any] | None:
+        """返回 work_id 参与的身份关联（canonical 或 duplicate 均适用）。"""
+
+        return _as_dict(self.conn.execute(
+            """
+            SELECT * FROM work_links
+            WHERE canonical_work_id = ? OR duplicate_work_id = ?
+            ORDER BY id LIMIT 1
+            """,
+            (int(work_id), int(work_id)),
+        ).fetchone())
+
+    def get_canonical_work_id(self, work_id: int) -> int:
+        """若 work_id 是 duplicate，返回其 canonical id；否则原样返回。"""
+
+        row = self.conn.execute(
+            "SELECT canonical_work_id FROM work_links WHERE duplicate_work_id = ?",
+            (int(work_id),),
+        ).fetchone()
+        return int(row["canonical_work_id"]) if row is not None else int(work_id)
+
+    def get_duplicate_work_ids(self) -> set[int]:
+        rows = self.conn.execute("SELECT duplicate_work_id FROM work_links").fetchall()
+        return {int(row["duplicate_work_id"]) for row in rows}
+
+    def get_linked_duplicates(self, canonical_work_id: int) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT w.*, l.method AS link_method, l.confidence AS link_confidence,
+                   l.note AS link_note
+            FROM work_links l
+            JOIN works w ON w.id = l.duplicate_work_id
+            WHERE l.canonical_work_id = ?
+            ORDER BY l.id
+            """,
+            (int(canonical_work_id),),
+        ).fetchall()
+        return _as_dicts(rows)
+
+    # ------------------------------------------------------------------ 流水线批次与耗时
+    def start_pipeline_run(
+        self,
+        *,
+        embedding_version: str | None = None,
+        params: Mapping[str, Any] | None = None,
+    ) -> int:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO pipeline_runs (
+                    started_at, embedding_version, params_json
+                ) VALUES (?, ?, ?)
+                """,
+                (
+                    now_utc_iso(),
+                    embedding_version,
+                    json.dumps(dict(params), sort_keys=True, ensure_ascii=False)
+                    if params is not None
+                    else None,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def finish_pipeline_run(
+        self,
+        run_id: int,
+        *,
+        n_selected: int,
+        n_completed: int,
+        n_failed: int,
+        total_s: float,
+        model_load_s: float | None = None,
+    ) -> None:
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE pipeline_runs SET
+                    finished_at = ?, n_selected = ?, n_completed = ?, n_failed = ?,
+                    total_s = ?, model_load_s = ?
+                WHERE id = ?
+                """,
+                (
+                    now_utc_iso(),
+                    int(n_selected),
+                    int(n_completed),
+                    int(n_failed),
+                    float(total_s),
+                    None if model_load_s is None else float(model_load_s),
+                    int(run_id),
+                ),
+            )
+            if cur.rowcount == 0:
+                raise DatabaseError(f"流水线批次不存在: {run_id}")
+
+    def record_work_timing(
+        self,
+        run_id: int | None,
+        work_id: int,
+        *,
+        embedding_version: str,
+        download_s: float = 0.0,
+        probe_s: float = 0.0,
+        extract_s: float = 0.0,
+        preprocess_s: float = 0.0,
+        forward_s: float = 0.0,
+        save_s: float = 0.0,
+        total_s: float = 0.0,
+    ) -> None:
+        for name, value in (
+            ("download_s", download_s),
+            ("probe_s", probe_s),
+            ("extract_s", extract_s),
+            ("preprocess_s", preprocess_s),
+            ("forward_s", forward_s),
+            ("save_s", save_s),
+            ("total_s", total_s),
+        ):
+            if not (float(value) >= 0.0):
+                raise DatabaseError(f"耗时不能为负: {name}={value}")
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO work_timings (
+                    run_id, work_id, embedding_version, download_s, probe_s, extract_s,
+                    preprocess_s, forward_s, save_s, total_s, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, work_id) DO UPDATE SET
+                    embedding_version = excluded.embedding_version,
+                    download_s = excluded.download_s,
+                    probe_s = excluded.probe_s,
+                    extract_s = excluded.extract_s,
+                    preprocess_s = excluded.preprocess_s,
+                    forward_s = excluded.forward_s,
+                    save_s = excluded.save_s,
+                    total_s = excluded.total_s,
+                    created_at = excluded.created_at
+                """,
+                (
+                    None if run_id is None else int(run_id),
+                    int(work_id),
+                    str(embedding_version),
+                    float(download_s),
+                    float(probe_s),
+                    float(extract_s),
+                    float(preprocess_s),
+                    float(forward_s),
+                    float(save_s),
+                    float(total_s),
+                    now_utc_iso(),
+                ),
+            )
+
+    def list_work_timings(
+        self,
+        *,
+        run_id: int | None = None,
+        embedding_version: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM work_timings"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(int(run_id))
+        if embedding_version is not None:
+            clauses.append("embedding_version = ?")
+            params.append(str(embedding_version))
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY work_id"
+        return _as_dicts(self.conn.execute(sql, params).fetchall())
+
+    def list_pipeline_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        if limit < 1:
+            raise DatabaseError("limit 必须 >= 1")
+        return _as_dicts(
+            self.conn.execute(
+                "SELECT * FROM pipeline_runs ORDER BY id DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        )
+
     # ------------------------------------------------------------------ 统计
     def stats(self) -> dict[str, Any]:
         try:
@@ -941,6 +1327,9 @@ class Catalog:
             ).fetchall()
             map_rows = self.conn.execute("SELECT COUNT(*) AS n FROM map_runs").fetchone()
             list_rows = self.conn.execute("SELECT COUNT(*) AS n FROM lists").fetchone()
+            link_rows = self.conn.execute("SELECT COUNT(*) AS n FROM work_links").fetchone()
+            run_rows = self.conn.execute("SELECT COUNT(*) AS n FROM pipeline_runs").fetchone()
+            timing_rows = self.conn.execute("SELECT COUNT(*) AS n FROM work_timings").fetchone()
         except sqlite3.OperationalError:
             # 尚未 initialize
             return {"status": status, "tables_ready": False}
@@ -954,4 +1343,7 @@ class Catalog:
             },
             "maps": int(map_rows["n"]) if map_rows else 0,
             "lists": int(list_rows["n"]) if list_rows else 0,
+            "links": int(link_rows["n"]) if link_rows else 0,
+            "pipeline_runs": int(run_rows["n"]) if run_rows else 0,
+            "timings": int(timing_rows["n"]) if timing_rows else 0,
         }

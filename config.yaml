@@ -48,7 +48,8 @@ umap:
   dimensions: [2, 3]        # 分别训练二维与三维投影
 
 download:
-  yt_dlp_format: "bv*[height<=480]+ba/b[height<=480]/b"
+  # 优先 <=480p（横屏按 height、竖屏按 width），都取不到时回退到最佳可用格式
+  yt_dlp_format: "bv*[height<=480]+ba/bv*[width<=480]+ba/bv*+ba/b"
   max_height: 480           # 编码只需要低分辨率，避免保存原始大文件
   cookies_file: null
   proxy: null

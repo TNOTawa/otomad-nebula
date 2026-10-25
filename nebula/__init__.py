@@ -14,7 +14,7 @@
 - nebula.appdata   可视化用纯数据准备（染色、搜索、跳转链接）
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # 向量种类：作品级与片段级各保存联合/音频/视频三类
 WORK_VECTOR_KINDS = ("work_joint", "work_audio", "work_video")

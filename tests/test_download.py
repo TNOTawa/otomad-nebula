@@ -26,6 +26,8 @@ NETWORK_ENABLED = os.environ.get("NEBULA_NETWORK_TESTS") == "1"
 VALID_BVID = "BV1xx411c7mD"  # 形状合法；解析测试用，不联网时不会真的访问
 OTHER_BVID = "BV1234567890"
 REAL_BVID = "BV1xx411c7mD"  # 真实网络冒烟测试用的公开 BV 号（仅获取元数据）
+# B1 回归真实案例：【NICE爷爷】My story 是多分P视频（整部 356s，P1/P2 各 178s）。
+REAL_MULTIPART_BVID = "BV1dAVYziE5X"
 
 
 # ---------------------------------------------------------------- 假对象
@@ -139,6 +141,21 @@ def _meta_payload(**data_updates: Any) -> dict[str, Any]:
     return {"code": 0, "message": "0", "data": data}
 
 
+def _multipart_payload() -> dict[str, Any]:
+    """多分P视频响应：整部总时长 356s，两个分P各 178s（B1 真实 bug 形态）。"""
+
+    payload = _meta_payload()
+    data = payload["data"]
+    data["title"] = "多分P作品"
+    data["duration"] = 356
+    data["videos"] = 2
+    data["pages"] = [
+        {"cid": 111, "page": 1, "duration": 178, "part": "my story V2-"},
+        {"cid": 222, "page": 2, "duration": 178, "part": "老版本"},
+    ]
+    return payload
+
+
 # ---------------------------------------------------------------- BV 号校验
 
 
@@ -191,6 +208,63 @@ def test_fetch_meta_second_part_uses_page_duration(config) -> None:
     meta = BilibiliClient(config.bilibili, session=session).fetch_meta(VALID_BVID, part=2)
     assert meta.duration_s == 42.0
     assert meta.page_count == 2
+
+
+@pytest.mark.parametrize(
+    ("part", "expected_part_title"),
+    [(1, "my story V2-"), (2, "老版本")],
+)
+def test_fetch_meta_multipart_uses_page_duration(
+    config, part: int, expected_part_title: str
+) -> None:
+    """回归：多分P视频必须取该分P时长，而不是 data["duration"] 整部总时长。"""
+
+    session = FakeSession(FakeResponse(payload=_multipart_payload()))
+    meta = BilibiliClient(config.bilibili, session=session).fetch_meta(VALID_BVID, part=part)
+
+    assert meta.duration_s == pytest.approx(178.0)
+    assert meta.page_count == 2
+    assert meta.title == "多分P作品"  # 整部标题保留
+    assert meta.part_title == expected_part_title
+
+
+def test_fetch_meta_multipart_without_pages_falls_back_to_total(config) -> None:
+    payload = _multipart_payload()
+    payload["data"]["pages"] = []
+    session = FakeSession(FakeResponse(payload=payload))
+    meta = BilibiliClient(config.bilibili, session=session).fetch_meta(VALID_BVID)
+    assert meta.duration_s == pytest.approx(356.0)
+    assert meta.page_count == 1
+    assert meta.part_title is None
+
+
+def test_fetch_meta_multipart_invalid_page_duration_falls_back(config) -> None:
+    payload = _multipart_payload()
+    payload["data"]["pages"][0]["duration"] = 0
+    session = FakeSession(FakeResponse(payload=payload))
+    meta = BilibiliClient(config.bilibili, session=session).fetch_meta(VALID_BVID, part=1)
+    assert meta.duration_s == pytest.approx(356.0)
+
+
+def test_fetch_meta_multipart_part_out_of_range(config) -> None:
+    session = FakeSession(FakeResponse(payload=_multipart_payload()))
+    with pytest.raises(DownloadError, match="分P 超出范围"):
+        BilibiliClient(config.bilibili, session=session).fetch_meta(VALID_BVID, part=3)
+
+
+def test_fetch_meta_single_page_uses_page_duration(config) -> None:
+    """pages 只有一个且时长与总时长不同时，也以该分P时长为准。"""
+
+    payload = _meta_payload()
+    payload["data"]["duration"] = 999
+    payload["data"]["pages"] = [
+        {"cid": 1, "page": 1, "duration": 321, "part": "正片"},
+    ]
+    session = FakeSession(FakeResponse(payload=payload))
+    meta = BilibiliClient(config.bilibili, session=session).fetch_meta(VALID_BVID)
+    assert meta.duration_s == pytest.approx(321.0)
+    assert meta.page_count == 1
+    assert meta.part_title == "正片"
 
 
 def test_fetch_meta_api_code_error(config) -> None:
@@ -560,3 +634,22 @@ def test_fetch_meta_real_bilibili(config) -> None:
     assert meta.duration_s > 0
     assert meta.page_count >= 1
     assert meta.author_name is not None
+
+
+@pytest.mark.network
+@pytest.mark.skipif(
+    not NETWORK_ENABLED,
+    reason="网络测试默认跳过；设置 NEBULA_NETWORK_TESTS=1 后运行",
+)
+def test_fetch_meta_real_multipart_uses_part_duration(config) -> None:
+    """B1 真实回归：多分P视频的每个分P时长必须远小于整部总时长。
+
+    【NICE爷爷】My story 整部 356s、两个分P各约 178s；修复前 part=1 会错误返回 356s。
+    """
+
+    with BilibiliClient(config.bilibili) as client:
+        meta = client.fetch_meta(REAL_MULTIPART_BVID, part=1)
+    assert meta.bvid == REAL_MULTIPART_BVID
+    assert meta.page_count >= 2
+    assert meta.duration_s < 250  # 分P时长，而不是整部总时长（约 356）
+    assert meta.part_title is not None

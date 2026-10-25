@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,29 @@ def test_parse_votes_csv_column_variants(tmp_path: Path, header: str) -> None:
         author_uid="10001",
         note="备注内容",
     )
+
+
+@pytest.mark.parametrize("header", ["作品标题", "title", "标题"])
+def test_parse_votes_csv_title_aliases(tmp_path: Path, header: str) -> None:
+    path = _write_csv(
+        tmp_path / "votes.csv",
+        f"bvid,{header}\n"
+        "BV1demo00001,作品甲\n",
+    )
+    row = parse_votes_csv(path, vote_year=2025)[0]
+    assert row.title == "作品甲"
+
+
+def test_parse_votes_csv_multiline_title_stripped(tmp_path: Path) -> None:
+    path = _write_csv(
+        tmp_path / "votes.csv",
+        "BV号,排名,票数,作品标题\n"
+        'BV1demo00001,1,10,"多行标题\n\n"\n'
+        "BV1demo00002,2,9,  普通标题  \n",
+    )
+    rows = parse_votes_csv(path, vote_year=2025)
+    assert rows[0].title == "多行标题"
+    assert rows[1].title == "普通标题"
 
 
 def test_parse_votes_csv_bom_encoding(tmp_path: Path) -> None:
@@ -335,6 +359,38 @@ def test_import_votes_csv_empty_data_raises(config, catalog: Catalog, tmp_path: 
     assert catalog.list_lists() == []
 
 
+def test_import_votes_csv_writes_title_and_honours_limit(
+    config, catalog: Catalog, tmp_path: Path
+) -> None:
+    path = _write_csv(
+        tmp_path / "votes.csv",
+        "BV号,排名,票数,作品标题\n"
+        "BV1demo00001,1,10,作品甲\n"
+        "BV1demo00002,2,9,作品乙\n"
+        "BV1demo00003,3,8,作品丙\n",
+    )
+    summary = import_votes_csv(catalog, config, path, vote_year=2025, limit=2)
+    assert summary.works_created == 2
+    assert summary.appearances == 2
+    assert catalog.get_work_by_bvid("BV1demo00001")["title"] == "作品甲"
+    assert catalog.get_work_by_bvid("BV1demo00003") is None
+
+    again = import_votes_csv(catalog, config, path, vote_year=2025)
+    assert again.works_created == 1
+    assert again.works_existing == 2
+    assert again.appearances == 3
+    assert catalog.get_work_by_bvid("BV1demo00003")["title"] == "作品丙"
+
+
+@pytest.mark.parametrize("limit", [0, -1, True])
+def test_import_votes_csv_invalid_limit(
+    config, catalog: Catalog, tmp_path: Path, limit
+) -> None:
+    path = _votes_csv(tmp_path / "votes.csv", "BV1demo00001,1\n")
+    with pytest.raises(IngestError, match="数量上限"):
+        import_votes_csv(catalog, config, path, vote_year=2025, limit=limit)
+
+
 def test_import_votes_csv_custom_name(config, catalog: Catalog, tmp_path: Path) -> None:
     path = _votes_csv(tmp_path / "votes.csv", "BV1demo00001,1\n")
     import_votes_csv(catalog, config, path, vote_year=2024, list_name="2024 年度精选")
@@ -500,6 +556,32 @@ def test_example_votes_file_is_parseable(repo_root: Path) -> None:
         assert row.votes is not None and row.votes >= 0
 
 
+def test_parse_real_votes_csv_89_rows(repo_root: Path) -> None:
+    """迭代 B1 真实选票 CSV：89 行全部解析、无丢行、标题 strip 正确。"""
+
+    path = repo_root / "input" / "lists" / "zuozhe_votes_2025.csv"
+    if not path.is_file():
+        pytest.skip("真实选票 CSV 不存在（属于本地运行数据，不随仓库分发）")
+    rows = parse_votes_csv(path, vote_year=2025)
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        raw_rows = list(csv.DictReader(handle))
+
+    assert len(raw_rows) == 89
+    assert len(rows) == 89
+    assert len({row.bvid for row in rows}) == 89
+    for parsed, source in zip(rows, raw_rows, strict=True):
+        assert parsed.bvid == source["BV号"].strip()
+        assert BVID_RE.fullmatch(parsed.bvid)
+        assert parsed.part == 1
+        assert parsed.rank is not None and parsed.rank >= 0
+        assert parsed.votes is not None and parsed.votes >= 0
+        assert parsed.title == (source["作品标题"] or "").strip()
+        assert parsed.title  # 真实数据每行都有标题
+        assert parsed.title == parsed.title.strip()
+    assert rows[0].title == "Slow Dance w/u"
+    assert rows[-1].title == "孩又"
+
+
 def test_example_votes_file_can_be_imported(config, catalog: Catalog, repo_root: Path) -> None:
     path = repo_root / "input" / "lists" / "votes_2025.example.csv"
     summary = import_votes_csv(catalog, config, path, vote_year=2025)
@@ -539,6 +621,35 @@ def test_cli_import_votes(config, tmp_path: Path, capsys: pytest.CaptureFixture[
         cat.initialize()
         assert len(cat.list_lists()) == 1
         assert len(cat.list_works(source="bilibili")) == 1
+
+
+def test_cli_import_votes_limit(
+    config, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _write_csv(
+        tmp_path / "votes.csv",
+        "BV号,排名,票数,作品标题\n"
+        "BV1demo00001,1,10,作品甲\n"
+        "BV1demo00002,2,9,作品乙\n"
+        "BV1demo00003,3,8,作品丙\n",
+    )
+    rc = ingest_main(
+        [
+            "--config",
+            str(config.path),
+            "import-votes",
+            str(path),
+            "--year",
+            "2025",
+            "--limit",
+            "2",
+        ]
+    )
+    assert rc == 0
+    assert "作品 2 个" in capsys.readouterr().out
+    with Catalog(config.paths.db_path) as cat:
+        cat.initialize()
+        assert len(cat.list_works(source="bilibili")) == 2
 
 
 def test_cli_import_weekly_bvids(config, capsys: pytest.CaptureFixture[str]) -> None:

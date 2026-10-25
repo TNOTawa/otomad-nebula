@@ -259,3 +259,129 @@ def test_stats(catalog: Catalog):
     assert stats["works_total"] == 1
     assert stats["status"]["failed"] == 1
     assert stats["maps"] == 0
+
+def test_schema_v2_migration_adds_filter_json(tmp_path):
+    from nebula.db import SCHEMA_VERSION
+
+    db_path = tmp_path / "migrate.sqlite"
+    first = Catalog(db_path)
+    first.initialize()
+    first.conn.execute("ALTER TABLE map_runs DROP COLUMN filter_json")
+    first.conn.execute("UPDATE schema_meta SET value = '1' WHERE key = 'schema_version'")
+    first.close()
+
+    migrated = Catalog(db_path)
+    migrated.initialize()
+    columns = {row["name"] for row in migrated.conn.execute("PRAGMA table_info(map_runs)")}
+    assert "filter_json" in columns
+    version = migrated.conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+    ).fetchone()["value"]
+    assert version == SCHEMA_VERSION
+    tables = {
+        row[0]
+        for row in migrated.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    for name in ("work_links", "pipeline_runs", "work_timings"):
+        assert name in tables
+    migrated.close()
+
+
+def test_work_links(catalog):
+    local_id, _ = catalog.upsert_local_work("x/a.mp4")
+    bili_id, _ = catalog.upsert_bilibili_work("BV1xx411c7mD")
+    link_id = catalog.link_works(bili_id, local_id, method="title+duration", confidence=0.98)
+    assert link_id > 0
+    assert catalog.get_duplicate_work_ids() == {local_id}
+    assert catalog.get_canonical_work_id(local_id) == bili_id
+    assert catalog.get_canonical_work_id(bili_id) == bili_id
+    link = catalog.get_work_link(local_id)
+    assert link["canonical_work_id"] == bili_id
+    duplicates = catalog.get_linked_duplicates(bili_id)
+    assert [row["id"] for row in duplicates] == [local_id]
+    assert duplicates[0]["link_method"] == "title+duration"
+    assert len(catalog.get_work_links()) == 1
+    with pytest.raises(DatabaseError):
+        catalog.link_works(bili_id, local_id, method="again")
+    with pytest.raises(DatabaseError):
+        catalog.link_works(local_id, local_id, method="self")
+    with pytest.raises(DatabaseError):
+        catalog.link_works(9999, bili_id, method="missing")
+    with pytest.raises(DatabaseError):
+        catalog.link_works(local_id, bili_id, method="canonical_is_duplicate")
+    assert catalog.unlink_work(local_id) == bili_id
+    assert catalog.get_duplicate_work_ids() == set()
+    with pytest.raises(DatabaseError):
+        catalog.unlink_work(local_id)
+
+
+def test_pipeline_runs_and_timings(catalog):
+    run_id = catalog.start_pipeline_run(embedding_version="v1", params={"note": "test"})
+    work_id, _ = catalog.upsert_local_work("v.mp4")
+    catalog.record_work_timing(
+        run_id,
+        work_id,
+        embedding_version="v1",
+        probe_s=0.1,
+        extract_s=1.2,
+        preprocess_s=2.0,
+        forward_s=3.0,
+        save_s=0.2,
+        total_s=6.5,
+    )
+    catalog.record_work_timing(
+        run_id,
+        work_id,
+        embedding_version="v1",
+        extract_s=1.0,
+        total_s=6.3,
+    )
+    timings = catalog.list_work_timings(run_id=run_id)
+    assert len(timings) == 1
+    assert timings[0]["total_s"] == 6.3
+    with pytest.raises(DatabaseError):
+        catalog.record_work_timing(run_id, work_id, embedding_version="v1", total_s=-1)
+    catalog.finish_pipeline_run(
+        run_id, n_selected=1, n_completed=1, n_failed=0, total_s=6.5, model_load_s=25.0
+    )
+    runs = catalog.list_pipeline_runs()
+    assert runs[0]["model_load_s"] == 25.0
+    assert runs[0]["finished_at"]
+    assert runs[0]["n_completed"] == 1
+    with pytest.raises(DatabaseError):
+        catalog.finish_pipeline_run(
+            9999, n_selected=0, n_completed=0, n_failed=0, total_s=0
+        )
+    stats = catalog.stats()
+    assert stats["pipeline_runs"] == 1
+    assert stats["timings"] == 1
+
+
+def test_map_run_filter_spec(catalog):
+    catalog.register_embedding_version(
+        "v1",
+        model_checkpoint="c",
+        model_revision=None,
+        frames=16,
+        clip_seconds=8.0,
+        clips_per_work=5,
+        audio_sample_rate=48000,
+        params={},
+    )
+    work_id, _ = catalog.upsert_local_work("a.mp4")
+    catalog.create_map_run(
+        "map_v001",
+        embedding_version="v1",
+        params={"n_neighbors": 8},
+        coords=[(work_id, 0.0, 0.0, 0.0, 0.0, 0.0)],
+        filter_spec={"list_key": "votes_2025", "n_neighbors": 8},
+    )
+    run = catalog.get_map("map_v001")
+    assert "votes_2025" in run["filter_json"]
+    catalog.create_map_run(
+        "map_v002",
+        embedding_version="v1",
+        params={"n_neighbors": 15},
+        coords=[(work_id, 0.0, 0.0, 0.0, 0.0, 0.0)],
+    )
+    assert catalog.get_map("map_v002")["filter_json"] is None

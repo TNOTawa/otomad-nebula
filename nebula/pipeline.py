@@ -16,13 +16,14 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -103,6 +104,7 @@ class Pipeline:
         self.allow_test_embedder = allow_test_embedder
         self._version: str | None = None
         self._bilibili_client: Any | None = None
+        self._run_id: int | None = None
         self.sync_reports: list[dict[str, Any]] = []
         self._sync_budget = 0
 
@@ -183,8 +185,10 @@ class Pipeline:
         limit: int | None = None,
         retry_failed: bool = True,
         verify_sync: int = 0,
+        list_key: str | None = None,
+        list_limit: int | None = None,
     ) -> PipelineStats:
-        """处理指定来源中尚未完成的全部作品。
+        """处理尚未完成的作品。
 
         参数
         ----
@@ -192,26 +196,39 @@ class Pipeline:
         limit: 最多处理多少部（用于试跑）
         retry_failed: 是否重试 failed 作品
         verify_sync: 对前 N 部作品抽查抽出的音画片段时长是否一致（P0 同步检查）
+        list_key: 只处理某个榜单（如 votes_2025）中的作品，按榜单排名排序
+        list_limit: 结合 list_key，只取榜单前 N 条（先截取再过滤已完成）
         """
 
         if source not in (None, "local", "bilibili"):
             raise PipelineError(f"未知来源: {source}")
         if limit is not None and limit < 1:
             raise PipelineError("limit 必须 >= 1")
-        self._sync_budget = max(0, int(verify_sync))
-        self.sync_reports = []
+        if list_limit is not None and list_limit < 1:
+            raise PipelineError("list_limit 必须 >= 1")
         version = self._ensure_version()
         works = self._select_works(
-            version=version, source=source, limit=limit, retry_failed=retry_failed
+            version=version,
+            source=source,
+            limit=limit,
+            retry_failed=retry_failed,
+            list_key=list_key,
+            list_limit=list_limit,
         )
-        stats = PipelineStats(selected=len(works))
-        logger.info("候选作品 %d 部（向量版本 %s）", len(works), version)
-        for index, work in enumerate(works, start=1):
-            logger.info("[%d/%d] 处理 work_id=%s (%s)", index, len(works), work["id"], work["source"])
-            stats.outcomes.append(self._process_work(work, version=version))
-        if self.sync_reports:
-            self._write_sync_report()
-        return stats
+        embedder = self.embedder
+        params = {
+            "source": source,
+            "limit": limit,
+            "retry_failed": retry_failed,
+            "verify_sync": verify_sync,
+            "list_key": list_key,
+            "list_limit": list_limit,
+            "embedder": type(embedder).__name__,
+            "is_test_only": bool(getattr(embedder, "is_test_only", False)),
+        }
+        return self._execute_batch(
+            works, version=version, params=params, verify_sync=verify_sync
+        )
 
     def retry_works(self, work_ids: Sequence[int]) -> PipelineStats:
         """把指定作品重置为 pending 后立即重新处理（单部/批量重试入口）。
@@ -223,7 +240,7 @@ class Pipeline:
         if not work_ids:
             raise PipelineError("请至少提供一个 work_id")
         version = self._ensure_version()
-        stats = PipelineStats(selected=len(work_ids))
+        works: list[dict[str, Any]] = []
         for work_id in work_ids:
             work = self.catalog.get_work(int(work_id))
             if work is None:
@@ -231,8 +248,100 @@ class Pipeline:
             self.catalog.reopen(int(work_id), reason="按用户要求重试")
             refreshed = self.catalog.get_work(int(work_id))
             assert refreshed is not None
-            stats.outcomes.append(self._process_work(refreshed, version=version))
+            works.append(refreshed)
+        return self._execute_batch(
+            works,
+            version=version,
+            params={"mode": "retry", "work_ids": [int(w) for w in work_ids]},
+            verify_sync=0,
+        )
+
+    def _execute_batch(
+        self,
+        works: Sequence[dict[str, Any]],
+        *,
+        version: str,
+        params: Mapping[str, Any],
+        verify_sync: int = 0,
+    ) -> PipelineStats:
+        """执行一个批次：登记 pipeline_runs、逐部处理、写分阶段耗时与汇总。"""
+
+        self._sync_budget = max(0, int(verify_sync))
+        self.sync_reports = []
+        stats = PipelineStats(selected=len(works))
+        run_id = self.catalog.start_pipeline_run(embedding_version=version, params=params)
+        self._run_id = run_id
+        batch_started = time.monotonic()
+        logger.info("批次 run_id=%s 开始：候选 %d 部（向量版本 %s）", run_id, len(works), version)
+        try:
+            for index, work in enumerate(works, start=1):
+                logger.info(
+                    "[%d/%d] 处理 work_id=%s (%s)",
+                    index,
+                    len(works),
+                    work["id"],
+                    work["source"],
+                )
+                stats.outcomes.append(
+                    self._process_work(work, version=version, run_id=run_id)
+                )
+        finally:
+            total_s = time.monotonic() - batch_started
+            model_load_s = (
+                float(getattr(self._embedder, "model_load_s", 0.0) or 0.0)
+                if self._embedder is not None
+                else 0.0
+            )
+            self.catalog.finish_pipeline_run(
+                run_id,
+                n_selected=len(works),
+                n_completed=stats.completed,
+                n_failed=stats.failed,
+                total_s=total_s,
+                model_load_s=model_load_s,
+            )
+            perf_path = self._write_perf_csv(run_id)
+            self._run_id = None
+            logger.info(
+                "批次 run_id=%s 结束：完成 %d 失败 %d，总耗时 %.2fs，模型加载 %.2fs，"
+                "分阶段耗时 %s",
+                run_id,
+                stats.completed,
+                stats.failed,
+                total_s,
+                model_load_s,
+                perf_path,
+            )
+        if self.sync_reports:
+            self._write_sync_report()
         return stats
+
+    def _write_perf_csv(self, run_id: int) -> Path | None:
+        """把当前批次的单部分阶段耗时写成 CSV（A4）；无数据时返回 None。"""
+
+        rows = self.catalog.list_work_timings(run_id=run_id)
+        if not rows:
+            return None
+        path = self.config.paths.logs / f"perf_{run_id:03d}.csv"
+        columns = [
+            "run_id",
+            "work_id",
+            "embedding_version",
+            "download_s",
+            "probe_s",
+            "extract_s",
+            "preprocess_s",
+            "forward_s",
+            "save_s",
+            "total_s",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({name: row.get(name) for name in columns})
+        logger.info("分阶段耗时写入 %s（%d 行）", path, len(rows))
+        return path
 
     def status(self) -> dict[str, Any]:
         stats = self.catalog.stats()
@@ -299,10 +408,24 @@ class Pipeline:
         source: str | None,
         limit: int | None,
         retry_failed: bool,
+        list_key: str | None = None,
+        list_limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        if list_key is not None:
+            candidates = self.catalog.list_works_for_list(list_key)
+            if list_limit is not None:
+                candidates = candidates[:list_limit]
+        else:
+            candidates = self.catalog.list_works(source=source)
+        duplicates = self.catalog.get_duplicate_work_ids()
         selected: list[dict[str, Any]] = []
-        for work in self.catalog.list_works(source=source):
+        for work in candidates:
             work_id = int(work["id"])
+            if work_id in duplicates:
+                # 重复实体默认不处理；canonical 已有向量时会被直接跳过
+                continue
+            if source is not None and work["source"] != source:
+                continue
             if self.catalog.has_embedding(work_id, version=version):
                 status = str(work["status"])
                 if status in ("downloading", "encoding"):
@@ -323,11 +446,21 @@ class Pipeline:
         return selected
 
     # ------------------------------------------------------------------ 处理单部
-    def _process_work(self, work: dict[str, Any], *, version: str) -> WorkOutcome:
+    def _process_work(
+        self, work: dict[str, Any], *, version: str, run_id: int | None = None
+    ) -> WorkOutcome:
         work_id = int(work["id"])
         started = time.monotonic()
         temp_dir = self.config.paths.temp / f"work_{work_id:06d}"
         outcome = WorkOutcome(work_id=work_id, status="failed")
+        timing: dict[str, float] = {
+            "download_s": 0.0,
+            "probe_s": 0.0,
+            "extract_s": 0.0,
+            "preprocess_s": 0.0,
+            "forward_s": 0.0,
+            "save_s": 0.0,
+        }
         try:
             if str(work["status"]) in ("completed", "downloading", "encoding"):
                 self.catalog.reopen(
@@ -341,16 +474,20 @@ class Pipeline:
                     raise PipelineError(f"本地视频不存在: {source_path}")
                 self.catalog.begin_attempt(work_id, "encoding")
             elif work["source"] == "bilibili":
+                download_started = time.monotonic()
                 source_path = self._download_bilibili_work(work, temp_dir)
+                timing["download_s"] = time.monotonic() - download_started
                 self.catalog.begin_attempt(work_id, "encoding")
             else:
                 raise PipelineError(f"未知作品来源: {work['source']}")
 
+            probe_started = time.monotonic()
             info = probe_media(
                 source_path,
                 ffprobe=self.config.media.ffprobe,
                 timeout_s=self.config.media.probe_timeout_seconds,
             )
+            timing["probe_s"] = time.monotonic() - probe_started
             if not info.has_video:
                 raise MediaError(f"作品没有视频流，无法提取音画向量: {source_path}")
             self.catalog.update_work_metadata(
@@ -367,9 +504,18 @@ class Pipeline:
             )
             clip_dir = temp_dir / "clips"
             clip_dir.mkdir(parents=True, exist_ok=True)
+            extract_started = time.monotonic()
             extracted = [
-                extract_clip(source_path, plan, clip_dir, media=self.config.media) for plan in plans
+                extract_clip(
+                    source_path,
+                    plan,
+                    clip_dir,
+                    media=self.config.media,
+                    info=info,
+                )
+                for plan in plans
             ]
+            timing["extract_s"] = time.monotonic() - extract_started
             if self._sync_budget > 0:
                 self._record_sync_checks(work_id, extracted)
                 self._sync_budget -= 1
@@ -377,7 +523,10 @@ class Pipeline:
             batch = self.embedder.encode_pairs(
                 [(clip.video_path, clip.audio_path) for clip in extracted]
             )
+            timing["preprocess_s"] = float(getattr(batch, "preprocess_s", 0.0) or 0.0)
+            timing["forward_s"] = float(getattr(batch, "forward_s", 0.0) or 0.0)
             self._validate_batch(batch, expected=len(extracted))
+            save_started = time.monotonic()
             work_dir = self.config.paths.embeddings / version / f"{work_id:06d}"
             work_dir.mkdir(parents=True, exist_ok=True)
             saved = self._save_vectors(work_dir, batch)
@@ -390,6 +539,7 @@ class Pipeline:
             )
             self._register_vectors(work_id, version=version, saved=saved, n_clips=len(extracted))
             self.catalog.complete(work_id)
+            timing["save_s"] = time.monotonic() - save_started
             outcome = WorkOutcome(
                 work_id=work_id,
                 status="completed",
@@ -407,6 +557,19 @@ class Pipeline:
             except DatabaseError:  # pragma: no cover - 编目本身异常
                 logger.exception("记录失败状态时出错 work_id=%s", work_id)
             outcome = WorkOutcome(work_id=work_id, status="failed", message=message)
+        finally:
+            total_s = time.monotonic() - started
+            if run_id is not None:
+                try:
+                    self.catalog.record_work_timing(
+                        run_id,
+                        work_id,
+                        embedding_version=version,
+                        total_s=total_s,
+                        **timing,
+                    )
+                except DatabaseError:  # pragma: no cover - 计时记录失败不影响主流程
+                    logger.exception("记录分阶段耗时失败 work_id=%s", work_id)
         outcome.elapsed_s = round(time.monotonic() - started, 3)
         return outcome
 

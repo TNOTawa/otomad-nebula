@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -143,6 +144,20 @@ def test_hash_embedder_close_is_idempotent():
     embedder = HashTestEmbedder()
     embedder.close()
     embedder.close()
+
+
+def test_embedding_batch_timing_defaults():
+    """A4：计时字段默认为 0.0，旧调用方不传也不会破坏。"""
+
+    batch = EmbeddingBatch(joint=np.zeros((2, 4), dtype=np.float32))
+    assert batch.preprocess_s == 0.0
+    assert batch.forward_s == 0.0
+
+
+def test_hash_embedder_reports_zero_timings(media_files: tuple[Path, Path]):
+    batch = HashTestEmbedder().encode_pairs([media_files])
+    assert batch.preprocess_s == 0.0
+    assert batch.forward_s == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +322,19 @@ def test_peav_embedder_empty_pairs_raises_without_loading(repo_root: Path):
         embedder.close()
 
 
+def test_peav_embedder_model_load_s_zero_before_load(repo_root: Path):
+    """A4：未加载时 model_load_s 为 0.0，close 后同样回到 0.0。"""
+
+    config = load_config(repo_root / "config.yaml")
+    embedder = PEAVEmbedder(config.model)
+    try:
+        assert embedder.model_load_s == 0.0
+        embedder.close()
+        assert embedder.model_load_s == 0.0
+    finally:
+        embedder.close()
+
+
 def test_peav_embedder_missing_files_raise_without_loading(tmp_path: Path, repo_root: Path):
     config = load_config(repo_root / "config.yaml")
     embedder = PEAVEmbedder(config.model)
@@ -369,6 +397,15 @@ def test_peav_real_batch_shapes_and_norms(sample_video: Path, tmp_path: Path, re
         norms = np.linalg.norm(array, axis=1)
         print(f"[peav] {name}: shape={array.shape} dtype={array.dtype} norms={norms.tolist()}")
         assert np.allclose(norms, 1.0, atol=1e-4), (name, norms)
+
+    # A4 计时：真实模型必须给出正的预处理 / 前向 / 加载耗时
+    print(
+        f"[peav] timing: model_load_s={peav_embedder.model_load_s:.2f} "
+        f"preprocess_s={batch.preprocess_s:.2f} forward_s={batch.forward_s:.2f}"
+    )
+    assert peav_embedder.model_load_s > 0.0
+    assert batch.preprocess_s > 0.0
+    assert batch.forward_s > 0.0
 
 
 @pytest.mark.model
@@ -450,3 +487,69 @@ def test_peav_real_ablation_muted_and_black_change_joint(
     # 联合向量同时受两个模态影响：任一消融都应造成明显下降
     assert joint_muted < 0.99, f"静音后联合向量几乎不变（cos={joint_muted:.4f}）"
     assert joint_black < 0.99, f"纯黑后联合向量几乎不变（cos={joint_black:.4f}）"
+
+
+@pytest.mark.model
+@pytest.mark.skipif(not MODEL_TESTS_ENABLED, reason=MODEL_SKIP_REASON)
+def test_peav_real_noaudio_mp4_matches_mp4_with_audio(
+    sample_video: Path, tmp_path: Path, repo_root: Path, peav_embedder: PEAVEmbedder
+):
+    """A5：临时 mp4 去掉 AAC 音轨后，PE-AV 编码结果必须与带音轨的旧做法一致。"""
+
+    config = load_config(repo_root / "config.yaml")
+    info = probe_media(sample_video, ffprobe=config.media.ffprobe)
+    plan = plan_clips(info.duration_s, clip_seconds=4.0, clips_per_work=2)[0]
+    clip = extract_clip(sample_video, plan, tmp_path / "clips", media=config.media, info=info)
+
+    new_style = probe_media(clip.video_path, ffprobe=config.media.ffprobe)
+    assert new_style.has_audio is False, "A5 之后临时 mp4 应只含视频轨"
+
+    # 造一个“旧做法”的带 AAC 音轨 mp4：视频流直接复制，音轨从 wav 重新编码
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("缺少 ffmpeg")
+    old_style_path = tmp_path / "with_audio.mp4"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(clip.video_path),
+            "-i",
+            str(clip.audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            str(old_style_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    assert probe_media(old_style_path, ffprobe=config.media.ffprobe).has_audio is True
+
+    new_batch = peav_embedder.encode_pairs([(clip.video_path, clip.audio_path)])
+    old_batch = peav_embedder.encode_pairs([(old_style_path, clip.audio_path)])
+
+    tolerance = 5e-3 if getattr(peav_embedder, "_use_autocast", False) else 1e-5
+    for name in ("joint", "audio", "video"):
+        new_array = getattr(new_batch, name)[0]
+        old_array = getattr(old_batch, name)[0]
+        cosine = float(np.dot(new_array, old_array))
+        max_diff = float(np.abs(new_array - old_array).max())
+        print(
+            f"[peav] A5 无音轨mp4 vs 带音轨mp4 {name}: "
+            f"cosine={cosine:.8f} max_abs_diff={max_diff:.3e}"
+        )
+        assert cosine >= 0.9999, (name, cosine)
+        assert max_diff <= tolerance, (name, max_diff)

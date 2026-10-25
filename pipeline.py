@@ -3,8 +3,10 @@
 只暴露方案文档要求的简单操作：
 
   python pipeline.py process-local        处理 input/local 下的本地视频（P0）
-  python pipeline.py run-pending          继续处理尚未完成的作品（可限定来源）
+  python pipeline.py run-pending          继续处理尚未完成的作品（可限定来源/榜单）
+                                           例: run-pending --source bilibili --list-key votes_2025 --list-limit 30
   python pipeline.py retry 12 34          单独重试指定 work_id
+  python pipeline.py timings              查看最近批次的单部分阶段耗时（A4）
   python pipeline.py ablate --limit 3     P0 音画消融排查实验
   python pipeline.py status               查看作品/向量/星云状态
   python pipeline.py clean-temp           清理失败残留的临时目录
@@ -46,6 +48,15 @@ def build_parser() -> argparse.ArgumentParser:
     pending.add_argument(
         "--source", choices=["all", "local", "bilibili"], default="all", help="限定作品来源"
     )
+    pending.add_argument(
+        "--list-key", default=None, help="只处理某个榜单中的作品（如 votes_2025），按排名排序"
+    )
+    pending.add_argument(
+        "--list-limit",
+        type=int,
+        default=None,
+        help="配合 --list-key：只取榜单前 N 条（先截取再过滤已完成）",
+    )
     pending.add_argument("--no-retry-failed", action="store_true", help="不重试 failed 作品")
     pending.add_argument(
         "--test-embedder", action="store_true", help="使用测试用 HashTestEmbedder（仅调试）"
@@ -65,6 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
     ablate.add_argument(
         "--test-embedder", action="store_true", help="使用测试用 HashTestEmbedder（仅调试）"
     )
+
+    timings = sub.add_parser("timings", help="查看分阶段耗时（A4，读取数据库）")
+    timings.add_argument("--run-id", type=int, default=None, help="批次 ID（默认最近一批）")
+    timings.add_argument("--limit-runs", type=int, default=5, help="列出最近多少个批次")
 
     sub.add_parser("status", help="查看作品、向量与星云状态")
     sub.add_parser("clean-temp", help="清空 temp 下流水线临时目录")
@@ -134,6 +149,8 @@ def main(argv: list[str] | None = None) -> int:
                     source=None if args.source == "all" else args.source,
                     limit=args.limit,
                     retry_failed=not args.no_retry_failed,
+                    list_key=args.list_key,
+                    list_limit=args.list_limit,
                 )
                 print(stats.summary())
                 _print_failures(stats)
@@ -161,13 +178,53 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"报告: {config.paths.logs / 'ablation_report.json'}")
                 return 0 if all("error" not in item for item in results) else 1
 
+        if args.command == "timings":
+            from nebula.db import Catalog
+
+            catalog = Catalog(config.paths.db_path)
+            catalog.initialize()
+            try:
+                runs = catalog.list_pipeline_runs(limit=args.limit_runs)
+                print("最近流水线批次:")
+                for run in runs:
+                    total = run["total_s"]
+                    print(
+                        f"  run_id={run['id']} version={run['embedding_version']} "
+                        f"selected={run['n_selected']} completed={run['n_completed']} "
+                        f"failed={run['n_failed']} model_load_s={run['model_load_s']} "
+                        f"total_s={None if total is None else round(total, 2)}"
+                    )
+                run_id = args.run_id
+                if run_id is None and runs:
+                    run_id = int(runs[0]["id"])
+                if run_id is not None:
+                    rows = catalog.list_work_timings(run_id=run_id)
+                    print(f"\nrun_id={run_id} 单部分阶段耗时（{len(rows)} 行）:")
+                    print(
+                        "work_id  total_s  download   probe  extract  preprocess  forward  save"
+                    )
+                    for row in rows:
+                        print(
+                            f"{row['work_id']:>7}  {row['total_s']:>7.2f}  "
+                            f"{row['download_s']:>8.2f}  {row['probe_s']:>6.2f}  "
+                            f"{row['extract_s']:>7.2f}  {row['preprocess_s']:>10.2f}  "
+                            f"{row['forward_s']:>7.2f}  {row['save_s']:>4.2f}"
+                        )
+                return 0
+            finally:
+                catalog.close()
+
         if args.command == "status":
-            with _make_pipeline(config, test_embedder=args.test_embedder) as pipeline:
+            with _make_pipeline(
+                config, test_embedder=getattr(args, "test_embedder", False)
+            ) as pipeline:
                 print(json.dumps(pipeline.status(), ensure_ascii=False, indent=2))
                 return 0
 
         if args.command == "clean-temp":
-            with _make_pipeline(config, test_embedder=args.test_embedder) as pipeline:
+            with _make_pipeline(
+                config, test_embedder=getattr(args, "test_embedder", False)
+            ) as pipeline:
                 removed = pipeline.clean_temp()
                 print(f"已清理 {removed} 个临时条目")
                 return 0

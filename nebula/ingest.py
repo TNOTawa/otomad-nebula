@@ -1,10 +1,13 @@
-"""数据导入：本地视频扫描、选票 CSV、周报 BV 列表。
+"""数据导入：本地视频扫描、选票 CSV、周报 BV 列表、本地/BV 身份关联。
 
-接口见 docs/CONTRACTS.md 第 8 节。设计要点：
+接口见 docs/CONTRACTS.md 第 8 节与 docs/CONTRACTS_V2.md 第 5 节。设计要点：
 
 - 本地作品以"相对 input_local 的 POSIX 路径"作为稳定 work_key，重复扫描幂等；
-- 选票 CSV 使用 utf-8-sig 编码，列名中英文兼容，非法行报错时带文件行号；
+- 选票 CSV 使用 utf-8-sig 编码，列名中英文兼容（含中文列 作品标题），
+  支持多行引号标题；非法行报错时带文件行号，重复 (bvid, part) 后者覆盖；
 - 周报导入只负责"提取 BV 号 + 建立榜单/出现记录"，元数据与视频由流水线补齐；
+- link-local 子命令复用 nebula.identity：规范化标题 + 时长双重校验建立
+  local->bilibili 身份关联，并把本地已有向量复制登记到 canonical 作品；
 - 所有可预期错误抛 IngestError（中文提示），CLI 顶层统一转换为退出码。
 
 库代码只用 logging，不 print；只有 CLI 的 main() 打印中文摘要。
@@ -17,6 +20,7 @@ import csv
 import logging
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -25,6 +29,14 @@ from .config import Config, load_config
 from .db import Catalog
 from .download import BVID_PATTERN, BVID_RE, http_get_text
 from .errors import DownloadError, IngestError, NebulaError
+from .identity import (
+    MANUAL_LINKS_FILENAME,
+    IdentityCandidate,
+    candidates_from_manual_links,
+    find_candidates,
+    link_candidates,
+    load_manual_links,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +51,7 @@ _VOTES_COLUMNS: dict[str, tuple[str, ...]] = {
     "votes": ("votes", "得票数", "票数"),
     "author_uid": ("author_uid", "uid", "up主uid"),
     "note": ("note", "备注"),
+    "title": ("title", "作品标题", "标题"),
 }
 
 # 从任意文本中提取 BV 号：前后不能紧邻数字/字母，避免匹配更长的字母数字串。
@@ -129,7 +142,11 @@ def register_local_videos(cat: Catalog, cfg: Config) -> LocalScanSummary:
 
 @dataclass(frozen=True)
 class VotesRow:
-    """选票 CSV 中的一行（一个作品）。"""
+    """选票 CSV 中的一行（一个作品）。
+
+    title 是新增字段（迭代 B1）：真实选票 CSV 带"作品标题"列，导入时写入
+    Bilibili 作品记录，供身份关联的标题预筛使用；旧 CSV 没有该列时为 None。
+    """
 
     bvid: str
     part: int = 1
@@ -137,6 +154,7 @@ class VotesRow:
     votes: int | None = None
     author_uid: str | None = None
     note: str | None = None
+    title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -241,8 +259,9 @@ def parse_votes_csv(path: str | Path, *, vote_year: int) -> list[VotesRow]:
     规则
     ----
     - 编码 utf-8-sig（自动去掉 BOM），逗号分隔，以 # 开头的行是注释；
-    - 必须列 bvid（兼容 BV号 / BV）；可选列 part/rank/votes/author_uid/note，
-      中文列名兼容 分P、排名、得票数/票数、UID/UP主UID、备注；
+    - 必须列 bvid（兼容 BV号 / BV）；可选列 part/rank/votes/author_uid/note/title，
+      中文列名兼容 分P、排名、得票数/票数、UID/UP主UID、备注、作品标题；
+      多行引号标题由 csv 模块正确处理，标题会 strip 掉换行与首尾空白；
     - bvid 必须匹配 BV + 10 位数字/字母；数字列必须是整数；
     - part >= 1，rank/votes >= 0；同 (bvid, part) 重复行由后者覆盖前者；
     - 非法数据抛 IngestError，消息带文件行号（表头为第 1 行起算的物理行号）。
@@ -287,6 +306,7 @@ def parse_votes_csv(path: str | Path, *, vote_year: int) -> list[VotesRow]:
                 votes=votes,
                 author_uid=_optional_text(cells.get("author_uid", "")),
                 note=_optional_text(cells.get("note", "")),
+                title=_optional_text(cells.get("title", "")),
             )
     except UnicodeDecodeError as exc:
         raise IngestError(
@@ -318,8 +338,15 @@ def import_votes_csv(
     *,
     vote_year: int,
     list_name: str | None = None,
+    limit: int | None = None,
 ) -> ImportSummary:
     """导入某一年选票 CSV：登记作品、生成 votes_<年份> 榜单与出现记录。
+
+    参数
+    ----
+    limit:
+        只导入 CSV 顺序的前 limit 个作品（去重后）；None 表示全部。
+        迭代 B 试运行时用于"只导入前 30 部"。
 
     同一 CSV 重复导入幂等（作品按 (bvid, part) 去重、出现记录按榜单 upsert）。
     """
@@ -328,6 +355,12 @@ def import_votes_csv(
     rows = parse_votes_csv(csv_path, vote_year=vote_year)
     if not rows:
         raise IngestError(f"选票 CSV 没有有效数据行: {csv_path}")
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise IngestError(f"导入数量上限必须 >= 1: {limit!r}")
+        if len(rows) > limit:
+            LOGGER.info("按 --limit=%d 截断选票 CSV（共 %d 行）", limit, len(rows))
+            rows = rows[:limit]
 
     list_key = f"votes_{vote_year}"
     name = (list_name or f"{vote_year}年音MAD选票").strip()
@@ -346,6 +379,7 @@ def import_votes_csv(
         work_id, is_new = cat.upsert_bilibili_work(
             row.bvid,
             part=row.part,
+            title=row.title,
             author_uid=row.author_uid,
         )
         if is_new:
@@ -550,7 +584,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser = argparse.ArgumentParser(
         prog="ingest.py",
-        description="音MAD星云计划 · 数据导入（本地视频 / 选票 CSV / 周报）",
+        description="音MAD星云计划 · 数据导入（本地视频 / 选票 CSV / 周报 / 身份关联）",
         parents=[common],
     )
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="子命令")
@@ -576,7 +610,41 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="榜单显示名（默认“<年份>年音MAD选票”）",
     )
+    votes.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="只导入 CSV 顺序的前 N 个作品（迭代 B 试运行用；默认全部）",
+    )
     votes.set_defaults(handler=_cmd_import_votes)
+
+    link = subparsers.add_parser(
+        "link-local",
+        parents=[common],
+        help="把本地作品关联到榜单里的 Bilibili 作品（标题 + 时长双重校验）",
+        description=(
+            "在指定榜单的 Bilibili 作品与全部本地作品之间查找身份关联："
+            "标题规范化后完全相等且时长差 <= 3s 才自动关联，"
+            "并把本地已有向量复制登记到 canonical 作品。"
+        ),
+    )
+    link.add_argument("--list-key", default="votes_2025", help="榜单键（默认 votes_2025）")
+    link.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只打印候选表，不建立关联、不复制向量",
+    )
+    link.add_argument(
+        "--no-copy",
+        action="store_true",
+        help="只建立身份关联，不复制本地向量",
+    )
+    link.add_argument(
+        "--manual",
+        action="store_true",
+        help=f"读取 input/lists/{MANUAL_LINKS_FILENAME} 手动覆盖清单",
+    )
+    link.set_defaults(handler=_cmd_link_local)
 
     weekly = subparsers.add_parser(
         "import-weekly",
@@ -611,6 +679,7 @@ def _cmd_import_votes(cat: Catalog, cfg: Config, args: argparse.Namespace) -> in
         args.csv,
         vote_year=args.year,
         list_name=args.name,
+        limit=args.limit,
     )
     print(f"选票导入完成：{args.year} 年，榜单 ID {summary.list_id}")
     print(
@@ -618,6 +687,148 @@ def _cmd_import_votes(cat: Catalog, cfg: Config, args: argparse.Namespace) -> in
         f"（新建 {summary.works_created}，已存在 {summary.works_existing}），"
         f"出现记录 {summary.appearances} 条，BV 号 {summary.bvid_count} 个"
     )
+    return 0
+
+
+# link-local 候选表：列名与显示宽度（中文按 2 列宽计算）
+_CANDIDATE_COLUMNS: tuple[tuple[str, int], ...] = (
+    ("本地ID", 7),
+    ("本地标题", 22),
+    ("本地时长", 9),
+    ("B站ID", 7),
+    ("BV号", 13),
+    ("B站标题", 22),
+    ("B站时长", 9),
+    ("时长差", 8),
+    ("判定", 6),
+)
+
+
+def _text_width(text: str) -> int:
+    """计算字符串的终端显示宽度（中文/全角字符按 2 列）。"""
+
+    return sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text)
+
+
+def _fit_text(text: str, width: int) -> str:
+    """把文本截断并补齐到指定显示宽度（超长时以省略号结尾）。"""
+
+    value = str(text)
+    if _text_width(value) > width:
+        kept: list[str] = []
+        used = 0
+        for char in value:
+            char_width = 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+            if used + char_width > width - 1:
+                break
+            kept.append(char)
+            used += char_width
+        value = "".join(kept) + "…"
+    return value + " " * max(0, width - _text_width(value))
+
+
+def _format_seconds(value: float | None) -> str:
+    return "-" if value is None else f"{value:.1f}s"
+
+
+def _print_candidate_table(cat: Catalog, candidates: Sequence[IdentityCandidate]) -> None:
+    """打印身份关联候选表；随后逐条打印判定说明。"""
+
+    header = "  ".join(_fit_text(name, width) for name, width in _CANDIDATE_COLUMNS)
+    print(header)
+    print("  ".join("-" * width for _, width in _CANDIDATE_COLUMNS))
+    for candidate in candidates:
+        bilibili_work = cat.get_work(candidate.bilibili_work_id) or {}
+        bvid = str(bilibili_work.get("bvid") or "-")
+        diff = "-"
+        if candidate.local_duration_s is not None and candidate.bilibili_duration_s is not None:
+            diff = f"{abs(candidate.local_duration_s - candidate.bilibili_duration_s):.1f}s"
+        cells = (
+            f"#{candidate.local_work_id}",
+            candidate.local_title,
+            _format_seconds(candidate.local_duration_s),
+            f"#{candidate.bilibili_work_id}",
+            bvid,
+            candidate.bilibili_title,
+            _format_seconds(candidate.bilibili_duration_s),
+            diff,
+            "接受" if candidate.accepted else "拒绝",
+        )
+        print(
+            "  ".join(
+                _fit_text(cell, column_width)
+                for cell, (_, column_width) in zip(
+                    cells, _CANDIDATE_COLUMNS, strict=True
+                )
+            )
+        )
+    print()
+    for candidate in candidates:
+        verdict = "接受" if candidate.accepted else "拒绝"
+        print(
+            f"  {verdict} local#{candidate.local_work_id} <-> "
+            f"bilibili#{candidate.bilibili_work_id}: {candidate.reason}"
+        )
+
+
+def _cmd_link_local(cat: Catalog, cfg: Config, args: argparse.Namespace) -> int:
+    list_key = str(args.list_key)
+    auto_candidates = find_candidates(cat, cfg, list_key=list_key)
+
+    manual_candidates: list[IdentityCandidate] = []
+    if args.manual:
+        manual_path = cfg.paths.input_lists / MANUAL_LINKS_FILENAME
+        if not manual_path.is_file():
+            raise IngestError(
+                f"手动关联清单不存在: {manual_path}；"
+                f"可复制示例文件 local_bv_links.example.csv 后改为真实值"
+            )
+        links = load_manual_links(cat, cfg)
+        if not links:
+            raise IngestError(f"手动关联清单没有有效数据行: {manual_path}")
+        manual_candidates = candidates_from_manual_links(cat, links)
+
+    manual_local_ids = {candidate.local_work_id for candidate in manual_candidates}
+    manual_bilibili_ids = {candidate.bilibili_work_id for candidate in manual_candidates}
+    auto_candidates = [
+        candidate
+        for candidate in auto_candidates
+        if candidate.local_work_id not in manual_local_ids
+        and candidate.bilibili_work_id not in manual_bilibili_ids
+    ]
+    candidates = manual_candidates + auto_candidates
+    accepted = [candidate for candidate in candidates if candidate.accepted]
+
+    print(
+        f"榜单 {list_key}：候选 {len(candidates)} 条"
+        f"（手动 {len(manual_candidates)} 条），接受 {len(accepted)} 条，"
+        f"拒绝 {len(candidates) - len(accepted)} 条"
+    )
+    if candidates:
+        _print_candidate_table(cat, candidates)
+    else:
+        print("  未找到标题规范化后完全相等的候选（可用 --manual 手动指定关联）。")
+
+    if args.dry_run:
+        print("dry-run：未建立身份关联、未复制向量；确认无误后去掉 --dry-run 再执行。")
+        return 0
+
+    result = link_candidates(
+        cat,
+        cfg,
+        candidates=accepted,
+        copy_vectors=not args.no_copy,
+    )
+    copy_note = "关" if args.no_copy else "开"
+    print(
+        f"身份关联完成：关联 {result['linked']} 条，复制向量 {result['copied']} 条"
+        f"（向量版本 {result['version']}，复制开关 {copy_note}）"
+    )
+    for item in result["skipped"]:
+        print(
+            f"  跳过 local#{item['local_work_id']} <-> "
+            f"bilibili#{item['bilibili_work_id']}: {item['reason']}"
+        )
     return 0
 
 

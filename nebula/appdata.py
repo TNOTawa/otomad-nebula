@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import html
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
@@ -26,9 +26,13 @@ from .config import Config
 from .db import Catalog
 from .errors import MapError
 
+if TYPE_CHECKING:  # 仅类型提示；appdata 运行期不依赖近邻模块，保持纯数据层轻量
+    from .similarity import SimilarityIndex
+
 #: 有序的染色字段列表：(字段 id, 中文标签)
 COLOR_FIELDS: list[tuple[str, str]] = [
     ("none", "不染色/密度"),
+    ("density_knn", "高维近邻密度"),
     ("duration_s", "视频时长"),
     ("publish_date", "发布日期"),
     ("rank", "选票排名"),
@@ -39,6 +43,8 @@ COLOR_FIELDS: list[tuple[str, str]] = [
 ]
 
 _CONTINUOUS_FIELDS = frozenset({"duration_s", "publish_date", "rank", "votes"})
+_NEIGHBOR_DENSITY_FIELD = "density_knn"
+_NEIGHBOR_DENSITY_K = 5
 _CATEGORICAL_FIELDS = frozenset({"author_uid", "vote_year", "source"})
 _ALL_FIELD_IDS = frozenset(field_id for field_id, _ in COLOR_FIELDS)
 
@@ -104,7 +110,10 @@ _FRAME_COLUMNS = [
     "votes",
     "vote_year",
     "vote_years",
+    "list_keys",
     "list_names",
+    "local_file",
+    "is_canonical",
     "search_text",
     "hover_text",
 ]
@@ -118,6 +127,7 @@ _SEARCH_COLUMNS = (
     "author_name",
     "author_uid",
     "local_path",
+    "local_file",
     "list_names",
 )
 
@@ -223,7 +233,11 @@ def _summarize_appearances(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
     years = sorted({int(row["vote_year"]) for row in rows if row.get("vote_year") is not None})
     list_names: list[str] = []
+    list_keys: list[str] = []
     for row in rows:
+        key = row.get("list_key")
+        if key and str(key) not in list_keys:
+            list_keys.append(str(key))
         name = row.get("list_name") or row.get("list_key")
         if name and name not in list_names:
             list_names.append(str(name))
@@ -241,6 +255,7 @@ def _summarize_appearances(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "votes": None if votes is None else float(votes),
         "vote_year": None if vote_year is None else int(vote_year),
         "vote_years": years,
+        "list_keys": list_keys,
         "list_names": "、".join(list_names),
     }
 
@@ -268,6 +283,47 @@ def _parse_map_params(map_row: Mapping[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_filter_spec(map_row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """解析 map_runs.filter_json；None 表示该星云没有筛选（全量）。"""
+
+    raw = map_row.get("filter_json")
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) and parsed else None
+
+
+def _basename(path: Any) -> str:
+    if not path:
+        return ""
+    return Path(str(path).replace("\\", "/")).name
+
+
+def _linked_local_file(
+    work_id: int,
+    *,
+    row: Mapping[str, Any],
+    duplicate_ids_by_canonical: Mapping[int, list[int]],
+    works_by_id: Mapping[int, Mapping[str, Any]],
+) -> str:
+    """作品本地文件名：优先自身 local_path，其次关联 duplicate 本地作品的 local_path。"""
+
+    own = _basename(row.get("local_path"))
+    if own:
+        return own
+    for duplicate_id in duplicate_ids_by_canonical.get(int(work_id), []):
+        duplicate = works_by_id.get(int(duplicate_id))
+        if duplicate is None:
+            continue
+        linked = _basename(duplicate.get("local_path"))
+        if linked:
+            return linked
+    return ""
 
 
 def load_nebula_frame(
@@ -303,6 +359,13 @@ def load_nebula_frame(
     for appearance in cat.appearance_rows():
         appearances_by_work.setdefault(int(appearance["work_id"]), []).append(appearance)
 
+    duplicate_ids = cat.get_duplicate_work_ids()
+    duplicate_ids_by_canonical: dict[int, list[int]] = {}
+    for link in cat.get_work_links():
+        canonical = int(link["canonical_work_id"])
+        duplicate_ids_by_canonical.setdefault(canonical, []).append(int(link["duplicate_work_id"]))
+    works_by_id = {int(work["id"]): work for work in cat.list_works()}
+
     records: list[dict[str, Any]] = []
     for row in rows:
         work_id = int(row["id"])
@@ -325,7 +388,14 @@ def load_nebula_frame(
                 "publish_date": row.get("publish_date"),
                 "local_path": local_path,
                 "file_name": _file_name(local_path, bvid, part),
+                "local_file": _linked_local_file(
+                    work_id,
+                    row=row,
+                    duplicate_ids_by_canonical=duplicate_ids_by_canonical,
+                    works_by_id=works_by_id,
+                ),
                 "status": row.get("status"),
+                "is_canonical": work_id not in duplicate_ids,
                 "x2": row.get("x2"),
                 "y2": row.get("y2"),
                 "x3": row.get("x3"),
@@ -335,6 +405,7 @@ def load_nebula_frame(
                 "votes": summary["votes"],
                 "vote_year": summary["vote_year"],
                 "vote_years": summary["vote_years"],
+                "list_keys": summary["list_keys"],
                 "list_names": summary["list_names"],
             }
         )
@@ -354,26 +425,58 @@ def load_nebula_frame(
 
     map_info = dict(map_row)
     map_info["params"] = _parse_map_params(map_row)
+    map_info["filter_spec"] = _parse_filter_spec(map_row)
     return map_info, frame
 
 
 # --------------------------------------------------------------------------- 染色
-def available_color_fields(df: pd.DataFrame) -> list[tuple[str, str]]:
+def available_color_fields(
+    df: pd.DataFrame,
+    has_similarity: bool = True,
+) -> list[tuple[str, str]]:
     """返回当前数据可用的染色字段（按 COLOR_FIELDS 顺序）。
 
-    除“不染色”外，只保留有至少一个非缺失值的列。
+    除“不染色”外，只保留有至少一个非缺失值的列；
+    “高维近邻密度”依赖 SimilarityIndex，has_similarity=False 时不提供。
     """
 
     available: list[tuple[str, str]] = []
+    count = len(df)
     for field_id, label in COLOR_FIELDS:
         if field_id == "none":
             available.append((field_id, label))
+            continue
+        if field_id == _NEIGHBOR_DENSITY_FIELD:
+            if has_similarity and count > 0:
+                available.append((field_id, label))
             continue
         if field_id not in df.columns:
             continue
         if bool(df[field_id].notna().any()):
             available.append((field_id, label))
     return available
+
+
+def _neighbor_density_spec(
+    df: pd.DataFrame,
+    similarity_index: "SimilarityIndex | None",
+) -> ColorSpec:
+    """高维近邻密度：第 k 近邻余弦距离（越大越稀疏）。"""
+
+    if similarity_index is None:
+        raise MapError("计算高维近邻密度需要 SimilarityIndex，请先构造近邻索引")
+    if "work_id" not in df.columns:
+        raise MapError("数据缺少 work_id 列，无法计算高维近邻密度")
+    try:
+        distances = similarity_index.kth_neighbor_distance(k=_NEIGHBOR_DENSITY_K)
+    except Exception as exc:  # noqa: BLE001 - 统一转成展示层可捕获的中文错误
+        raise MapError(f"计算高维近邻密度失败: {exc}") from exc
+    values = [distances.get(int(work_id)) for work_id in df["work_id"].tolist()]
+    return ColorSpec(
+        values=values,
+        title=f"高维近邻密度（第{_NEIGHBOR_DENSITY_K}近邻余弦距离，越大越稀疏）",
+        colorscale="Viridis",
+    )
 
 
 def _density_spec(df: pd.DataFrame, projection: str, density_grid: int) -> ColorSpec:
@@ -526,8 +629,12 @@ def apply_color(
     *,
     projection: str = "2d",
     density_grid: int = 40,
+    similarity_index: "SimilarityIndex | None" = None,
 ) -> ColorSpec:
-    """把某个染色维度换算成 Plotly 可直接使用的颜色参数。"""
+    """把某个染色维度换算成 Plotly 可直接使用的颜色参数。
+
+    高维近邻密度（density_knn）需要传入 SimilarityIndex；其余维度不需要。
+    """
 
     if field not in _ALL_FIELD_IDS:
         raise MapError(f"未知染色维度: {field}（可选: {', '.join(sorted(_ALL_FIELD_IDS))}）")
@@ -535,6 +642,8 @@ def apply_color(
         raise MapError(f"未知投影方式: {projection}（只支持 2d / 3d）")
     if field == "none":
         return _density_spec(df, projection, density_grid)
+    if field == _NEIGHBOR_DENSITY_FIELD:
+        return _neighbor_density_spec(df, similarity_index)
     if field in _CONTINUOUS_FIELDS:
         return _continuous_spec(df, field)
     return _categorical_spec(df, field)
@@ -556,6 +665,102 @@ def search_frame(df: pd.DataFrame, query: str) -> pd.DataFrame:
     search_text = df["search_text"].fillna("").astype(str).str.casefold()
     mask = search_text.str.contains(text.casefold(), regex=False)
     return df.loc[mask].copy()
+
+
+def _as_selection(values: Any) -> set[Any] | None:
+    """把界面传来的筛选值统一成集合；None 或空集合表示不过滤。"""
+
+    if values is None:
+        return None
+    if isinstance(values, (str, int)):
+        return {values}
+    try:
+        selected = set(values)
+    except TypeError as exc:
+        raise MapError(f"筛选值必须是可迭代集合: {values!r}") from exc
+    return selected or None
+
+
+def filter_frame(
+    df: pd.DataFrame,
+    *,
+    sources: Iterable[str] | None = None,
+    list_keys: Iterable[str] | None = None,
+    vote_years: Iterable[int] | None = None,
+) -> pd.DataFrame:
+    """按来源 / 榜单 / 选票年份过滤作品；空值表示不过滤。
+
+    榜单筛选使用作品关联的 list_keys（可能跨多个榜单），年份使用 vote_years。
+    """
+
+    result = df.copy()
+    selected_sources = _as_selection(sources)
+    if selected_sources is not None:
+        if "source" not in result.columns:
+            raise MapError("数据缺少 source 列，无法按来源筛选")
+        result = result[result["source"].isin(selected_sources)]
+
+    selected_lists = _as_selection(list_keys)
+    if selected_lists is not None:
+        if "list_keys" not in result.columns:
+            raise MapError("数据缺少 list_keys 列，无法按榜单筛选")
+        result = result[
+            result["list_keys"].map(
+                lambda keys: bool(set(keys or []) & selected_lists)
+            )
+        ]
+
+    selected_years = _as_selection(vote_years)
+    if selected_years is not None:
+        if "vote_years" not in result.columns:
+            raise MapError("数据缺少 vote_years 列，无法按年份筛选")
+        normalized_years = {int(year) for year in selected_years}
+        result = result[
+            result["vote_years"].map(
+                lambda years: bool(set(int(year) for year in (years or [])) & normalized_years)
+            )
+        ]
+    return result
+
+
+def neighbor_rows(
+    df: pd.DataFrame,
+    index: "SimilarityIndex",
+    work_id: int,
+    kind: str = "work_joint",
+    k: int = 5,
+) -> list[dict[str, Any]]:
+    """把某部作品在指定模态下的 Top-k 近邻整理成展示行。
+
+    每行包含 rank / work_id / title / file_name / similarity / in_map；
+    in_map 表示该近邻是否也出现在当前 DataFrame（当前星云/筛选视图）里。
+    作品没有该模态向量时由 SimilarityIndex 抛 NebulaError。
+    """
+
+    neighbors = index.neighbors(int(work_id), kind=kind, k=k)
+    records: dict[int, Mapping[str, Any]] = {}
+    if "work_id" in df.columns:
+        for record in df.to_dict("records"):
+            records[int(record["work_id"])] = record
+    rows: list[dict[str, Any]] = []
+    for neighbor in neighbors:
+        record = records.get(int(neighbor.work_id))
+        title = (
+            (record.get("title") or record.get("file_name") or record.get("work_key"))
+            if record is not None
+            else None
+        )
+        rows.append(
+            {
+                "rank": neighbor.rank,
+                "work_id": neighbor.work_id,
+                "title": str(title) if title else f"作品 {neighbor.work_id}",
+                "file_name": str(record.get("file_name") or "") if record is not None else "",
+                "similarity": float(neighbor.similarity),
+                "in_map": record is not None,
+            }
+        )
+    return rows
 
 
 def external_url(row: Mapping[str, Any] | pd.Series) -> str | None:

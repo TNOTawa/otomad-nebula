@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from nebula import media as media_module
 from nebula.errors import MediaError
 from nebula.media import (
     ExtractedClip,
@@ -269,6 +270,8 @@ def test_extract_two_clips_with_matching_durations(sample_video: Path, config, t
         assert video_info.has_video is True
         assert video_info.video_codec == "h264"
         assert (video_info.width, video_info.height) == (160, 120)
+        # A5：临时 mp4 只保留视频轨，音频单独走 wav，避免多一次 AAC 编码
+        assert video_info.has_audio is False, "临时 mp4 不应带 AAC 音轨"
 
         _, sample_rate, channels = _read_wav_samples(clip.audio_path)
         assert sample_rate == 48000
@@ -324,6 +327,57 @@ def test_extract_video_without_audio_pads_silence(video_only: Path, config, tmp_
     assert report["ok"] is True
     assert report["video_duration_s"] == pytest.approx(4.0, abs=0.15)
     assert report["audio_duration_s"] == pytest.approx(4.0, abs=0.15)
+    assert probe_media(clip.video_path, ffprobe=config.media.ffprobe).has_audio is False
+
+
+def test_extract_with_info_skips_ffprobe(sample_video: Path, config, tmp_path: Path, monkeypatch):
+    """A4：传入已探测的 MediaInfo 时必须完全跳过 ffprobe。"""
+
+    info = probe_media(sample_video, ffprobe=config.media.ffprobe)
+    plan = plan_clips(info.duration_s, clip_seconds=4.0, clips_per_work=2)[0]
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("传入 info 时 extract_clip 不应再调用 probe_media/ffprobe")
+
+    monkeypatch.setattr(media_module, "probe_media", _fail)
+    clip = extract_clip(sample_video, plan, tmp_path / "clips", media=config.media, info=info)
+
+    assert clip.index == plan.index
+    assert clip.video_path.is_file() and clip.audio_path.is_file()
+    assert clip.duration_s == plan.duration_s
+
+
+def test_extract_with_info_uses_provided_duration(
+    sample_video: Path, config, tmp_path: Path, monkeypatch
+):
+    """A4：越界判断使用传入的 MediaInfo，不重新 probe。"""
+
+    info = probe_media(sample_video, ffprobe=config.media.ffprobe)
+    short_info = replace(info, duration_s=3.0)
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("传入 info 时不应再调用 probe_media/ffprobe")
+
+    monkeypatch.setattr(media_module, "probe_media", _fail)
+    with pytest.raises(MediaError, match="超出"):
+        extract_clip(
+            sample_video,
+            ClipPlan(index=0, start_s=2.0, duration_s=2.0),
+            tmp_path,
+            media=config.media,
+            info=short_info,
+        )
+
+
+def test_extract_rejects_invalid_info_type(sample_video: Path, config, tmp_path: Path):
+    with pytest.raises(MediaError, match="info 参数类型非法"):
+        extract_clip(
+            sample_video,
+            ClipPlan(index=0, start_s=0.0, duration_s=1.0),
+            tmp_path,
+            media=config.media,
+            info="not-media-info",  # type: ignore[arg-type]
+        )
 
 
 def test_extract_audio_only_source_raises(audio_only: Path, config, tmp_path: Path):

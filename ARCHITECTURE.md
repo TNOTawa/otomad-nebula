@@ -1,8 +1,8 @@
 # 架构设计（ARCHITECTURE）
 
 本文描述音MAD星云计划的系统结构、数据模型、模块边界与必须保持的不变量。
-接口细节以 `docs/CONTRACTS.md` 为准；用户使用说明见 `README.md`；
-关键取舍的理由见 `docs/adr/`。
+v0.1 接口细节以 `docs/CONTRACTS.md` 为准，v0.2/v0.3 迭代契约见
+`docs/CONTRACTS_V2.md`；用户使用说明见 `README.md`；关键取舍的理由见 `docs/adr/`。
 
 ## 1. 系统总览
 
@@ -44,9 +44,12 @@ Bilibili BV 清单 ───┘                                        │
 | 编排层 | `nebula/pipeline.py` | 单部作品全流程、批处理、断点续跑、临时目录生命周期 | media、embed、ingest、download、db、config |
 | 数据层 | `nebula/ingest.py` / `nebula/download.py` | 本地扫描、选票/周报解析、Bilibili 元数据与下载 | db、config、errors |
 | 数据层 | `nebula/mapplot.py` | 向量矩阵加载、UMAP 2D/3D、版本落盘、transform 增量 | db、config、umap-learn、joblib、numpy |
-| 展示层 | `nebula/appdata.py` | 纯数据准备：DataFrame、染色 `ColorSpec`、密度、搜索、hover、链接 | pandas、numpy、db、config；**不导入 streamlit/plotly** |
-| 展示层 | `app.py` | Streamlit 页面：侧栏控件、Plotly 图、详情展示 | streamlit、plotly、appdata |
-| 入口层 | `ingest.py` / `pipeline.py` / `map.py` / `qa.py` | 参数解析、调用库代码、打印结果、返回退出码 | 对应库模块 |
+| 展示层 | `nebula/appdata.py` | 纯数据准备：DataFrame、染色 `ColorSpec`（含高维近邻密度）、筛选、搜索、hover、近邻展示行 | pandas、numpy、db、config；**不导入 streamlit/plotly** |
+| 展示层 | `app.py` | Streamlit 页面：侧栏控件、Plotly 图、详情与近邻面板 | streamlit、plotly、appdata、similarity（经缓存） |
+| 分析层 | `nebula/similarity.py` | 高维余弦近邻索引：三模态 Top-k、第 k 近邻距离、进程内矩阵缓存 | db、config、numpy；**不导入 umap/streamlit/plotly** |
+| 数据层 | `nebula/identity.py` | 标题规范化、本地↔Bilibili 身份候选与关联（人工清单兜底）、向量复制登记 | db、config、errors；Bilibili 客户端由调用方注入 |
+| 分析层 | `nebula/stability.py` | 片段留一重聚合、Top-k 稳定性报告（JSON/CSV） | config、db、embed、numpy；**不加载模型、不导入 umap/pandas** |
+| 入口层 | `ingest.py` / `pipeline.py` / `map.py` / `qa.py` / `tools/clip_stability.py` | 参数解析、调用库代码、打印结果、返回退出码 | 对应库模块 |
 
 依赖方向只有一条：入口层 → 展示层 / 编排层 → 领域层 → 基础层。
 几个必须保持的边界（由 `tests/test_invariants.py` 静态检查）：
@@ -56,19 +59,26 @@ Bilibili BV 清单 ───┘                                        │
 - `nebula.mapplot` 不导入 `streamlit` / `plotly`：降维是纯计算，可在无界面环境运行；
 - `nebula.appdata` 不导入 `streamlit` / `plotly`：数据准备与渲染分离，便于单元测试与
   `streamlit.testing.v1.AppTest` 之外的直接断言；
-- `app.py` 只依赖 `appdata` 与库层，不反向被库代码导入。
+- `nebula.similarity` 不导入 `umap` / `streamlit` / `plotly`：近邻、相似度、
+  近邻密度必须来自高维余弦，不能退化成 UMAP 平面距离；
+- `nebula.stability` 不导入模型/torch、UMAP 或界面库：A3 只读已保存向量，不重新编码、
+  不参与坐标训练；`tools/clip_stability.py` 同样不加载模型；
+- `nebula.identity` 只做本地数据与编排，Bilibili 网络客户端由调用方注入（默认测试离线）；
+- `app.py` 只依赖 `appdata` / `similarity` 与库层，不反向被库代码导入。
 
 ## 3. 数据模型
 
 ### 3.1 SQLite 表关系
 
 ~~~text
-works 1────N work_events           （处理事件：created / status / ...）
+works 1────N work_events           （处理事件：created / status / linked / reopen / ...）
 works 1────N appearances N────1 lists      （一部作品可出现在多个榜单/年份）
 works 1────N embeddings  N────1 embedding_versions
 works 1────N clips                         （片段计划：idx/start_s/duration_s）
 works 1────N map_coords N────1 map_runs
 map_runs N────1 embedding_versions         （星云必须记录基于哪个向量版本）
+works 1────N work_links N────1 works       （canonical ← duplicate 单层身份关联，v0.2）
+works 1────N work_timings N────1 pipeline_runs   （单部分阶段耗时 ← 批次，v0.2）
 ~~~
 
 | 表 | 关键列 | 说明 |
@@ -81,8 +91,11 @@ map_runs N────1 embedding_versions         （星云必须记录基于�
 | `embedding_versions` | `version` PK, `model_checkpoint`, `model_revision`, `frames`, `clip_seconds`, `clips_per_work`, `audio_sample_rate`, `params_json` | 向量版本登记；同版本参数不一致直接报错 |
 | `embeddings` | `work_id`, `version`, `kind`, `path`, `dim`, `n_clips` | 只登记向量文件位置与形状，不存元数据 |
 | `clips` | `work_id`, `version`, `idx`, `start_s`, `duration_s` | 采样计划落库，用于复核音画同步 |
-| `map_runs` | `version` PK, `embedding_version`, `params_json`, `coords_path`, `model_2d_path`, `model_3d_path`, `n_works`, `status` | 星云版本；`building/ready/failed` |
+| `map_runs` | `version` PK, `embedding_version`, `params_json`, `filter_json`, `coords_path`, `model_2d_path`, `model_3d_path`, `n_works`, `status` | 星云版本；`building/ready/failed`；`filter_json` 记录 v0.2 筛选条件（NULL = 全量） |
 | `map_coords` | `map_version`, `work_id`, `x2`, `y2`, `x3`, `y3`, `z3` | 主键 `(map_version, work_id)`，一个版本一套坐标 |
+| `work_links` | `canonical_work_id`, `duplicate_work_id` UNIQUE, `method`, `confidence`, `note` | 身份关联（v0.2）：duplicate 唯一、单层、默认不进星云；CHECK 禁止自关联 |
+| `pipeline_runs` | `id`, `started_at/finished_at`, `embedding_version`, `model_load_s`, `n_selected/n_completed/n_failed`, `total_s`, `params_json` | A4 批次级指标（模型加载属于批次级） |
+| `work_timings` | `run_id`, `work_id`, `embedding_version`, `download_s/probe_s/extract_s/preprocess_s/forward_s/save_s/total_s` | A4 单部作品分阶段耗时；`UNIQUE(run_id, work_id)` 防止重复登记 |
 
 连接设置：WAL、`foreign_keys=ON`、`BEGIN IMMEDIATE` 事务、`busy_timeout`；
 所有写操作在事务内完成，读方法返回普通 `dict` 便于上层使用。
@@ -110,6 +123,18 @@ data/
 - `work_joint` 等作品级向量的 `dim` 在同一个 `embedding_version` 内必须一致；
 - 片段级向量形状 `(n_clips, dim)`，`n_clips` 与 `clips` 表的段数一致；
 - 所有 npy / joblib / parquet 写入都走“临时文件 + 原子替换”，避免半文件。
+
+`logs/` 下的可重建报告（v0.2）：
+
+~~~text
+logs/
+├── perf_<run_id>.csv            # A4：每部作品的分阶段耗时（pipeline 自动生成）
+├── sync_report.json             # 音画同步抽查
+├── ablation_report.json        # 静音/遮蔽画面消融
+└── clip_stability.json/.csv    # A3：片段稳定性报告（tools/clip_stability.py 生成）
+~~~
+
+这些文件只用于观察与证据，**不进入**向量库与星云；删除后可按原命令重新生成。
 
 ## 4. 关键不变量
 
@@ -151,6 +176,29 @@ data/
 8. **可复现。**
    模型 `revision` 固定、采样确定、UMAP `random_state` 固定且 `n_jobs=1`；
    所有版本参数落库/落盘，便于复算与对比。
+9. **展示去重：canonical / duplicate 单层关联（v0.2）。**
+   `work_links` 中每个 duplicate 只能属于一个 canonical，canonical 不能是任何人的
+   duplicate（禁止链式）；duplicate 的作品记录、本地视频与向量保留，但**默认**不进入
+   星云、近邻索引与界面；需要对照时可显式 `include_duplicates=True` 并记录在 filter_json。
+   星云是构建时的快照：在建立身份关联**之前**生成的旧版本（如 P0 的 `map_v001`）
+   保留当时的实体集合，不回溯改写；v0.2 起新构建的版本默认排除 duplicate，近邻索引
+   与界面按当前 canonical 集合计算。
+10. **筛选条件落库，筛选星云坐标不可比（v0.2）。**
+    每个筛选星云是独立 `map_vNNN`，`filter_json` 记录 dataset/vote_year/list_key/
+    include_duplicates；UMAP 在筛选后的 canonical 子集上重新训练。
+    筛选版与全量版、不同筛选版之间的坐标**不可直接比较**；跨版本对比只作趋势观察。
+11. **近邻、相似度与近邻密度只使用高维余弦（v0.2）。**
+    `SimilarityIndex` 用 `work_joint/audio/video` 向量计算真实余弦；
+    不允许用 UMAP 平面距离替代（UMAP 只近似保邻域，不保持距离度量）。
+    近邻索引排除 duplicate，矩阵进程内缓存，缺失模态显式提示。
+12. **分阶段计时只观测，不改变语义（v0.2）。**
+    `pipeline_runs` / `work_timings` 记录 download/probe/extract/preprocess/forward/
+    save/total 与批次模型加载耗时；负值被数据库层拒绝；计时字段不参与
+    `embedding_version`、不进入向量与星云，HashTestEmbedder 允许为 0。
+13. **片段稳定性只读、不参与坐标与质量评价（v0.2/A3）。**
+    只读取 `clip_joint` 与 `work_joint` npy 做留一重聚合与 Top-k 对比，
+    不加载模型、不重新编码、不写数据库；报告输出到 `logs/`，仅用于评估
+    “作品近邻结论对单个 8 秒片段的依赖程度”，不是作品优劣指标。
 
 ## 5. 处理流程与失败语义
 
@@ -165,6 +213,8 @@ data/
 7. `aggregate_work_vector` 聚合为作品级向量；
 8. 原子写 npy，登记 `embeddings` / `clips`，更新元数据（时长、has_audio/has_video）；
 9. `complete()`；删除该作品的临时目录。任一步失败 → `fail()` 记录可读原因并保留临时文件。
+10. 各阶段耗时写入 `work_timings`（批次 `run_id` 由 `pipeline_runs` 登记），
+    批次结束生成 `logs/perf_<run_id>.csv`；计时在任何失败路径上也尽量记录已发生阶段（v0.2/A4）。
 
 批处理层面：继续处理其他作品，最终汇总“完成 / 失败 / 跳过”；网络下载失败或视频失效
 只影响自身；`failed` 作品下次运行默认重试（可关闭），也可 `pipeline.py retry <work_id>` 单独重试。
@@ -194,6 +244,31 @@ CLI 顶层捕获后返回非 0 并给出中文提示；库代码用 `logging` �
 已知限制：UMAP 数值结果可能随 umap-learn / numpy 版本、平台浮点实现有微小差异；
 跨版本比较应使用“同一环境内重新生成”的结果，且不同星云版本本身不可比绝对坐标。
 PE-AV 的语义质量不在自动化测试范围内，P0 只做“静音/遮蔽画面后联合向量应变化”的消融抽查。
+
+真实数据运行层的已知边界：
+
+- 8.7 小时的活动直播回放（BV1b6ivBzEpb）全量下载代价过高：本轮记录为 `failed` 并保留
+  可读原因，不阻塞其他作品；后续可改用分段下载/只取片段；
+- 竖屏视频曾因下载格式的宽高筛选条件失败（height 限制不适用于竖屏），
+  `config.yt_dlp_format` 已增加 `width<=480` 与 `best` 兜底并重试成功；
+- 真实 P0/P1 的耗时主要来自下载与推理，用 `pipeline.py timings` 与
+  `logs/perf_<run_id>.csv` 定位瓶颈，避免凭感觉调参。
+
+### 6.2 A5 低风险提速实测（v0.2）
+
+提速原则：**不改变 `embedding_version` 的行为才可直接采纳**；任何会改变向量的优化必须
+发布新向量版本并整批重跑。以下数据来自 T1 的基准工具（`tools/bench_peav.py` /
+`tools/verify_peav.py`）在真实视频上的实测：
+
+| 优化项 | 实测结果 | 结论 |
+| --- | --- | --- |
+| 切片 mp4 去掉 AAC 音轨 | 真实 3 部作品 4 类向量 sha1 全等，max abs diff = 0；joint cos = 0.99999994 | 零漂移，v0.2 起默认采纳 |
+| 重复 ffprobe | 作品级探测结果通过 `extract_clip(info=...)` 复用，重复探测已消除 | 默认采纳 |
+| ffmpeg preset veryfast → ultrafast | 5 片段 11.07s → 5.88s（1.88×）；临时体积约 2.35×；抽样 joint cos 最低 0.99918 | 本轮不改变默认（体积换时间，收益不足以改方案） |
+| 片段分辨率缩放到高 336 | extract 12.88s → 4.43s（2.91×）；preprocess 3.52s → 1.03s（3.43×）；单作品 19.53s → 8.26s（2.36×）；work joint cos 最低 0.99812 | 会改变向量，需新 `embedding_version` + 整批重跑，留作 v0.3 后续评估 |
+
+结论：v0.2 只采纳“零向量漂移”的两项（去 AAC 音轨、复用 ffprobe），其余作为 v0.3 的候选，
+通过新向量版本对照验证后再切换。
 
 ### 6.1 数值一致性边界（device / dtype）
 
@@ -239,20 +314,28 @@ PE-AV 向量存在**硬件相关的数值差异**，这决定了什么可以比�
 | `nebula/pipeline.py` | 单部处理与批处理编排 |
 | `nebula/ingest.py` | 本地扫描、选票 CSV、周报导入 |
 | `nebula/download.py` | Bilibili 元数据 API 与 yt-dlp 下载 |
-| `nebula/mapplot.py` | UMAP 训练、版本落盘、transform |
-| `nebula/appdata.py` | 可视化数据准备（纯函数） |
-| `app.py` | Streamlit 应用 |
-| `ingest.py/pipeline.py/map.py/qa.py` | 顶层 CLI |
+| `nebula/similarity.py` | 高维余弦近邻索引、三模态 Top-k、第 k 近邻距离（A1/A2） |
+| `nebula/identity.py` | 标题规范化、本地↔BV 身份候选/关联、向量复制（B1） |
+| `nebula/stability.py` | 片段留一重聚合与 Top-k 稳定性报告（A3） |
+| `nebula/mapplot.py` | UMAP 训练、筛选/变体版本落盘、transform |
+| `nebula/appdata.py` | 可视化数据准备（纯函数，含近邻密度与筛选） |
+| `app.py` | Streamlit 应用（近邻面板、密度、筛选） |
+| `ingest.py/pipeline.py/map.py/qa.py` | 顶层 CLI（含 link-local、variants） |
+| `tools/clip_stability.py` | A3 稳定性报告 CLI（只读、离线） |
+| `tools/bench_peav.py` / `tools/verify_peav.py` | 模型/性能基准与真实模型验证证据脚本 |
 | `tests/` | 单元、不变量、E2E 测试；`tests/fixtures/` 合成视频与临时配置 |
-| `docs/` | 契约、ADR、质量规范、执行方案 |
+| `docs/` | 契约（V1/V2）、ADR、质量规范、执行方案 |
 
 ## 9. 验证策略
 
 - **唯一门禁**：`python qa.py`（ruff + pytest 快速离线 + 文档/入口/配置检查）；
   `--full` 额外运行 `model` / `network` 标记测试；
-- **测试分层**：单元（config/db/sampling/media/embed/ingest/mapplot/appdata）、
-  不变量（`tests/test_invariants.py`：模块边界、版本、状态机、去重、采样、gitignore、CLI）、
-  端到端（`tests/test_e2e.py`：合成视频 → 流水线 → UMAP → appdata → Streamlit AppTest）；
+- **测试分层**：单元（config/db/sampling/media/embed/ingest/mapplot/appdata/similarity/
+  identity/stability）、不变量（`tests/test_invariants.py`：模块边界、版本、状态机、去重、
+  schema v2/身份关联/计时/filter_json/采样/gitignore/CLI）、端到端（`tests/test_e2e.py`：
+  合成视频 → 流水线 → 向量 → 近邻/稳定性 → 筛选星云 → appdata → Streamlit AppTest）；
+- **v0.2 独立验收**：近邻与密度结果与手算高维余弦对比；filter_json 与作品集合一致、跨版本坐标确实
+  不同；身份关联后 duplicate 默认排除、`include_duplicates` 对照版本包含；A3 报告只读不加载模型；
 - **独立预言机**：E2E 使用 `tests/fixtures/video_factory.py` 现场合成的素材与独立断言，
   不复用实现方测试的断言逻辑；`qa.py` 的入口检查与 pytest 独立失败；
 - **默认离线**：网络/模型测试必须打 marker，默认测试不触网、不加载权重；

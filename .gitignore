@@ -33,3 +33,4 @@ models/
 _smoke/
 _video_scan.txt
 *.log
+backups/

@@ -4,7 +4,8 @@
 
 - probe_media：解析 ffprobe 的 JSON，容忍只有视频 / 只有音频的文件；
 - extract_clip：用一条 ffmpeg 命令同时截取音画（-ss 放在 -i 前，
-  音视频同源同偏移），源文件无音轨时用 anullsrc 补等长静音；
+  音视频同源同偏移），输出无音轨 mp4（PE-AV 只需要画面）与 wav；
+  源文件无音轨时用 anullsrc 补等长静音；
 - mute_audio_clip / black_video_clip：为“静音 / 黑屏”消融实验生成等长素材；
 - clip_duration_report：抽查抽出的视频与音频时长是否一致（P0 音画同步自检）。
 
@@ -360,11 +361,14 @@ def _extract_command(
     media: MediaConfig,
     has_audio: bool,
 ) -> list[str]:
-    """构造“一条命令同时输出 mp4 + wav”的 ffmpeg 参数。
+    """构造“一条命令同时输出 无音轨 mp4 + wav”的 ffmpeg 参数。
 
-    -ss 放在 -i 之前：同一条命令里音视频输入使用同一个精确 seek 偏移，
-    保证抽出的音频与画面来自同一时间段（P0 音画同步的关键）。
-    源文件无音轨时，用 lavfi 的 anullsrc 作为第二路输入补等长静音。
+    - -ss 放在 -i 之前：同一条命令里音视频输入使用同一个精确 seek 偏移，
+      保证抽出的音频与画面来自同一时间段（P0 音画同步的关键）。
+    - mp4 只保留视频轨（-an）：PE-AV 只从视频文件解码画面，音频单独读 wav，
+      因此临时 mp4 不再编码 AAC；少一次音频编码、临时文件更小。
+    - 源文件无音轨时，用 lavfi 的 anullsrc 作为第二路输入补等长静音，
+      该输入只映射到 wav（mp4 始终无音轨）。
     """
 
     layout = _channel_layout(media.audio_channels)
@@ -382,93 +386,66 @@ def _extract_command(
         "-i",
         str(source),
     ]
-    if has_audio:
-        command += [
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0",
-            "-t",
-            f"{duration_s:.3f}",
-            "-c:v",
-            "libx264",
-            "-preset",
-            str(media.video_preset),
-            "-crf",
-            str(int(media.video_crf)),
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            str(video_path),
-            "-map",
-            "0:a:0",
-            "-t",
-            f"{duration_s:.3f}",
-            "-vn",
-            "-c:a",
-            "pcm_s16le",
-            "-ar",
-            str(rate),
-            "-ac",
-            str(channels),
-            str(audio_path),
-        ]
-    else:
-        command += [
-            "-f",
-            "lavfi",
-            "-i",
-            f"anullsrc=r={rate}:cl={layout}",
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-t",
-            f"{duration_s:.3f}",
-            "-c:v",
-            "libx264",
-            "-preset",
-            str(media.video_preset),
-            "-crf",
-            str(int(media.video_crf)),
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            str(video_path),
-            "-map",
-            "1:a:0",
-            "-t",
-            f"{duration_s:.3f}",
-            "-vn",
-            "-c:a",
-            "pcm_s16le",
-            "-ar",
-            str(rate),
-            "-ac",
-            str(channels),
-            str(audio_path),
-        ]
+    audio_map = "0:a:0"
+    if not has_audio:
+        command += ["-f", "lavfi", "-i", f"anullsrc=r={rate}:cl={layout}"]
+        audio_map = "1:a:0"
+    command += [
+        # 输出 1：无音轨 H.264/yuv420p 视频片段（画面尺寸保持）
+        "-map",
+        "0:v:0",
+        "-t",
+        f"{duration_s:.3f}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        str(media.video_preset),
+        "-crf",
+        str(int(media.video_crf)),
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-an",
+        str(video_path),
+        # 输出 2：48k / 双声道 PCM wav（PE-AV 的音频输入）
+        "-map",
+        audio_map,
+        "-t",
+        f"{duration_s:.3f}",
+        "-vn",
+        "-c:a",
+        "pcm_s16le",
+        "-ar",
+        str(rate),
+        "-ac",
+        str(channels),
+        str(audio_path),
+    ]
     return command
 
 
 def extract_clip(
-    source: Path, plan: ClipPlan, dst_dir: Path, *, media: MediaConfig
+    source: Path,
+    plan: ClipPlan,
+    dst_dir: Path,
+    *,
+    media: MediaConfig,
+    info: MediaInfo | None = None,
 ) -> ExtractedClip:
-    """按采样计划截取一个音画同步片段，输出 mp4 + wav 两个文件。
+    """按采样计划截取一个音画同步片段，输出无音轨 mp4 + wav 两个文件。
 
     输出文件名固定为 clip_{index:02d}.mp4 与 clip_{index:02d}.wav。
+    mp4 只含视频轨（PE-AV 只从这里解码画面），wav 是模型需要的音频输入。
     源文件没有音轨时，用 anullsrc 补等长静音 wav（是否补静音由
     probe_media 的 has_audio 决定），因此音频文件总是存在且可直接送模型。
+
+    参数
+    ----
+    info:
+        可选的已探测元数据。流水线对同一个源文件只 probe 一次后逐段传入，
+        可完全跳过本片段的 ffprobe 调用（A4 分阶段耗时优化）；为 None 时
+        函数内部自行 probe_media，保持与原行为兼容。
 
     异常
     ----
@@ -495,7 +472,10 @@ def extract_clip(
     start_s = float(plan.start_s)
     _validate_media_config(media)
 
-    info = probe_media(src, ffprobe=media.ffprobe, timeout_s=media.probe_timeout_seconds)
+    if info is not None and not isinstance(info, MediaInfo):
+        raise MediaError(f"info 参数类型非法: {type(info).__name__}（需要 MediaInfo 或 None）")
+    if info is None:
+        info = probe_media(src, ffprobe=media.ffprobe, timeout_s=media.probe_timeout_seconds)
     if not info.has_video:
         raise MediaError(f"源文件没有视频轨，无法截取音画片段: {src}")
     if start_s + duration_s > info.duration_s + 0.05:

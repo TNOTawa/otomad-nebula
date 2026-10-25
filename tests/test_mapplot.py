@@ -21,6 +21,7 @@ from nebula.errors import MapError
 from nebula.mapplot import (
     COORD_COLUMNS,
     build_map,
+    build_map_variants,
     load_embedding_matrix,
     main,
     transform_new,
@@ -347,3 +348,292 @@ def test_cli_missing_config_returns_error(tmp_path: Path, capsys):
     assert main(["list", "--config", str(missing)]) == 1
     captured = capsys.readouterr()
     assert "错误" in captured.err
+
+
+# --------------------------------------------------------------------------- 筛选条件
+def _add_work(
+    catalog: Catalog,
+    config: Config,
+    number: int,
+    *,
+    source: str = "bilibili",
+    dim: int = VECTOR_DIM,
+    seed: int | None = None,
+    version: str | None = None,
+) -> int:
+    """登记一部指定来源的合成作品，返回 work_id。"""
+
+    embedding_version = _ensure_embedding_version(catalog, config, version)
+    if source == "local":
+        work_id, _ = catalog.upsert_local_work(
+            f"clips/作品 {number}.mp4", title=f"作品 {number}"
+        )
+    else:
+        work_id, _ = catalog.upsert_bilibili_work(
+            f"BV1xx411c7{number:02d}", title=f"作品 {number}", duration_s=30.0 + number
+        )
+    rng = np.random.default_rng(number if seed is None else seed)
+    vector = rng.normal(size=dim).astype(np.float32)
+    path = config.paths.embeddings / embedding_version / str(work_id) / "work_joint.npy"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, vector)
+    catalog.register_embedding(
+        work_id,
+        version=embedding_version,
+        kind="work_joint",
+        path=config.data_relpath(path),
+        dim=dim,
+        n_clips=2,
+    )
+    return work_id
+
+
+def _seed_mixed_works(
+    catalog: Catalog,
+    config: Config,
+    *,
+    local_numbers: tuple[int, ...] = (0, 2, 4, 6),
+    bilibili_numbers: tuple[int, ...] = (1, 3, 5, 7),
+) -> dict[str, list[int]]:
+    """本地/Bilibili 混合作品 + 2025/2024 两个榜单。"""
+
+    local_ids = [_add_work(catalog, config, number, source="local") for number in local_numbers]
+    bilibili_ids = [_add_work(catalog, config, number) for number in bilibili_numbers]
+    all_ids = local_ids + bilibili_ids
+    votes_2025 = catalog.ensure_list(
+        "votes_2025", name="2025年音MAD选票", kind="votes", vote_year=2025
+    )
+    for index, work_id in enumerate(all_ids):
+        catalog.add_appearance(work_id, votes_2025, rank=index + 1, votes=100 - index)
+    votes_2024 = catalog.ensure_list(
+        "votes_2024", name="2024年音MAD选票", kind="votes", vote_year=2024
+    )
+    for work_id in (local_ids[0], local_ids[1], bilibili_ids[0]):
+        catalog.add_appearance(work_id, votes_2024, rank=1)
+    return {"local": local_ids, "bilibili": bilibili_ids, "all": all_ids}
+
+
+def test_load_embedding_matrix_filter_spec(config: Config, catalog: Catalog):
+    groups = _seed_mixed_works(catalog, config)
+
+    ids, matrix = load_embedding_matrix(catalog, config, filter_spec={"dataset": "local"})
+    assert ids == groups["local"]
+    assert matrix.shape == (len(groups["local"]), VECTOR_DIM)
+
+    ids, _ = load_embedding_matrix(catalog, config, filter_spec={"dataset": "bilibili"})
+    assert ids == groups["bilibili"]
+
+    expected_2024 = sorted(
+        [groups["local"][0], groups["local"][1], groups["bilibili"][0]]
+    )
+    ids, _ = load_embedding_matrix(catalog, config, filter_spec={"vote_year": 2024})
+    assert ids == expected_2024
+
+    ids, _ = load_embedding_matrix(catalog, config, filter_spec={"list_key": "votes_2024"})
+    assert ids == expected_2024
+
+    ids, _ = load_embedding_matrix(
+        catalog, config, filter_spec={"dataset": "local", "vote_year": 2025}
+    )
+    assert ids == groups["local"]
+
+    # 默认不过滤 = 全部 canonical 作品
+    ids, _ = load_embedding_matrix(catalog, config)
+    assert ids == sorted(groups["all"])
+
+
+def test_load_embedding_matrix_invalid_filter_spec(config: Config, catalog: Catalog):
+    _seed_mixed_works(catalog, config)
+    with pytest.raises(MapError, match="未知的筛选条件"):
+        load_embedding_matrix(catalog, config, filter_spec={"source": "local"})
+    with pytest.raises(MapError, match="dataset 只支持"):
+        load_embedding_matrix(catalog, config, filter_spec={"dataset": "youtube"})
+    with pytest.raises(MapError, match="vote_year 必须是整数"):
+        load_embedding_matrix(catalog, config, filter_spec={"vote_year": "2025年"})
+    with pytest.raises(MapError, match="include_duplicates 必须是布尔值"):
+        load_embedding_matrix(catalog, config, filter_spec={"include_duplicates": "yes"})
+
+
+def test_filter_too_few_works_raises(config: Config, catalog: Catalog):
+    _seed_mixed_works(catalog, config)
+    # 不存在的年份 -> 0 部作品，筛选后不足 MIN_WORKS
+    with pytest.raises(MapError, match="筛选后作品数量不足"):
+        load_embedding_matrix(catalog, config, filter_spec={"vote_year": 2023})
+
+
+def test_duplicates_excluded_by_default(config: Config, catalog: Catalog):
+    groups = _seed_mixed_works(catalog, config)
+    canonical = groups["bilibili"][0]
+    duplicate = groups["local"][0]
+    catalog.link_works(canonical, duplicate, method="title+duration", confidence=0.99)
+
+    ids, _ = load_embedding_matrix(catalog, config)
+    assert duplicate not in ids
+    assert canonical in ids
+    assert len(ids) == len(groups["all"]) - 1
+
+    ids_included, _ = load_embedding_matrix(
+        catalog, config, filter_spec={"include_duplicates": True}
+    )
+    assert duplicate in ids_included
+    assert len(ids_included) == len(groups["all"])
+
+
+def test_build_map_persists_filter_spec(config: Config, catalog: Catalog):
+    groups = _seed_mixed_works(catalog, config)
+    result = build_map(
+        catalog,
+        config,
+        filter_spec={"dataset": "bilibili", "vote_year": 2025},
+        note="仅 B 站 2025",
+    )
+
+    assert result.n_works == len(groups["bilibili"])
+    frame = _read_coords(result)
+    assert set(frame["work_id"].tolist()) == set(groups["bilibili"])
+
+    map_row = catalog.get_map(result.version)
+    stored_filter = json.loads(map_row["filter_json"])
+    assert stored_filter == {"dataset": "bilibili", "vote_year": 2025}
+    params = json.loads(map_row["params_json"])
+    assert params["filter_spec"] == {"dataset": "bilibili", "vote_year": 2025}
+
+    meta = json.loads((result.coords_path.parent / "meta.json").read_text(encoding="utf-8"))
+    assert meta["filter_spec"] == {"dataset": "bilibili", "vote_year": 2025}
+    assert meta["params"]["filter_spec"] == {"dataset": "bilibili", "vote_year": 2025}
+
+    # 无筛选的星云 filter_json 为 NULL
+    plain = build_map(catalog, config)
+    assert catalog.get_map(plain.version)["filter_json"] is None
+
+
+def test_build_map_excludes_duplicates_by_default(config: Config, catalog: Catalog):
+    groups = _seed_mixed_works(catalog, config)
+    catalog.link_works(
+        groups["bilibili"][0], groups["local"][0], method="title+duration", confidence=0.99
+    )
+    result = build_map(catalog, config)
+    assert result.n_works == len(groups["all"]) - 1
+    assert groups["local"][0] not in _read_coords(result)["work_id"].tolist()
+
+    included = build_map(catalog, config, filter_spec={"include_duplicates": True})
+    assert included.n_works == len(groups["all"])
+
+
+def test_build_map_n_neighbors_override(config: Config, catalog: Catalog):
+    _seed_mixed_works(catalog, config)
+    result = build_map(catalog, config, n_neighbors=4)
+    params = json.loads(catalog.get_map(result.version)["params_json"])
+    assert params["n_neighbors"] == 4
+    model_2d = joblib.load(result.model_2d_path)
+    assert model_2d.get_params()["n_neighbors"] == 4
+
+    # 覆盖值超过样本数时自动降为 n-1
+    capped = build_map(catalog, config, n_neighbors=100)
+    params = json.loads(catalog.get_map(capped.version)["params_json"])
+    assert params["n_neighbors"] == capped.n_works - 1
+
+    with pytest.raises(MapError, match="n_neighbors 必须 >= 2"):
+        build_map(catalog, config, n_neighbors=1)
+
+
+def test_build_map_variants(config: Config, catalog: Catalog):
+    _seed_mixed_works(catalog, config)
+    results = build_map_variants(catalog, config, n_neighbors_list=(3, 5, 3))
+    assert [result.version for result in results] == ["map_v001", "map_v002"]
+    neighbors = [
+        json.loads(catalog.get_map(result.version)["params_json"])["n_neighbors"]
+        for result in results
+    ]
+    assert neighbors == [3, 5]
+    notes = [catalog.get_map(result.version)["note"] for result in results]
+    assert all("n_neighbors=" in note for note in notes)
+
+    with pytest.raises(MapError, match="不能为空"):
+        build_map_variants(catalog, config, n_neighbors_list=())
+    with pytest.raises(MapError, match="n_neighbors 必须 >= 2"):
+        build_map_variants(catalog, config, n_neighbors_list=(1,))
+
+
+def test_transform_new_respects_map_filter(config: Config, catalog: Catalog):
+    groups = _seed_mixed_works(catalog, config)
+    result = build_map(catalog, config, filter_spec={"dataset": "bilibili"})
+    assert result.n_works == len(groups["bilibili"])
+
+    # 本地新作品不满足筛选条件，不应被 transform 进来
+    local_new = _add_work(catalog, config, 40, source="local")
+    assert transform_new(catalog, config, map_version=result.version) == 0
+    assert local_new not in _read_coords(result)["work_id"].tolist()
+
+    # Bilibili 新作品满足筛选条件
+    bilibili_new = _add_work(catalog, config, 41)
+    assert transform_new(catalog, config, map_version=result.version) == 1
+    assert bilibili_new in _read_coords(result)["work_id"].tolist()
+
+
+def test_cli_build_with_filter_and_neighbors(config: Config, catalog: Catalog, capsys):
+    groups = _seed_mixed_works(catalog, config)
+    code = main(
+        [
+            "build",
+            "--config",
+            str(config.path),
+            "--dataset",
+            "local",
+            "--vote-year",
+            "2025",
+            "--n-neighbors",
+            "5",
+            "--note",
+            "本地筛选",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "筛选条件" in out
+    assert "来源=本地" in out
+    assert "不可直接比较" in out
+
+    map_row = catalog.latest_map()
+    assert json.loads(map_row["filter_json"]) == {"dataset": "local", "vote_year": 2025}
+    # 4 部作品时 n_neighbors 会被截断为 min(5, n-1)=3，并如实记录
+    assert json.loads(map_row["params_json"])["n_neighbors"] == 3
+    coords = pd.read_parquet(config.paths.maps / map_row["version"] / "coords.parquet")
+    assert set(coords["work_id"].tolist()) == set(groups["local"])
+
+
+def test_cli_variants(config: Config, catalog: Catalog, capsys):
+    _seed_mixed_works(catalog, config)
+    code = main(
+        [
+            "variants",
+            "--config",
+            str(config.path),
+            "--n-neighbors",
+            "3",
+            "5",
+            "--note-prefix",
+            "对比",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "2 个星云变体" in out
+    maps = catalog.list_maps()
+    assert len(maps) == 2
+    assert [json.loads(map_row["params_json"])["n_neighbors"] for map_row in maps] == [3, 5]
+
+    listed = main(["list", "--config", str(config.path)])
+    assert listed == 0
+    out = capsys.readouterr().out
+    assert "n_neighbors=3" in out
+    assert "筛选=" in out
+
+
+def test_cli_filter_error_returns_nonzero(config: Config, catalog: Catalog, capsys):
+    _seed_mixed_works(catalog, config)
+    code = main(["build", "--config", str(config.path), "--vote-year", "2023"])
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "错误" in captured.err
+    assert "筛选后作品数量不足" in captured.err

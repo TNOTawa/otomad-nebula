@@ -340,3 +340,63 @@ def test_interrupted_downloading_with_vectors_self_heals_and_batch_continues(con
         pipeline.close()
     finally:
         catalog.close()
+
+def test_pipeline_records_stage_timings_and_perf_csv(config, sample_video, tmp_path):
+    _copy_video(config, sample_video, "timed.mp4")
+    catalog = _open_catalog(config)
+    try:
+        pipeline = _pipeline(config, catalog)
+        register_local_videos(catalog, config)
+        stats = pipeline.process_pending(source="local", verify_sync=0)
+        assert stats.completed == 1
+        runs = catalog.list_pipeline_runs()
+        assert len(runs) == 1
+        run = runs[0]
+        assert run["embedding_version"] == pipeline.embedding_version
+        assert run["n_selected"] == 1 and run["n_completed"] == 1 and run["n_failed"] == 0
+        assert run["finished_at"]
+        assert run["total_s"] is not None and run["total_s"] >= 0
+        assert run["model_load_s"] == 0.0  # HashTestEmbedder 不加载模型
+        timings = catalog.list_work_timings(run_id=run["id"])
+        assert len(timings) == 1
+        row = timings[0]
+        for name in ("download_s", "probe_s", "extract_s", "preprocess_s",
+                     "forward_s", "save_s", "total_s"):
+            assert row[name] >= 0.0
+        assert row["total_s"] == pytest.approx(stats.outcomes[0].elapsed_s, abs=0.5)
+        assert row["download_s"] == 0.0
+        perf = config.paths.logs / f"perf_{run['id']:03d}.csv"
+        assert perf.is_file()
+        header = perf.read_text(encoding="utf-8").splitlines()[0]
+        assert "extract_s" in header and "forward_s" in header
+        pipeline.close()
+    finally:
+        catalog.close()
+
+
+def test_process_pending_list_key_orders_and_limits(config, tmp_path):
+    ids = {}
+    for index in range(3):
+        source = _make_synth_video(tmp_path / f"l{index}.mp4", duration=12, freq=250 + index * 50)
+        _copy_video(config, source, f"l{index}.mp4")
+    catalog = _open_catalog(config)
+    try:
+        pipeline = _pipeline(config, catalog)
+        register_local_videos(catalog, config)
+        for work in catalog.list_works():
+            ids[work["work_key"]] = work["id"]
+        list_id = catalog.ensure_list("votes_test", name="测试榜单", kind="votes", vote_year=2025)
+        # 排名故意打乱：l1 第 1、l2 第 2、l0 第 3
+        catalog.add_appearance(ids["local:l1.mp4"], list_id, rank=1)
+        catalog.add_appearance(ids["local:l2.mp4"], list_id, rank=2)
+        catalog.add_appearance(ids["local:l0.mp4"], list_id, rank=3)
+        stats = pipeline.process_pending(list_key="votes_test", list_limit=2)
+        assert stats.selected == 2
+        assert [o.work_id for o in stats.outcomes] == [
+            ids["local:l1.mp4"],
+            ids["local:l2.mp4"],
+        ]
+        assert catalog.get_work(ids["local:l0.mp4"])["status"] == "pending"
+        pipeline.close()
+    finally:
+        catalog.close()

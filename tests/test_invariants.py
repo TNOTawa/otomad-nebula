@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import random
 import shutil
 import subprocess
@@ -31,6 +32,7 @@ import pytest
 from nebula import CLIP_VECTOR_KINDS, EMBEDDING_KINDS, WORK_VECTOR_KINDS
 from nebula.config import Config
 from nebula.db import (
+    SCHEMA_VERSION,
     STATUSES,
     TRANSITIONS,
     Catalog,
@@ -118,6 +120,33 @@ def test_mapplot_does_not_import_ui_libraries() -> None:
     _assert_no_import(path, ("streamlit", "plotly"))
 
 
+def test_similarity_uses_high_dim_not_umap() -> None:
+    """A1 近邻索引必须使用高维余弦；禁止依赖 UMAP 平面距离或模型推理。"""
+
+    path = _module_file("similarity")
+    _assert_no_import(path, ("umap", "streamlit", "plotly", "torch", "transformers"))
+
+
+def test_identity_logic_is_offline() -> None:
+    """B1 身份关联逻辑不加载模型/界面库；网络客户端通过参数注入。"""
+
+    path = _module_file("identity")
+    _assert_no_import(path, ("torch", "transformers", "streamlit", "plotly", "umap"))
+
+
+def test_stability_report_is_offline_and_plan_distance_free() -> None:
+    """A3 稳定性只读已保存向量：不加载模型、不导入 UMAP/界面库。"""
+
+    path = _module_file("stability")
+    _assert_no_import(
+        path, ("torch", "transformers", "streamlit", "plotly", "umap", "pandas")
+    )
+    tool = REPO_ROOT / "tools" / "clip_stability.py"
+    if not tool.is_file():
+        pytest.skip("tools/clip_stability.py 尚未交付")
+    _assert_no_import(tool, ("torch", "transformers", "streamlit", "plotly", "umap"))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 元数据不进入向量
 # ──────────────────────────────────────────────────────────────────────────────
@@ -187,13 +216,16 @@ def test_embedder_interface_takes_paths_only() -> None:
 
 
 def test_map_loader_interface_has_no_metadata_arguments() -> None:
-    """星云矩阵加载只按向量版本取数，不接收元数据过滤条件。"""
+    """星云矩阵加载只按向量版本/筛选条件取数，不接收单个作品元数据。"""
 
     path = _module_file("mapplot")
     params = _function_param_names(path, "load_embedding_matrix")
     if params is None:
         pytest.skip("nebula.mapplot 尚无 load_embedding_matrix")
-    assert params == ["cat", "cfg", "version"], f"load_embedding_matrix 参数异常: {params}"
+    assert params == ["cat", "cfg", "version", "filter_spec"], (
+        f"load_embedding_matrix 参数异常: {params}"
+    )
+    assert not set(params) & set(METADATA_FIELDS)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -251,6 +283,11 @@ def test_embedding_version_ignores_runtime_only_settings(config: Config) -> None
         == base
     )
     assert _variant_version(config, model={"batch_size": config.model.batch_size + 1}) == base
+    # device/dtype 是运行时条件；A3/ADR-0001 明确 embedding_version 不编码它们
+    assert _variant_version(config, model={"device": "cpu", "dtype": "float32"}) == base
+    other_device = "cuda" if config.model.device != "cuda" else "cpu"
+    other_dtype = "bfloat16" if config.model.dtype != "bfloat16" else "float32"
+    assert _variant_version(config, model={"device": other_device, "dtype": other_dtype}) == base
 
 
 def test_embedding_version_format_and_content(config: Config) -> None:
@@ -385,6 +422,201 @@ def test_bilibili_work_key_dedupes_by_bvid_and_part(catalog: Catalog) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# DB v2（迭代 A）：身份关联 / 批次计时 / 筛选条件落库
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_schema_v2_tables_and_columns(catalog: Catalog) -> None:
+    """v2 schema：新增三张表与 map_runs.filter_json 列，版本号必须为 2。"""
+
+    assert SCHEMA_VERSION == "2"
+    tables = {
+        str(row[0])
+        for row in catalog.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert {"work_links", "pipeline_runs", "work_timings"} <= tables
+    map_columns = {
+        str(row[1]) for row in catalog.conn.execute("PRAGMA table_info(map_runs)").fetchall()
+    }
+    assert "filter_json" in map_columns
+    link_columns = {
+        str(row[1]) for row in catalog.conn.execute("PRAGMA table_info(work_links)").fetchall()
+    }
+    assert {"canonical_work_id", "duplicate_work_id", "method"} <= link_columns
+
+
+def test_work_links_single_level_and_unique(catalog: Catalog) -> None:
+    """一个 duplicate 只能属于一个 canonical；canonical 不能是别人的 duplicate。"""
+
+    canonical, _ = catalog.upsert_bilibili_work("BV1xx411c7m1")
+    duplicate_a, _ = catalog.upsert_bilibili_work("BV1xx411c7m2")
+    duplicate_b, _ = catalog.upsert_bilibili_work("BV1xx411c7m3")
+
+    catalog.link_works(
+        canonical, duplicate_a, method="title+duration", confidence=0.99, note="测试"
+    )
+    with pytest.raises(DatabaseError):
+        catalog.link_works(duplicate_b, duplicate_a, method="title+duration")
+    with pytest.raises(DatabaseError):
+        catalog.link_works(duplicate_a, duplicate_b, method="title+duration")
+    with pytest.raises(DatabaseError):
+        catalog.link_works(duplicate_b, duplicate_b, method="title+duration")
+    with pytest.raises(DatabaseError):
+        catalog.link_works(canonical, duplicate_b, method="")
+
+    links = catalog.get_work_links()
+    assert len(links) == 1
+    assert links[0]["canonical_work_id"] == canonical
+    assert links[0]["duplicate_work_id"] == duplicate_a
+    assert catalog.get_canonical_work_id(duplicate_a) == canonical
+    assert catalog.get_canonical_work_id(canonical) == canonical
+    assert catalog.get_duplicate_work_ids() == {duplicate_a}
+    linked = catalog.get_linked_duplicates(canonical)
+    assert [int(row["id"]) for row in linked] == [duplicate_a]
+    assert linked[0]["link_method"] == "title+duration"
+    assert linked[0]["link_confidence"] == pytest.approx(0.99)
+    assert catalog.get_work_link(duplicate_a)["canonical_work_id"] == canonical
+    with pytest.raises(DatabaseError):
+        catalog.unlink_work(canonical)  # canonical 本身没有关联记录
+    assert catalog.unlink_work(duplicate_a, reason="撤销") == canonical
+    assert catalog.get_duplicate_work_ids() == set()
+    assert catalog.get_work_links() == []
+
+
+def test_duplicates_excluded_from_default_queries_but_data_kept(catalog: Catalog) -> None:
+    """duplicate 默认不进入榜单/地图候选查询，但其作品记录、向量与文件登记保留。"""
+
+    catalog.register_embedding_version(
+        "v-link",
+        model_checkpoint="synthetic",
+        model_revision=None,
+        frames=16,
+        clip_seconds=8.0,
+        clips_per_work=5,
+        audio_sample_rate=48000,
+        params={},
+    )
+    canonical, _ = catalog.upsert_bilibili_work("BV1xx411c7m1", title="同一作品")
+    duplicate, _ = catalog.upsert_local_work("local/同一作品.mp4")
+    for work_id in (canonical, duplicate):
+        catalog.register_embedding(
+            work_id,
+            version="v-link",
+            kind="work_joint",
+            path=f"embeddings/v-link/{work_id:06d}/work_joint.npy",
+            dim=8,
+        )
+    list_id = catalog.ensure_list(
+        "votes_2025", name="2025年音MAD选票", kind="votes", vote_year=2025
+    )
+    catalog.add_appearance(canonical, list_id, rank=1)
+    catalog.add_appearance(duplicate, list_id, rank=2)
+    catalog.link_works(canonical, duplicate, method="title+duration", confidence=0.99)
+
+    assert catalog.work_ids_for_list("votes_2025") == {canonical}
+    assert catalog.work_ids_for_list("votes_2025", only_canonical=False) == {
+        canonical,
+        duplicate,
+    }
+    default_rows = catalog.list_works_for_list("votes_2025")
+    assert [int(row["id"]) for row in default_rows] == [canonical]
+    full_rows = catalog.list_works_for_list("votes_2025", only_canonical=False)
+    assert {int(row["id"]) for row in full_rows} == {canonical, duplicate}
+    # duplicate 的向量登记与作品记录必须保留（只是默认不出现在星云/榜单视图里）
+    assert catalog.has_embedding(duplicate, version="v-link")
+    assert catalog.has_embedding(canonical, version="v-link")
+
+
+def test_map_run_filter_json_roundtrip(catalog: Catalog) -> None:
+    """筛选星云的 filter_spec 必须原样落库；无筛选时为 None。"""
+
+    catalog.register_embedding_version(
+        "v1",
+        model_checkpoint="synthetic",
+        model_revision=None,
+        frames=16,
+        clip_seconds=8.0,
+        clips_per_work=5,
+        audio_sample_rate=48000,
+        params={},
+    )
+    work_id, _ = catalog.upsert_local_work("a.mp4")
+    catalog.create_map_run(
+        "map_v001",
+        embedding_version="v1",
+        params={"n_neighbors": 15},
+        coords=[(work_id, 0.0, 0.0, 0.0, 0.0, 0.0)],
+    )
+    assert catalog.get_map("map_v001")["filter_json"] is None
+
+    spec = {"dataset": "bilibili", "vote_year": 2025, "include_duplicates": False}
+    catalog.create_map_run(
+        "map_v002",
+        embedding_version="v1",
+        params={"n_neighbors": 8},
+        coords=[(work_id, 1.0, 1.0, 1.0, 1.0, 1.0)],
+        filter_spec=spec,
+    )
+    row = catalog.get_map("map_v002")
+    assert json.loads(row["filter_json"]) == spec
+    latest = catalog.latest_map()
+    assert latest["version"] == "map_v002"
+    assert json.loads(latest["filter_json"]) == spec
+    assert all("filter_json" in map_row for map_row in catalog.list_maps())
+
+
+def test_pipeline_runs_and_timings_semantics(catalog: Catalog) -> None:
+    """批次计时：负耗时/负计数被拒绝，写读一致，批次完成信息可查。"""
+
+    work_id, _ = catalog.upsert_local_work("a.mp4")
+    run_id = catalog.start_pipeline_run(embedding_version="v1", params={"note": "审计"})
+    assert isinstance(run_id, int) and run_id >= 1
+
+    catalog.record_work_timing(
+        None, work_id, embedding_version="v1", probe_s=0.1, total_s=0.2
+    )
+    catalog.record_work_timing(
+        run_id, work_id, embedding_version="v1", extract_s=0.3, total_s=0.4
+    )
+    timings = catalog.list_work_timings(run_id=run_id)
+    assert len(timings) == 1
+    assert timings[0]["extract_s"] == pytest.approx(0.3)
+    assert len(catalog.list_work_timings(embedding_version="v1")) == 2
+
+    catalog.finish_pipeline_run(
+        run_id, n_selected=1, n_completed=1, n_failed=0, total_s=1.5, model_load_s=0.2
+    )
+    runs = catalog.list_pipeline_runs(limit=5)
+    assert runs[0]["id"] == run_id
+    assert runs[0]["finished_at"]
+    assert runs[0]["n_completed"] == 1
+    assert runs[0]["total_s"] == pytest.approx(1.5)
+
+    for field in (
+        "download_s",
+        "probe_s",
+        "extract_s",
+        "preprocess_s",
+        "forward_s",
+        "save_s",
+        "total_s",
+    ):
+        with pytest.raises(DatabaseError):
+            catalog.record_work_timing(
+                run_id, work_id, embedding_version="v1", **{field: -0.01}
+            )
+    with pytest.raises(DatabaseError):
+        catalog.finish_pipeline_run(99999, n_selected=1, n_completed=1, n_failed=0, total_s=1)
+    with pytest.raises(DatabaseError):
+        catalog.list_pipeline_runs(limit=0)
+
+    stats = catalog.stats()
+    assert stats["links"] == 0
+    assert stats["pipeline_runs"] == 1
+    assert stats["timings"] >= 1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 采样规则
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -496,15 +728,27 @@ def test_gitignore_actually_ignores_paths(repo_root: Path) -> None:
         assert proc.returncode == 0, f"git 未忽略运行时产物: {rel_path}"
 
 
-@pytest.mark.parametrize("script_name", ["ingest.py", "pipeline.py", "map.py", "qa.py"])
-def test_cli_help_runs(repo_root: Path, script_name: str) -> None:
-    """顶层 CLI 脚本必须能被 --help 安全调用（不加载模型、不触网、不写数据）。"""
+@pytest.mark.parametrize(
+    ("script_name", "args"),
+    [
+        ("ingest.py", ()),
+        ("pipeline.py", ()),
+        ("map.py", ()),
+        ("map.py", ("variants",)),
+        ("ingest.py", ("link-local",)),
+        ("tools/clip_stability.py", ()),
+        ("qa.py", ()),
+    ],
+)
+def test_cli_help_runs(repo_root: Path, script_name: str, args: tuple[str, ...]) -> None:
+    """顶层 CLI 与 v0.2 子命令必须能被 --help 安全调用（不加载模型、不触网、不写数据）。"""
 
     script = repo_root / script_name
     if not script.is_file():
         pytest.skip(f"入口脚本 {script_name} 尚未交付")
+    label = " ".join((script_name, *args))
     proc = subprocess.run(
-        [sys.executable, str(script), "--help"],
+        [sys.executable, str(script), *args, "--help"],
         cwd=str(repo_root),
         capture_output=True,
         text=True,
@@ -514,6 +758,6 @@ def test_cli_help_runs(repo_root: Path, script_name: str) -> None:
         check=False,
     )
     combined = (proc.stdout or "") + (proc.stderr or "")
-    assert proc.returncode == 0, f"{script_name} --help 退出码 {proc.returncode}: {combined[-800:]}"
-    assert "usage" in combined.lower(), f"{script_name} --help 未输出 usage"
-    assert "traceback" not in combined.lower(), f"{script_name} --help 出现异常堆栈"
+    assert proc.returncode == 0, f"{label} --help 退出码 {proc.returncode}: {combined[-800:]}"
+    assert "usage" in combined.lower(), f"{label} --help 未输出 usage"
+    assert "traceback" not in combined.lower(), f"{label} --help 出现异常堆栈"

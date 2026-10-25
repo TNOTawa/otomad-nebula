@@ -1,0 +1,19 @@
+# 音MAD星云计划 · 手动身份关联清单示例文件
+# 用途：当自动候选（标题 + 时长双重校验）无法确定，但人工确认某部本地视频就是
+#       某个 Bilibili 作品时，用本清单显式指定。使用方式：
+#
+#   python ingest.py link-local --list-key votes_2025 --manual
+#
+# 用法：复制本文件为 input/lists/local_bv_links.csv（去掉 .example）再填真实数据。
+# 列：
+#   local_path  必填，相对 input/local 的路径（POSIX 或 Windows 分隔符均可）
+#   bvid        必填，Bilibili BV 号
+#   part        可选，分P序号，默认 1
+#
+# 以 # 开头的行是注释；同一 local_path 出现多次时最后一行为准。
+# 手动关联与自动候选冲突时，手动关联优先（自动候选中涉及同一作品的不再重复处理）。
+#
+# 示例（以下均为注释，取消注释并改为真实路径后才会生效）：
+# local_path,bvid,part
+# 【音EDM合作】Chromeme.mp4,BV1GvYZznES3,1
+# 坏枪 vs 学识/上不去！.mp4,BV1vN3azbErf,1

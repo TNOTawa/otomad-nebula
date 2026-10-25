@@ -48,7 +48,7 @@
 
 - **Project:** otomad-nebula（音MAD星云计划）
 - **Purpose:** 用 PE-AV 多模态模型提取音MAD作品联合向量，持久化为可扩充的高维向量数据库，并用 UMAP 生成可交互 2D/3D 星云（外部元数据仅用于染色/筛选）。
-- **Main entry point:** 方案文档要求的四个入口：`ingest.py`（导入）、`pipeline.py`（下载/切片/编码/清理）、`map.py`（UMAP 星云版本）、`app.py`（Streamlit 可视化）；内部实现在 `nebula/`。
+- **Main entry point:** 方案文档要求的四个入口：`ingest.py`（导入/身份关联）、`pipeline.py`（下载/切片/编码/清理/计时）、`map.py`（UMAP 星云版本/筛选/变体）、`app.py`（Streamlit 可视化：2D/3D、近邻、染色、筛选）；内部实现在 `nebula/`，新增 `similarity.py`（高维近邻）、`identity.py`（本地/BV 去重）、`stability.py`（片段稳定性）。
 - **Architecture map:** `ARCHITECTURE.md`；接口与边界契约见 `docs/CONTRACTS.md`；执行计划见 `音MAD星云计划 · 完整执行方案.md`。
 - **Build/setup:** Python 3.10 + `.venv`（uv）。`uv venv .venv`；`uv pip install -e ".[ml,dev]"`（ffmpeg/ffprobe 需在 PATH）；配置 `config.yaml`。
 - **Fast relevant tests:** `.\\.venv\\Scripts\\python.exe -m pytest tests -q`；`ruff check nebula tests`。
@@ -62,6 +62,10 @@
   - 状态机 `pending -> downloading -> encoding -> completed`，失败 `failed` 可重试；`completed` 只能通过显式 `Catalog.reopen()` 重开。
   - 任务状态、向量登记、星云版本以 SQLite 为唯一事实来源；临时文件仅在向量成功登记后清理，本地原始视频永不删除。
   - PE-AV 加载依赖 transformers 5.20.2 的 `TimmWrapperConfig.num_labels` workaround（见 `nebula/embed.py`），升级 transformers 后必须重验。
+  - 身份关联：`work_links` 中 canonical 是星云保留实体，duplicate 默认排除（npy/记录保留）；关联依据是规范化标题完全相等 + Bilibili 分P时长差 ≤3s，不确定不自动合并。
+  - 筛选星云把条件写入 `map_runs.filter_json`；不同版本/不同筛选的 UMAP 坐标不可直接比较绝对位置。
+  - 分阶段耗时写入 `work_timings`/`pipeline_runs`，明细 CSV 在 `logs/perf_<run_id>.csv`（`pipeline.py timings` 查看）。
+  - 已知边界：超长活动直播回放（如 8.7h）暂不做全量下载，记录 failed；竖屏视频下载需 width 维度筛选（config.yt_dlp_format 已含）。
 
 ## Completion
 

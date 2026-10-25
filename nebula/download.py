@@ -51,7 +51,13 @@ YdlFactory = Callable[[dict[str, Any]], Any]
 
 @dataclass(frozen=True)
 class BilibiliMeta:
-    """一部 Bilibili 视频（或其中一个分P）的元数据。"""
+    """一部 Bilibili 视频（或其中一个分P）的元数据。
+
+    duration_s 在指定分P时是"该分P的时长"：多分P视频不会用整部总时长，
+    否则本地视频与 Bilibili 分P的时长校验会被误判（回归 bug 见 B1）。
+    part_title 是该分P的标题（pages[part-1]["part"]；单P或缺少该字段时为 None），
+    整部标题保留在 title 中。
+    """
 
     bvid: str
     title: str
@@ -61,6 +67,7 @@ class BilibiliMeta:
     publish_date: str | None  # YYYY-MM-DD
     cover_url: str | None
     page_count: int
+    part_title: str | None = None
 
 
 def is_valid_bvid(value: object) -> bool:
@@ -180,7 +187,8 @@ class BilibiliClient:
         """获取一个 Bilibili 视频（或其中一个分P）的元数据。
 
         调用 https://api.bilibili.com/x/web-interface/view?bvid=...，
-        解析标题、时长、UP 主、发布日期、封面与分P数量。
+        解析标题、时长、UP 主、发布日期、封面与分P数量。指定分P时 duration_s
+        是该分P的时长（多分P视频不能用整部总时长），标题仍保留整部标题。
 
         异常
         ----
@@ -249,12 +257,16 @@ def _meta_from_payload(bvid: str, part: int, data: Mapping[str, Any]) -> Bilibil
             page = candidate
 
     duration_value: Any = data.get("duration")
-    if (
-        page is not None
-        and (part > 1 or duration_value is None)
-        and page.get("duration") is not None
-    ):
-        duration_value = page["duration"]
+    part_title: str | None = None
+    if page is not None:
+        # 多分P视频的 data["duration"] 是整部总时长，必须优先采用该分P的时长；
+        # 只有分P时长缺失/非法时才回退到总时长（并保证最终时长 > 0）。
+        page_duration = _optional_positive_float(page.get("duration"))
+        if page_duration is not None:
+            duration_value = page_duration
+        raw_part_title = page.get("part")
+        if raw_part_title is not None:
+            part_title = str(raw_part_title).strip() or None
     duration_s = _positive_float(duration_value, field="duration", bvid=bvid)
 
     owner = data.get("owner")
@@ -281,7 +293,22 @@ def _meta_from_payload(bvid: str, part: int, data: Mapping[str, Any]) -> Bilibil
         publish_date=publish_date,
         cover_url=cover_url,
         page_count=page_count,
+        part_title=part_title,
     )
+
+
+def _optional_positive_float(value: Any) -> float | None:
+    """解析可选正浮点数；None/非法/非正数时返回 None（分P时长回退用）。"""
+
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
 
 
 def _positive_float(value: Any, *, field: str, bvid: str) -> float:

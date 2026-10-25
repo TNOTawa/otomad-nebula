@@ -2,11 +2,13 @@
 
 默认快速离线检查（不访问网络、不加载模型权重）：
 
-1. ruff 静态检查：nebula/、tests/、项目根目录全部 Python 脚本；
+1. ruff 静态检查：nebula/、tests/、项目根目录与 tools/ 下的 Python 脚本；
 2. pytest：tests/ 全量测试，默认排除 model / network 标记；
-3. 文档检查：README.md、ARCHITECTURE.md 存在且非空，docs/adr/ 至少 3 篇
-   并包含 Decision / Why / Options / Chosen / Consequences / How verified 章节；
-4. CLI 入口冒烟：ingest.py、pipeline.py、map.py 的 --help 均能成功运行；
+3. 文档检查：README.md、ARCHITECTURE.md 存在且包含 v0.2 关键内容；docs/adr/ 至少 7 篇
+   （含 0005 身份关联 / 0006 筛选地图 / 0007 高维近邻密度）并包含
+   Decision / Why / Options / Chosen / Consequences / How verified 章节；
+4. CLI 入口冒烟：ingest.py、pipeline.py、map.py 及其 v0.2 子命令（map.py variants、
+   ingest.py link-local）、tools/clip_stability.py 的 --help 均能成功运行；
 5. 配置有效性：config.yaml 可加载；可据此生成并加载一份临时隔离配置；ffmpeg/ffprobe 可用。
 
 --full 额外运行带 model / network 标记的测试（需要 PE-AV 权重和网络；
@@ -41,12 +43,28 @@ ROOT = Path(__file__).resolve().parent
 
 CHECK_NAMES: tuple[str, ...] = ("ruff", "pytest", "docs", "cli", "config")
 
-ENTRY_SCRIPTS: tuple[str, ...] = ("ingest.py", "pipeline.py", "map.py")
-"""必须提供可运行 --help 的顶层 CLI 脚本。"""
+CLI_CHECKS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("ingest.py", ()),
+    ("pipeline.py", ()),
+    ("map.py", ()),
+    ("map.py", ("variants",)),
+    ("ingest.py", ("link-local",)),
+    ("tools/clip_stability.py", ()),
+)
+"""必须能以 --help 成功运行的 CLI 入口（脚本, 子命令参数）。"""
 
 REQUIRED_DOC_FILES: tuple[str, ...] = ("README.md", "ARCHITECTURE.md")
 
-MIN_ADR_COUNT = 3
+V02_DOC_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "README.md": ("v0.2", "近邻", "稳定性", "身份关联", "筛选"),
+    "ARCHITECTURE.md": ("work_links", "filter_json", "stability", "余弦"),
+}
+"""v0.2 文档必须覆盖的关键内容（存在性检查，不校验具体措辞）。"""
+
+REQUIRED_ADR_PREFIXES: tuple[str, ...] = ("0005", "0006", "0007")
+"""v0.2 必需的 ADR 编号前缀（身份关联、筛选地图、高维近邻密度）。"""
+
+MIN_ADR_COUNT = 7
 ADR_SECTIONS: tuple[str, ...] = (
     "Decision",
     "Why",
@@ -239,10 +257,27 @@ def check_docs(*, verbose: bool = False) -> CheckResult:
         elif path.stat().st_size < 100:
             problems.append(f"{name} 内容过少（{path.stat().st_size} 字节）")
 
+    for name, keywords in V02_DOC_KEYWORDS.items():
+        path = ROOT / name
+        if not path.is_file():
+            continue  # 缺失或过短已由上面的文档文件检查报告
+        try:
+            lowered = path.read_text(encoding="utf-8").lower()
+        except OSError as exc:
+            problems.append(f"无法读取 {name}: {exc}")
+            continue
+        missing = [keyword for keyword in keywords if keyword.lower() not in lowered]
+        if missing:
+            problems.append(f"{name} 缺少 v0.2 内容: {', '.join(missing)}")
+
     adr_dir = ROOT / "docs" / "adr"
     adr_files = sorted(path for path in adr_dir.glob("*.md") if path.name[:1].isdigit())
     if len(adr_files) < MIN_ADR_COUNT:
         problems.append(f"docs/adr/ 至少需要 {MIN_ADR_COUNT} 篇 ADR，当前 {len(adr_files)} 篇")
+    adr_names = [path.name for path in adr_files]
+    for prefix in REQUIRED_ADR_PREFIXES:
+        if not any(name.startswith(prefix) for name in adr_names):
+            problems.append(f"docs/adr/ 缺少 {prefix} 开头的 ADR（v0.2 新增决策）")
     for adr in adr_files:
         try:
             text = adr.read_text(encoding="utf-8")
@@ -258,7 +293,7 @@ def check_docs(*, verbose: bool = False) -> CheckResult:
         print(f"  ADR 文件: {[path.name for path in adr_files]}")
     if problems:
         return CheckResult("docs", False, "；".join(problems), duration)
-    detail = f"README/ARCHITECTURE 存在，ADR {len(adr_files)} 篇且章节完整"
+    detail = f"README/ARCHITECTURE 含 v0.2 内容，ADR {len(adr_files)} 篇且章节完整"
     return CheckResult("docs", True, detail, duration)
 
 
@@ -268,32 +303,37 @@ def check_cli(*, verbose: bool = False) -> CheckResult:
     problems: list[str] = []
     passed: list[str] = []
     outputs: list[str] = []
-    for script_name in ENTRY_SCRIPTS:
+    for script_name, sub_args in CLI_CHECKS:
         script = ROOT / script_name
+        label = " ".join((script_name, *sub_args))
         if not script.is_file():
             problems.append(f"缺少入口脚本 {script_name}")
             continue
-        command = [python, script_name, "--help"]
+        command = [python, script, *sub_args, "--help"]
         try:
             proc = run_command(command, timeout_s=CLI_TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            problems.append(f"{script_name} --help 超时（>{CLI_TIMEOUT_S:.0f}s）")
+            problems.append(f"{label} --help 超时（>{CLI_TIMEOUT_S:.0f}s）")
             continue
         combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
         if verbose:
             print(f"  命令: {' '.join(map(str, command))}")
         if proc.returncode != 0:
-            problems.append(f"{script_name} --help 退出码 {proc.returncode}")
-            outputs.append(f"--- {script_name} --help ---\n{_tail(combined)}")
+            problems.append(f"{label} --help 退出码 {proc.returncode}")
+            outputs.append(f"--- {label} --help ---\n{_tail(combined)}")
         elif "usage" not in combined.lower():
-            problems.append(f"{script_name} --help 输出中没有 usage 信息")
-            outputs.append(f"--- {script_name} --help ---\n{_tail(combined)}")
+            problems.append(f"{label} --help 输出中没有 usage 信息")
+            outputs.append(f"--- {label} --help ---\n{_tail(combined)}")
         else:
-            passed.append(script_name)
+            passed.append(label)
     duration = time.perf_counter() - started
     if problems:
         return CheckResult("cli", False, "；".join(problems), duration, "\n".join(outputs))
-    return CheckResult("cli", True, f"{', '.join(passed)} --help 均可运行", duration)
+    detail = (
+        f"{len(passed)} 个 CLI 入口 --help 均可运行"
+        "（含 map.py variants、ingest.py link-local、tools/clip_stability.py）"
+    )
+    return CheckResult("cli", True, detail, duration)
 
 
 def check_config(*, verbose: bool = False) -> CheckResult:

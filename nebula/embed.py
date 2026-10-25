@@ -31,6 +31,7 @@ import hashlib
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, Sequence, runtime_checkable
@@ -57,11 +58,17 @@ class EmbeddingBatch:
 
     joint / audio / video 的形状都是 (n, dim)，dtype 为 float32，逐行 L2 归一化；
     模型不提供单模态向量时对应字段为 None。
+
+    preprocess_s / forward_s 是 A4 分阶段耗时插桩字段：本次 encode_pairs 调用中
+    processor 解码 + 预处理与模型前向的累计秒数（CUDA 前向由 torch.cuda.synchronize
+    夹住计时）。HashTestEmbedder 等测试用实现固定为 0.0，不影响向量数值。
     """
 
     joint: np.ndarray
     audio: np.ndarray | None = None
     video: np.ndarray | None = None
+    preprocess_s: float = 0.0
+    forward_s: float = 0.0
 
 
 @runtime_checkable
@@ -174,7 +181,14 @@ def _hash_vector(domain: bytes, digests: tuple[bytes, ...], dim: int) -> np.ndar
 
 
 class PEAVEmbedder:
-    """PE-AV 多模态嵌入器：懒加载模型，按配置的 batch_size 分批编码片段对。"""
+    """PE-AV 多模态嵌入器：懒加载模型，按配置的 batch_size 分批编码片段对。
+
+    A4 计时属性 / 字段：
+    - model_load_s：懒加载总耗时（秒）；未加载时为 0.0，close() 后重置为 0.0；
+    - encode_pairs 返回的 EmbeddingBatch.preprocess_s / forward_s：本次调用内
+      processor 预处理与模型前向的累计耗时。
+    计时只读取时钟，不改变向量数值与归一化结果。
+    """
 
     is_test_only = False
 
@@ -190,6 +204,7 @@ class PEAVEmbedder:
         self._use_autocast = False
         self._loaded = False
         self._batch_size = max(1, int(model.batch_size))
+        self.model_load_s = 0.0
 
     @staticmethod
     def _resolve_device(device: str, torch: Any) -> str:
@@ -212,6 +227,7 @@ class PEAVEmbedder:
 
         if self._loaded:
             return
+        loaded_started = time.perf_counter()
         try:
             import torch
             from transformers import PeAudioVideoConfig, PeAudioVideoModel, PeAudioVideoProcessor
@@ -260,10 +276,12 @@ class PEAVEmbedder:
         self._device = device
         self._use_autocast = use_autocast
         self._loaded = True
+        self.model_load_s = time.perf_counter() - loaded_started
         logger.info(
-            "PE-AV 模型加载完成：device=%s dtype=%s",
+            "PE-AV 模型加载完成：device=%s dtype=%s（耗时 %.1fs）",
             device,
             "bfloat16(autocast)" if use_autocast else "float32",
+            self.model_load_s,
         )
 
     def _extract_embeds(
@@ -288,10 +306,16 @@ class PEAVEmbedder:
 
     def _encode_chunk(
         self, chunk: Sequence[tuple[Path, Path]]
-    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
-        """编码一个 batch 的片段对，返回（联合, 音频, 视频）归一化向量。"""
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, float, float]:
+        """编码一个 batch 的片段对。
+
+        返回（联合, 音频, 视频, preprocess_s, forward_s），后两者用于 A4 分阶段
+        耗时插桩；CUDA 前向用 torch.cuda.synchronize() 夹住计时，保证读到真实
+        GPU 完成时间。计时不参与任何向量运算，不影响数值结果。
+        """
 
         torch = self._torch
+        preprocess_started = time.perf_counter()
         try:
             inputs = self._processor(
                 videos=[str(video) for video, _ in chunk],
@@ -302,10 +326,15 @@ class PEAVEmbedder:
             )
         except Exception as exc:
             raise EmbeddingError(f"PE-AV 预处理失败（{len(chunk)} 个片段）：{exc}") from exc
+        preprocess_s = time.perf_counter() - preprocess_started
         model_inputs = {
             key: value.to(self._device) if torch.is_tensor(value) else value
             for key, value in dict(inputs).items()
         }
+        cuda = self._device == "cuda"
+        if cuda:
+            torch.cuda.synchronize()
+        forward_started = time.perf_counter()
         try:
             with torch.inference_mode():
                 if self._use_autocast:
@@ -315,13 +344,16 @@ class PEAVEmbedder:
                     outputs = self._model(**model_inputs)
         except Exception as exc:
             raise EmbeddingError(f"PE-AV 推理失败（{len(chunk)} 个片段）：{exc}") from exc
+        if cuda:
+            torch.cuda.synchronize()
+        forward_s = time.perf_counter() - forward_started
 
         joint = self._extract_embeds(outputs, "audio_video_embeds", expected_rows=len(chunk))
         if joint is None:
             raise EmbeddingError("PE-AV 模型没有返回 audio_video_embeds（联合向量）")
         audio = self._extract_embeds(outputs, "audio_embeds", expected_rows=len(chunk))
         video = self._extract_embeds(outputs, "video_embeds", expected_rows=len(chunk))
-        return joint, audio, video
+        return joint, audio, video, preprocess_s, forward_s
 
     def encode_pairs(self, pairs: Sequence[tuple[Path, Path]]) -> EmbeddingBatch:
         """分批编码 (视频文件, 音频文件) 片段对。
@@ -335,7 +367,8 @@ class PEAVEmbedder:
         ----
         EmbeddingBatch:
             joint 为 (n, dim) float32 归一化向量；模型提供单模态向量时
-            audio / video 也为 (n, dim)，否则为 None。
+            audio / video 也为 (n, dim)，否则为 None；preprocess_s / forward_s
+            为本次调用所有 batch 累计的预处理 / 前向耗时（秒）。
 
         异常
         ----
@@ -366,9 +399,13 @@ class PEAVEmbedder:
         joint_parts: list[np.ndarray] = []
         audio_parts: list[np.ndarray] = []
         video_parts: list[np.ndarray] = []
+        preprocess_total = 0.0
+        forward_total = 0.0
         for offset in range(0, len(normalized_pairs), self._batch_size):
             chunk = normalized_pairs[offset : offset + self._batch_size]
-            joint, audio, video = self._encode_chunk(chunk)
+            joint, audio, video, preprocess_s, forward_s = self._encode_chunk(chunk)
+            preprocess_total += preprocess_s
+            forward_total += forward_s
             joint_parts.append(joint)
             if audio is not None:
                 audio_parts.append(audio)
@@ -392,7 +429,13 @@ class PEAVEmbedder:
                     f"PE-AV 单模态向量 {name} 数量与联合向量不一致: "
                     f"{array.shape[0]} != {joint_all.shape[0]}"
                 )
-        return EmbeddingBatch(joint=joint_all, audio=audio_all, video=video_all)
+        return EmbeddingBatch(
+            joint=joint_all,
+            audio=audio_all,
+            video=video_all,
+            preprocess_s=preprocess_total,
+            forward_s=forward_total,
+        )
 
     def close(self) -> None:
         """释放模型与显存；允许重复调用。"""
@@ -403,6 +446,7 @@ class PEAVEmbedder:
         self._model = None
         self._torch = None
         self._loaded = False
+        self.model_load_s = 0.0
         if not was_loaded:
             return
         del model

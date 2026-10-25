@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import shutil
 from dataclasses import dataclass, field
@@ -29,17 +30,28 @@ from nebula.appdata import (
     apply_color,
     available_color_fields,
     external_url,
+    filter_frame,
     hover_text,
     load_nebula_frame,
+    neighbor_rows,
     search_frame,
 )
 from nebula.config import Config
 from nebula.db import Catalog
-from nebula.embed import HashTestEmbedder, load_vector
-from nebula.errors import MapError
+from nebula.download import BilibiliMeta
+from nebula.embed import HashTestEmbedder, load_vector, save_vector
+from nebula.errors import IngestError, MapError, NebulaError
+from nebula.identity import (
+    candidates_from_manual_links,
+    find_candidates,
+    link_candidates,
+    load_manual_links,
+    normalize_title,
+)
 from nebula.ingest import register_local_videos
-from nebula.mapplot import build_map
+from nebula.mapplot import build_map, load_embedding_matrix
 from nebula.pipeline import Pipeline
+from nebula.similarity import load_similarity_index
 from tests.fixtures.video_factory import (
     build_video_library,
     create_temp_config,
@@ -485,3 +497,1029 @@ def test_temp_cleanup_and_data_artifacts(e2e: E2EState) -> None:
     # 数据目录内不应出现写到一半的临时文件
     for pattern in ("*.partial", "*.tmp"):
         assert not list(e2e.cfg.paths.data.rglob(pattern))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. v0.2 独立验收：临时 DB + 合成向量（不依赖 ffmpeg/模型）
+#    覆盖 A1 高维近邻、A2 近邻密度/筛选星云、B1 身份关联与去重。
+#    断言由本文件独立实现（直接 np.load 读向量、手算余弦），不复用实现方测试的
+#    断言逻辑；所有数据在临时目录，不触碰仓库真实数据。
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class VectorEnv:
+    """A1/A2 独立验收所用的合成向量环境。"""
+
+    root: Path
+    cfg: Config
+    catalog: Catalog
+    version: str
+    work_ids: dict[str, int]
+
+
+def _unit64(values) -> np.ndarray:
+    vector = np.asarray(values, dtype=np.float64)
+    assert float(np.linalg.norm(vector)) > 0
+    return (vector / np.linalg.norm(vector)).astype(np.float32)
+
+
+def _direct_work_vectors(env: VectorEnv, kind: str = "work_joint") -> dict[int, np.ndarray]:
+    """独立读取一个模态的全部作品向量（直接 np.load，不经过实现方 API）。"""
+
+    vectors: dict[int, np.ndarray] = {}
+    for row in env.catalog.list_embeddings(env.version, kind=kind):
+        array = np.asarray(
+            np.load(env.cfg.data_path(str(row["path"])), allow_pickle=False), dtype=np.float64
+        )
+        if array.ndim == 2 and array.shape[0] == 1:
+            array = array.reshape(-1)
+        assert array.ndim == 1, f"{kind} 作品向量形状异常: {array.shape}"
+        vectors[int(row["work_id"])] = array / np.linalg.norm(array)
+    return vectors
+
+
+def _expected_ranked(vectors: dict[int, np.ndarray], work_id: int) -> list[tuple[int, float]]:
+    """手算余弦排序：相似度降序、work_id 升序（并列时稳定），不含自身。"""
+
+    pairs = [
+        (other_id, float(np.dot(vectors[work_id], vector)))
+        for other_id, vector in vectors.items()
+        if other_id != work_id
+    ]
+    pairs.sort(key=lambda pair: (-pair[1], pair[0]))
+    return pairs
+
+
+def _expected_kth_distances(
+    vectors: dict[int, np.ndarray], k: int
+) -> dict[int, float]:
+    distances: dict[int, float] = {}
+    for work_id in vectors:
+        ranked = _expected_ranked(vectors, work_id)
+        take = min(int(k), len(ranked))
+        distances[work_id] = 1.0 - ranked[take - 1][1]
+    return distances
+
+
+@pytest.fixture(scope="module")
+def vector_env(tmp_path_factory: pytest.TempPathFactory) -> VectorEnv:
+    root = tmp_path_factory.mktemp("accept-vectors")
+    cfg = create_temp_config(root)
+    catalog = Catalog(cfg.paths.db_path)
+    catalog.initialize()
+    version = "v-accept"
+    catalog.register_embedding_version(
+        version,
+        model_checkpoint="synthetic",
+        model_revision=None,
+        frames=16,
+        clip_seconds=8.0,
+        clips_per_work=5,
+        audio_sample_rate=48000,
+        params={"test": "e2e-acceptance"},
+    )
+    lists = {
+        "votes_2025": catalog.ensure_list(
+            "votes_2025", name="2025年音MAD选票", kind="votes", vote_year=2025
+        ),
+        "votes_2026": catalog.ensure_list(
+            "votes_2026", name="2026年音MAD选票", kind="votes", vote_year=2026
+        ),
+    }
+    specs = [
+        {
+            "name": "w1",
+            "source": "bilibili",
+            "bvid": "BV1xx411c7m1",
+            "title": "合成作品一",
+            "duration_s": 100.0,
+            "joint": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "audio": [1.0, 0.0, 0.0, 0.0],
+            "video": [1.0, 0.0, 0.0, 0.0],
+            "lists": [("votes_2025", 1, 500)],
+        },
+        {
+            "name": "w2",
+            "source": "bilibili",
+            "bvid": "BV1xx411c7m2",
+            "title": "合成作品二",
+            "duration_s": 120.0,
+            "joint": [0.8, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "audio": [0.8, 0.6, 0.0, 0.0],
+            "video": [0.6, 0.8, 0.0, 0.0],
+            "lists": [("votes_2025", 2, 400)],
+        },
+        {
+            "name": "w3",
+            "source": "bilibili",
+            "bvid": "BV1xx411c7m3",
+            "title": "合成作品三",
+            "duration_s": 80.0,
+            "joint": [0.6, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "audio": [0.0, 1.0, 0.0, 0.0],
+            "video": None,
+            "lists": [("votes_2025", 3, 300)],
+        },
+        {
+            "name": "w4",
+            "source": "bilibili",
+            "bvid": "BV1xx411c7m4",
+            "title": "合成作品四",
+            "duration_s": 60.0,
+            "joint": [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "audio": None,
+            "video": [1.0, 0.0, 0.0, 0.0],
+            "lists": [("votes_2026", 1, 100)],
+        },
+        {
+            "name": "w5",
+            "source": "local",
+            "local_path": "accept/local_a.mp4",
+            "title": "本地作品五",
+            "duration_s": 90.0,
+            "joint": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            "audio": None,
+            "video": None,
+            "lists": [("votes_2025", 4, 200)],
+        },
+        {
+            "name": "w6",
+            "source": "local",
+            "local_path": "accept/local_b.mp4",
+            "title": "本地作品六",
+            "duration_s": 45.0,
+            "joint": [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            "audio": None,
+            "video": None,
+            "lists": [("votes_2026", 2, 50)],
+        },
+    ]
+    work_ids: dict[str, int] = {}
+    try:
+        for spec in specs:
+            if spec["source"] == "local":
+                work_id, _created = catalog.upsert_local_work(
+                    str(spec["local_path"]), title=str(spec["title"])
+                )
+            else:
+                work_id, _created = catalog.upsert_bilibili_work(
+                    str(spec["bvid"]), title=str(spec["title"])
+                )
+            catalog.begin_attempt(work_id, "encoding")
+            catalog.update_work_metadata(work_id, duration_s=float(spec["duration_s"]))
+            work_dir = cfg.paths.embeddings / version / f"{work_id:06d}"
+            for kind, values in (
+                ("work_joint", spec["joint"]),
+                ("work_audio", spec["audio"]),
+                ("work_video", spec["video"]),
+            ):
+                if values is None:
+                    continue
+                array = _unit64(values)
+                save_vector(work_dir / f"{kind}.npy", array)
+                catalog.register_embedding(
+                    work_id,
+                    version=version,
+                    kind=kind,
+                    path=cfg.data_relpath(work_dir / f"{kind}.npy"),
+                    dim=int(array.shape[0]),
+                )
+            catalog.complete(work_id)
+            for list_key, rank, votes in spec["lists"]:
+                catalog.add_appearance(work_id, lists[list_key], rank=int(rank), votes=int(votes))
+            work_ids[str(spec["name"])] = int(work_id)
+        yield VectorEnv(root=root, cfg=cfg, catalog=catalog, version=version, work_ids=work_ids)
+    finally:
+        catalog.close()
+
+
+# ---------------------------------------------------------------- A1 近邻
+
+def test_a1_neighbors_match_hand_computed_cosine(vector_env: VectorEnv) -> None:
+    """A1：Top-k 近邻顺序/相似度必须与手算高维余弦一致，不含自身。"""
+
+    index = load_similarity_index(vector_env.catalog, vector_env.cfg, version=vector_env.version)
+    try:
+        assert list(index.work_ids) == sorted(vector_env.work_ids.values())
+        vectors = _direct_work_vectors(vector_env)
+        for work_id in index.work_ids:
+            expected = _expected_ranked(vectors, work_id)[:3]
+            neighbors = index.neighbors(work_id, k=3)
+            assert [neighbor.work_id for neighbor in neighbors] == [
+                pair[0] for pair in expected
+            ]
+            assert [neighbor.rank for neighbor in neighbors] == [1, 2, 3]
+            for neighbor, (expected_id, expected_sim) in zip(neighbors, expected, strict=True):
+                assert neighbor.work_id == expected_id
+                assert neighbor.similarity == pytest.approx(expected_sim, abs=1e-6)
+                assert neighbor.work_id != work_id
+            # k 超过可用作品数时截断，而不是报错
+            assert len(index.neighbors(work_id, k=100)) == len(index.work_ids) - 1
+    finally:
+        index.close()
+
+
+def test_a1_similarity_and_kth_distance_match_hand_computed(vector_env: VectorEnv) -> None:
+    """A1：similarity() 与 kth_neighbor_distance() 必须等于手算余弦值。"""
+
+    index = load_similarity_index(vector_env.catalog, vector_env.cfg, version=vector_env.version)
+    try:
+        vectors = _direct_work_vectors(vector_env)
+        ids = list(vectors)
+        for first in ids:
+            for second in ids:
+                expected = 1.0 if first == second else float(
+                    np.dot(vectors[first], vectors[second])
+                )
+                assert index.similarity(first, second) == pytest.approx(expected, abs=1e-6)
+        expected_kth = _expected_kth_distances(vectors, 3)
+        actual_kth = index.kth_neighbor_distance(k=3)
+        assert set(actual_kth) == set(expected_kth)
+        for work_id, expected in expected_kth.items():
+            assert actual_kth[work_id] == pytest.approx(expected, abs=1e-6)
+    finally:
+        index.close()
+
+
+def test_a1_modalities_cache_and_close(vector_env: VectorEnv) -> None:
+    """A1：三模态可用性、缺失模态报中文错误、矩阵缓存内容正确、close 后拒绝查询。"""
+
+    index = load_similarity_index(vector_env.catalog, vector_env.cfg, version=vector_env.version)
+    try:
+        assert index.available_kinds == ("work_joint", "work_audio", "work_video")
+        vectors = _direct_work_vectors(vector_env)
+        matrix = index.matrix("work_joint")
+        assert matrix.dtype == np.float32
+        assert matrix.shape == (len(vectors), 8)
+        for row_index, work_id in enumerate(index.work_ids):
+            assert matrix[row_index] == pytest.approx(vectors[work_id], abs=1e-6)
+            assert float(np.linalg.norm(matrix[row_index])) == pytest.approx(1.0, abs=1e-6)
+        # w6 没有音频向量
+        with pytest.raises(NebulaError):
+            index.neighbors(vector_env.work_ids["w6"], kind="work_audio")
+        # 未知模态
+        with pytest.raises(NebulaError):
+            index.matrix("work_unknown")
+    finally:
+        index.close()
+    with pytest.raises(NebulaError):
+        index.neighbors(vector_env.work_ids["w1"], k=1)
+
+
+# ---------------------------------------------------------------- A2 数据准备/密度
+
+def test_a2_frame_filters_and_neighbor_rows(vector_env: VectorEnv) -> None:
+    """A2：load_nebula_frame 的 v0.2 列、filter_frame 语义、neighbor_rows 展示行。"""
+
+    result = build_map(
+        vector_env.catalog, vector_env.cfg, version=vector_env.version, note="acceptance-full"
+    )
+    assert result.version == "map_v001"
+    assert result.n_works == len(vector_env.work_ids)
+    _map_info, frame = load_nebula_frame(vector_env.catalog, vector_env.cfg)
+
+    assert len(frame) == len(vector_env.work_ids)
+    for column in (
+        "work_id",
+        "title",
+        "list_keys",
+        "list_names",
+        "vote_years",
+        "rank",
+        "votes",
+        "is_canonical",
+        "search_text",
+        "hover_text",
+    ):
+        assert column in frame.columns, f"缺少 v0.2 展示列: {column}"
+    assert frame["is_canonical"].all()
+
+    ids = vector_env.work_ids
+    bilibili_ids = {ids["w1"], ids["w2"], ids["w3"], ids["w4"]}
+    local_ids = {ids["w5"], ids["w6"]}
+    assert set(filter_frame(frame, sources=["bilibili"])["work_id"]) == bilibili_ids
+    assert set(filter_frame(frame, sources=["local"])["work_id"]) == local_ids
+    assert set(filter_frame(frame, vote_years=[2025])["work_id"]) == {
+        ids["w1"],
+        ids["w2"],
+        ids["w3"],
+        ids["w5"],
+    }
+    assert set(filter_frame(frame, list_keys=["votes_2026"])["work_id"]) == {
+        ids["w4"],
+        ids["w6"],
+    }
+    assert set(
+        filter_frame(frame, sources=["local"], vote_years=[2026])["work_id"]
+    ) == {ids["w6"]}
+    assert len(filter_frame(frame)) == len(frame)
+    # 空选择 = 不过滤（契约语义）
+    assert len(filter_frame(frame, sources=[], list_keys=[], vote_years=[])) == len(frame)
+
+    index = load_similarity_index(vector_env.catalog, vector_env.cfg, version=vector_env.version)
+    try:
+        rows = neighbor_rows(frame, index, ids["w1"], kind="work_joint", k=3)
+        vectors = _direct_work_vectors(vector_env)
+        expected = _expected_ranked(vectors, ids["w1"])[:3]
+        assert [row["work_id"] for row in rows] == [pair[0] for pair in expected]
+        assert [row["rank"] for row in rows] == [1, 2, 3]
+        for row, (expected_id, expected_sim) in zip(rows, expected, strict=True):
+            assert row["work_id"] == expected_id
+            assert row["similarity"] == pytest.approx(expected_sim, abs=1e-6)
+            assert row["in_map"] is True
+            assert row["title"]
+        for kind in index.available_kinds:
+            assert neighbor_rows(frame, index, ids["w1"], kind=kind, k=2)
+    finally:
+        index.close()
+
+
+def test_a2_density_knn_matches_hand_computed(vector_env: VectorEnv) -> None:
+    """A2：高维近邻密度 = 1 - 第 5 近邻高维余弦相似度（不是平面距离）。"""
+
+    _map_info, frame = load_nebula_frame(vector_env.catalog, vector_env.cfg)
+    index = load_similarity_index(vector_env.catalog, vector_env.cfg, version=vector_env.version)
+    try:
+        spec = apply_color(frame, "density_knn", similarity_index=index)
+        assert len(spec.values) == len(frame)
+        assert spec.categorical is False
+        vectors = _direct_work_vectors(vector_env)
+        expected = _expected_kth_distances(vectors, 5)
+        for work_id, value in zip(frame["work_id"].tolist(), spec.values, strict=True):
+            assert value is not None
+            assert float(value) == pytest.approx(float(expected[int(work_id)]), abs=1e-5)
+        with pytest.raises(MapError):
+            apply_color(frame, "density_knn")
+    finally:
+        index.close()
+
+    with_similarity = {field_id for field_id, _label in available_color_fields(frame, has_similarity=True)}
+    without_similarity = {
+        field_id for field_id, _label in available_color_fields(frame, has_similarity=False)
+    }
+    assert "density_knn" in with_similarity
+    assert "density_knn" not in without_similarity
+
+
+# ---------------------------------------------------------------- A2 筛选星云
+
+def test_a2_filtered_maps_persist_filter_and_incomparable_coords(
+    vector_env: VectorEnv,
+) -> None:
+    """A2：筛选星云独立版本、filter_json 落库、坐标与全量版不可比。"""
+
+    full = build_map(
+        vector_env.catalog, vector_env.cfg, version=vector_env.version, note="acceptance-full-2"
+    )
+    assert full.n_works == len(vector_env.work_ids)
+
+    bilibili_ids = {
+        vector_env.work_ids[name] for name in ("w1", "w2", "w3", "w4")
+    }
+    filtered = build_map(
+        vector_env.catalog,
+        vector_env.cfg,
+        version=vector_env.version,
+        filter_spec={"dataset": "bilibili"},
+        note="acceptance-bilibili",
+    )
+    assert filtered.version != full.version
+    assert filtered.n_works == len(bilibili_ids)
+
+    run = vector_env.catalog.get_map(filtered.version)
+    assert json.loads(str(run["filter_json"])) == {"dataset": "bilibili"}
+    meta = json.loads((filtered.coords_path.parent / "meta.json").read_text(encoding="utf-8"))
+    assert meta["filter_spec"] == {"dataset": "bilibili"}
+
+    all_ids, all_matrix = load_embedding_matrix(
+        vector_env.catalog, vector_env.cfg, version=vector_env.version
+    )
+    filtered_ids, filtered_matrix = load_embedding_matrix(
+        vector_env.catalog,
+        vector_env.cfg,
+        version=vector_env.version,
+        filter_spec={"dataset": "bilibili"},
+    )
+    assert set(all_ids) == set(vector_env.work_ids.values())
+    assert set(filtered_ids) == bilibili_ids
+    assert all_matrix.shape[0] == len(all_ids)
+    assert filtered_matrix.shape[0] == len(bilibili_ids)
+
+    full_coords = pd.read_parquet(full.coords_path).set_index("work_id")
+    filtered_coords = pd.read_parquet(filtered.coords_path).set_index("work_id")
+    common = sorted(set(full_coords.index) & set(filtered_coords.index))
+    assert common == sorted(bilibili_ids)
+    diffs = np.abs(
+        full_coords.loc[common, ["x2", "y2", "x3", "y3", "z3"]].to_numpy(dtype=float)
+        - filtered_coords.loc[common, ["x2", "y2", "x3", "y3", "z3"]].to_numpy(dtype=float)
+    )
+    assert float(diffs.max()) > 1e-6, "不同筛选星云的坐标不应相同（坐标不可跨版本比较）"
+
+    year_map = build_map(
+        vector_env.catalog,
+        vector_env.cfg,
+        version=vector_env.version,
+        filter_spec={"vote_year": 2025},
+    )
+    assert year_map.n_works == 4
+    expected_2025 = {
+        vector_env.work_ids[name] for name in ("w1", "w2", "w3", "w5")
+    }
+    assert set(load_embedding_matrix(
+        vector_env.catalog, vector_env.cfg, version=vector_env.version,
+        filter_spec={"vote_year": 2025},
+    )[0]) == expected_2025
+
+    # 筛选后作品不足 3 部时必须中文报错，而不是生成空星云
+    with pytest.raises(MapError, match="至少"):
+        build_map(
+            vector_env.catalog,
+            vector_env.cfg,
+            version=vector_env.version,
+            filter_spec={"dataset": "local"},
+        )
+
+# ---------------------------------------------------------------- B1 身份关联
+
+class _FakeBilibiliClient:
+    """离线假 Bilibili 客户端：只返回预置元数据，不触网。"""
+
+    def __init__(self, metas: dict[str, BilibiliMeta]) -> None:
+        self.metas = metas
+        self.closed = False
+
+    def fetch_meta(self, bvid: str, *, part: int = 1) -> BilibiliMeta:
+        return self.metas[bvid]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@dataclass
+class IdentityEnv:
+    """B1 独立验收环境。"""
+
+    root: Path
+    cfg: Config
+    catalog: Catalog
+    version: str
+    ids: dict[str, int]
+    metas: dict[str, BilibiliMeta]
+
+
+@pytest.fixture(scope="module")
+def identity_env(tmp_path_factory: pytest.TempPathFactory) -> IdentityEnv:
+    root = tmp_path_factory.mktemp("accept-identity")
+    cfg = create_temp_config(root)
+    catalog = Catalog(cfg.paths.db_path)
+    catalog.initialize()
+    version = "v-ident"
+    catalog.register_embedding_version(
+        version,
+        model_checkpoint="synthetic",
+        model_revision=None,
+        frames=16,
+        clip_seconds=8.0,
+        clips_per_work=5,
+        audio_sample_rate=48000,
+        params={"test": "e2e-identity"},
+    )
+    list_id = catalog.ensure_list(
+        "votes_2025", name="2025年音MAD选票", kind="votes", vote_year=2025
+    )
+    ids: dict[str, int] = {}
+
+    def create_work(
+        name: str,
+        *,
+        source: str,
+        title: str,
+        duration_s: float | None,
+        bvid: str | None = None,
+        local_path: str | None = None,
+        joint=None,
+        clip=None,
+        audio=None,
+        ranks: tuple[int, int] | None = None,
+    ) -> None:
+        if source == "local":
+            assert local_path is not None
+            target = cfg.paths.input_local / local_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"acceptance-local-video-bytes")
+            work_id, _created = catalog.upsert_local_work(local_path, title=title)
+        else:
+            assert bvid is not None
+            work_id, _created = catalog.upsert_bilibili_work(bvid, title=title)
+        catalog.begin_attempt(work_id, "encoding")
+        if duration_s is not None:
+            catalog.update_work_metadata(work_id, duration_s=duration_s)
+        work_dir = cfg.paths.embeddings / version / f"{work_id:06d}"
+        if joint is not None:
+            save_vector(work_dir / "work_joint.npy", _unit64(joint))
+            catalog.register_embedding(
+                work_id,
+                version=version,
+                kind="work_joint",
+                path=cfg.data_relpath(work_dir / "work_joint.npy"),
+                dim=8,
+            )
+        if audio is not None:
+            save_vector(work_dir / "work_audio.npy", _unit64(audio))
+            catalog.register_embedding(
+                work_id,
+                version=version,
+                kind="work_audio",
+                path=cfg.data_relpath(work_dir / "work_audio.npy"),
+                dim=8,
+            )
+        if clip is not None:
+            matrix = np.stack([_unit64(row) for row in clip])
+            save_vector(work_dir / "clip_joint.npy", matrix)
+            catalog.register_embedding(
+                work_id,
+                version=version,
+                kind="clip_joint",
+                path=cfg.data_relpath(work_dir / "clip_joint.npy"),
+                dim=8,
+                n_clips=int(matrix.shape[0]),
+            )
+            catalog.replace_clips(
+                work_id,
+                version=version,
+                clips=[(index, index * 8.0, 8.0) for index in range(matrix.shape[0])],
+            )
+        catalog.complete(work_id)
+        if ranks is not None:
+            catalog.add_appearance(work_id, list_id, rank=ranks[0], votes=ranks[1])
+        ids[name] = int(work_id)
+
+    metas = {
+        "BV1xx411c7n1": BilibiliMeta(
+            bvid="BV1xx411c7n1",
+            title="作品甲 LIVE",
+            author_uid="1001",
+            author_name="UP甲",
+            duration_s=60.5,
+            publish_date="2025-01-02",
+            cover_url=None,
+            page_count=1,
+        ),
+        "BV1xx411c7n2": BilibiliMeta(
+            bvid="BV1xx411c7n2",
+            title="作品乙",
+            author_uid="1002",
+            author_name="UP乙",
+            duration_s=70.0,
+            publish_date="2025-02-03",
+            cover_url=None,
+            page_count=1,
+        ),
+        "BV1xx411c7n3": BilibiliMeta(
+            bvid="BV1xx411c7n3",
+            title="完全不同的作品",
+            author_uid="1003",
+            author_name="UP丙",
+            duration_s=100.0,
+            publish_date="2025-03-04",
+            cover_url=None,
+            page_count=1,
+        ),
+    }
+    try:
+        create_work(
+            "local_a",
+            source="local",
+            local_path="same/作品甲.mp4",
+            title="作品甲 Live",
+            duration_s=61.0,
+            joint=[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            clip=[
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            audio=[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        create_work(
+            "local_b",
+            source="local",
+            local_path="same/作品乙.mp4",
+            title="作品乙",
+            duration_s=50.0,
+            joint=[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        create_work(
+            "local_c",
+            source="local",
+            local_path="same/作品丙.mp4",
+            title="作品丙",
+            duration_s=40.0,
+            joint=[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        create_work(
+            "bili_a",
+            source="bilibili",
+            bvid="BV1xx411c7n1",
+            title="作品甲   LIVE",
+            duration_s=None,
+            ranks=(1, 500),
+        )
+        create_work(
+            "bili_b",
+            source="bilibili",
+            bvid="BV1xx411c7n2",
+            title="作品乙",
+            duration_s=None,
+            ranks=(2, 400),
+        )
+        create_work(
+            "bili_c",
+            source="bilibili",
+            bvid="BV1xx411c7n3",
+            title="完全不同的作品",
+            duration_s=None,
+            ranks=(3, 300),
+        )
+        yield IdentityEnv(
+            root=root, cfg=cfg, catalog=catalog, version=version, ids=ids, metas=metas
+        )
+    finally:
+        catalog.close()
+
+
+def test_b1_normalize_title_boundaries() -> None:
+    """B1：标题规范化处理空白/换行/全半角/引号/零宽字符，空标题报中文错误。"""
+
+    equal_pairs = [
+        ("作品 甲\nLive", "作品甲live"),
+        ("【音MAD】Foo：Live！", "[音MAD]Foo:Live!"),
+        ("ＡＢＣ　１２３", "abc123"),
+        ("作\u200b品甲", "作品甲"),
+        ("「测试」作品", '"测试"作品'),
+    ]
+    for first, second in equal_pairs:
+        assert normalize_title(first) == normalize_title(second), (first, second)
+    assert normalize_title("作品甲") != normalize_title("作品乙")
+    for bad in ("", " \n\t ", "\u200b"):
+        with pytest.raises(IngestError):
+            normalize_title(bad)
+    with pytest.raises(IngestError):
+        normalize_title(123)
+
+
+def test_b1_find_candidates_double_validation(identity_env: IdentityEnv) -> None:
+    """B1：只有“标题规范化完全相等 + 时长差 <= 3s”才接受，其余保留拒绝原因。"""
+
+    client = _FakeBilibiliClient(identity_env.metas)
+    candidates = find_candidates(
+        identity_env.catalog,
+        identity_env.cfg,
+        list_key="votes_2025",
+        client=client,
+    )
+    accepted = [candidate for candidate in candidates if candidate.accepted]
+    assert len(accepted) == 1
+    winner = accepted[0]
+    assert winner.local_work_id == identity_env.ids["local_a"]
+    assert winner.bilibili_work_id == identity_env.ids["bili_a"]
+    assert winner.method == "title+duration"
+    assert winner.local_duration_s == pytest.approx(61.0)
+    assert winner.bilibili_duration_s == pytest.approx(60.5)
+    assert winner.confidence > 0.9
+    assert "时长差" in winner.reason
+
+    rejected = [candidate for candidate in candidates if not candidate.accepted]
+    target = [
+        candidate
+        for candidate in rejected
+        if candidate.local_work_id == identity_env.ids["local_b"]
+        and candidate.bilibili_work_id == identity_env.ids["bili_b"]
+    ]
+    assert target, "本地作品乙与 B 站作品乙应产生一条被拒绝的候选"
+    assert "容差" in target[0].reason
+    assert target[0].bilibili_duration_s == pytest.approx(70.0)
+
+    # 标题完全不同的作品不应产生候选
+    assert not any(
+        candidate.bilibili_work_id == identity_env.ids["bili_c"] for candidate in candidates
+    )
+
+    # 拉取元数据时应把真实标题/时长补全到作品记录
+    bili_a = identity_env.catalog.get_work(identity_env.ids["bili_a"])
+    assert bili_a["title"] == "作品甲 LIVE"
+    assert float(bili_a["duration_s"]) == pytest.approx(60.5)
+
+
+def test_b1_link_copies_vectors_and_excludes_duplicate(identity_env: IdentityEnv) -> None:
+    """B1：关联后复制向量给 canonical、duplicate 默认不进星云/近邻、原始数据保留。"""
+
+    catalog = identity_env.catalog
+    cfg = identity_env.cfg
+    version = identity_env.version
+    ids = identity_env.ids
+
+    candidate = find_candidates(
+        catalog, cfg, list_key="votes_2025", client=_FakeBilibiliClient(identity_env.metas)
+    )
+    accepted = [item for item in candidate if item.accepted]
+    assert len(accepted) == 1
+    duplicate = ids["local_a"]
+    canonical = ids["bili_a"]
+
+    local_dir = cfg.paths.embeddings / version / f"{duplicate:06d}"
+    local_before = {
+        path.name: hashlib.sha1(path.read_bytes()).hexdigest()
+        for path in sorted(local_dir.rglob("*.npy"))
+    }
+    local_video = cfg.paths.input_local / "same" / "作品甲.mp4"
+    video_bytes_before = local_video.read_bytes()
+
+    result = link_candidates(catalog, cfg, candidates=candidate, copy_vectors=True, version=version)
+    assert result["linked"] == 1
+    assert result["copied"] == 1
+    assert catalog.get_duplicate_work_ids() == {duplicate}
+    assert catalog.get_canonical_work_id(duplicate) == canonical
+    assert catalog.get_work(canonical)["status"] == "completed"
+    assert catalog.has_embedding(canonical, version=version, kind="work_joint")
+    assert catalog.has_embedding(canonical, version=version, kind="clip_joint")
+    assert catalog.has_embedding(canonical, version=version, kind="work_audio")
+    assert len(catalog.get_clips(canonical, version=version)) == 2
+
+    canonical_dir = cfg.paths.embeddings / version / f"{canonical:06d}"
+    for kind in ("work_joint", "clip_joint", "work_audio"):
+        local_array = np.load(local_dir / f"{kind}.npy", allow_pickle=False)
+        copied_array = np.load(canonical_dir / f"{kind}.npy", allow_pickle=False)
+        assert np.array_equal(local_array, copied_array), f"{kind} 复制内容不一致"
+
+    # 本地原始数据不删除、不改写
+    local_after = {
+        path.name: hashlib.sha1(path.read_bytes()).hexdigest()
+        for path in sorted(local_dir.rglob("*.npy"))
+    }
+    assert local_after == local_before
+    assert local_video.read_bytes() == video_bytes_before
+    assert catalog.has_embedding(duplicate, version=version, kind="work_joint")
+
+    # duplicate 默认不进入星云
+    default_map = build_map(catalog, cfg, version=version, note="identity-default")
+    assert default_map.n_works == 3  # canonical + local_b + local_c
+    assert duplicate not in {
+        int(row["id"]) for row in catalog.load_map_rows(default_map.version)
+    }
+    duplicated_map = build_map(
+        catalog,
+        cfg,
+        version=version,
+        note="identity-with-duplicates",
+        filter_spec={"include_duplicates": True},
+    )
+    assert duplicated_map.n_works == 4
+    assert duplicate in {
+        int(row["id"]) for row in catalog.load_map_rows(duplicated_map.version)
+    }
+    assert json.loads(str(catalog.get_map(duplicated_map.version)["filter_json"])) == {
+        "include_duplicates": True
+    }
+
+    # duplicate 默认不进入高维近邻索引
+    index = load_similarity_index(catalog, cfg, version=version)
+    try:
+        assert duplicate not in index.work_ids
+        for work_id in index.work_ids:
+            assert duplicate not in {
+                neighbor.work_id for neighbor in index.neighbors(work_id, k=5)
+            }
+    finally:
+        index.close()
+
+    # unlink 后 duplicate 恢复为普通作品
+    restored = catalog.unlink_work(duplicate, reason="独立验收-撤销")
+    assert restored == canonical
+    assert catalog.get_duplicate_work_ids() == set()
+
+
+def test_b1_manual_links_override(identity_env: IdentityEnv) -> None:
+    """B1：手动关联清单可覆盖自动规则，非法清单给出带原因的 IngestError。"""
+
+    catalog = identity_env.catalog
+    cfg = identity_env.cfg
+    ids = identity_env.ids
+    manual_path = cfg.paths.input_lists / "local_bv_links.csv"
+    manual_path.write_text(
+        "local_path,bvid\nsame/作品乙.mp4,BV1xx411c7n2\n", encoding="utf-8"
+    )
+    links = load_manual_links(catalog, cfg)
+    assert links == [(ids["local_b"], ids["bili_b"])]
+
+    manual_candidates = candidates_from_manual_links(catalog, links)
+    assert len(manual_candidates) == 1
+    assert manual_candidates[0].accepted is True
+    assert manual_candidates[0].method == "manual"
+    result = link_candidates(
+        catalog, cfg, candidates=manual_candidates, copy_vectors=False, version=identity_env.version
+    )
+    assert result["linked"] == 1
+    assert result["copied"] == 0
+    # 上一测试末尾已 unlink local_a，这里只应新增 local_b
+    assert catalog.get_duplicate_work_ids() == {ids["local_b"]}
+    assert catalog.get_canonical_work_id(ids["local_b"]) == ids["bili_b"]
+
+    # 非法 BV 号：带行号的中文错误
+    manual_path.write_text("local_path,bvid\nsame/作品丙.mp4,NOT_A_BVID\n", encoding="utf-8")
+    with pytest.raises(IngestError, match="BV"):
+        load_manual_links(catalog, cfg)
+    # 未登记的本地路径：带行号提示先 scan-local
+    manual_path.write_text(
+        "local_path,bvid\nnot/registered.mp4,BV1xx411c7n3\n", encoding="utf-8"
+    )
+    with pytest.raises(IngestError, match="未登记"):
+        load_manual_links(catalog, cfg)
+
+# ---------------------------------------------------------------- A2 界面（AppTest）
+
+@dataclass
+class AppEnv:
+    """A2 界面独立验收环境。"""
+
+    root: Path
+    cfg: Config
+    catalog: Catalog
+    version: str
+    map_version: str
+    work_ids: dict[str, int]
+
+
+@pytest.fixture(scope="module")
+def app_env(tmp_path_factory: pytest.TempPathFactory) -> AppEnv:
+    root = tmp_path_factory.mktemp("accept-app")
+    cfg = create_temp_config(root)
+    catalog = Catalog(cfg.paths.db_path)
+    catalog.initialize()
+    version = "v-app"
+    catalog.register_embedding_version(
+        version,
+        model_checkpoint="synthetic",
+        model_revision=None,
+        frames=16,
+        clip_seconds=8.0,
+        clips_per_work=5,
+        audio_sample_rate=48000,
+        params={"test": "e2e-app"},
+    )
+    list_2025 = catalog.ensure_list(
+        "votes_2025", name="2025年音MAD选票", kind="votes", vote_year=2025
+    )
+    list_2026 = catalog.ensure_list(
+        "votes_2026", name="2026年音MAD选票", kind="votes", vote_year=2026
+    )
+    specs = [
+        ("app1", "bilibili", "BV1xx411c7p1", "界面作品一", [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], list_2025, 1),
+        ("app2", "bilibili", "BV1xx411c7p2", "界面作品二", [0.9, 0.435889894, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], list_2025, 2),
+        ("app3", "bilibili", "BV1xx411c7p3", "界面作品三", [0.7, 0.714142842, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], list_2026, 1),
+        ("app4", "local", None, "本地界面作品四", [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], list_2026, 2),
+        ("app5", "local", None, "本地界面作品五", [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], list_2025, 3),
+    ]
+    work_ids: dict[str, int] = {}
+    try:
+        for name, source, bvid, title, vector, target_list, rank in specs:
+            if source == "local":
+                work_id, _created = catalog.upsert_local_work(
+                    f"app/{name}.mp4", title=title
+                )
+            else:
+                work_id, _created = catalog.upsert_bilibili_work(str(bvid), title=title)
+            catalog.begin_attempt(work_id, "encoding")
+            catalog.update_work_metadata(work_id, duration_s=60.0 + rank)
+            work_dir = cfg.paths.embeddings / version / f"{work_id:06d}"
+            has_audio = name in {"app1", "app2", "app3"}
+            has_video = name in {"app1", "app2", "app3", "app4"}
+            for kind, values in (
+                ("work_joint", vector),
+                ("work_audio", [1.0, 0.0, 0.0, 0.0] if has_audio else None),
+                ("work_video", [0.0, 1.0, 0.0, 0.0] if has_video else None),
+            ):
+                if values is None:
+                    continue
+                array = _unit64(values)
+                save_vector(work_dir / f"{kind}.npy", array)
+                catalog.register_embedding(
+                    work_id,
+                    version=version,
+                    kind=kind,
+                    path=cfg.data_relpath(work_dir / f"{kind}.npy"),
+                    dim=int(array.shape[0]),
+                )
+            catalog.complete(work_id)
+            catalog.add_appearance(work_id, target_list, rank=rank, votes=100 - rank)
+            work_ids[name] = int(work_id)
+        built = build_map(catalog, cfg, version=version, note="acceptance-app")
+        yield AppEnv(
+            root=root,
+            cfg=cfg,
+            catalog=catalog,
+            version=version,
+            map_version=built.version,
+            work_ids=work_ids,
+        )
+    finally:
+        catalog.close()
+
+
+def test_v02_app_neighbor_panel_density_filters_and_3d(
+    app_env: AppEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A2 独立验收：AppTest 渲染近邻面板/高亮、近邻跳转、密度染色、筛选与 3D。"""
+
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setenv("NEBULA_CONFIG", str(app_env.cfg.path))
+    at = AppTest.from_file(str(REPO_ROOT / "app.py"), default_timeout=120)
+    at.run()
+    assert len(at.exception) == 0, f"页面出现异常: {list(at.exception)}"
+    assert len(at.error) == 0, f"页面显示错误: {list(at.error)}"
+
+    # 基础控件与主图
+    assert at.selectbox(key="map_version").value == app_env.map_version
+    assert at.radio(key="projection").value == "2d"
+    assert at.selectbox(key="color_field").value is not None
+    assert at.selectbox(key="filter_source").value == "all"
+    charts = at.get("plotly_chart")
+    assert len(charts) == 1
+    spec = json.loads(charts[0].proto.spec)
+    assert "scatter" in str(spec).lower()
+
+    # 默认选中第一部作品：详情 + 三个模态的近邻表 + 高亮/连线 trace
+    tables = [element.value for element in at.dataframe]
+    assert len(tables) == 3, f"应有 joint/audio/video 三张近邻表，实际 {len(tables)}"
+    trace_names = [str(trace.get("name") or "") for trace in spec["data"]]
+    assert any("选中作品" in name for name in trace_names)
+    assert any("Top5 近邻" in name for name in trace_names)
+    assert len(spec["data"]) >= 3, "2D 默认应画出选中点、近邻点与连线"
+
+    # 独立手算 app1 的联合 Top1 近邻，然后通过“跳到近邻作品”验证跳转
+    vectors: dict[int, np.ndarray] = {}
+    for row in app_env.catalog.list_embeddings(app_env.version, kind="work_joint"):
+        array = np.asarray(
+            np.load(app_env.cfg.data_path(str(row["path"])), allow_pickle=False),
+            dtype=np.float64,
+        )
+        vectors[int(row["work_id"])] = array / np.linalg.norm(array)
+    expected_top1 = _expected_ranked(vectors, app_env.work_ids["app1"])[0]
+    jump_work_id, jump_similarity = expected_top1
+    jump_titles = {
+        int(row["id"]): str(row["title"])
+        for row in app_env.catalog.list_works()
+    }
+    assert at.selectbox(key="manual_work").value == app_env.work_ids["app1"]
+    at.selectbox(key="neighbor_jump").set_value(jump_work_id).run()
+    assert len(at.exception) == 0
+    assert at.selectbox(key="manual_work").value == jump_work_id
+    headers = [str(element.value) for element in at.subheader]
+    assert jump_titles[jump_work_id] in headers
+
+    # 高维近邻密度染色（需要 SimilarityIndex，不能退化成平面距离）
+    at.selectbox(key="color_field").set_value("density_knn").run()
+    assert len(at.exception) == 0
+    assert len(at.error) == 0
+    assert len(at.get("plotly_chart")) == 1
+
+    # 筛选：来源 local -> 2 部；年份 2026 -> 2 部；搜索唯一标题 -> 1 部
+    at.selectbox(key="filter_source").set_value("local").run()
+    captions = [str(element.value) for element in at.caption]
+    assert any("当前显示 2 / 5" in caption for caption in captions), captions
+    at.selectbox(key="filter_source").set_value("all").run()
+    at.multiselect(key="filter_years").set_value([2026]).run()
+    captions = [str(element.value) for element in at.caption]
+    assert any("当前显示 2 / 5" in caption for caption in captions), captions
+    at.multiselect(key="filter_years").set_value([]).run()
+    at.text_input(key="search").set_value("界面作品三").run()
+    captions = [str(element.value) for element in at.caption]
+    assert any("当前显示 1 / 5" in caption for caption in captions), captions
+    at.text_input(key="search").set_value("").run()
+
+    # 选中没有音频/画面向量的作品：显式提示而不是报错
+    at.selectbox(key="manual_work").set_value(app_env.work_ids["app5"]).run()
+    assert len(at.exception) == 0
+    captions = [str(element.value) for element in at.caption]
+    assert any("无音频模态向量" in caption for caption in captions), captions
+    assert any("无画面模态向量" in caption for caption in captions), captions
+
+    # 3D 投影 + 连线开关
+    at.radio(key="projection").set_value("3d").run()
+    assert len(at.exception) == 0
+    assert len(at.error) == 0
+    spec_3d = json.loads(at.get("plotly_chart")[0].proto.spec)
+    assert any("scatter3d" in str(trace.get("type", "")).lower() for trace in spec_3d["data"])
+    assert at.checkbox(key="show_lines_3d").value is False
+    at.checkbox(key="show_lines_3d").set_value(True).run()
+    assert len(at.exception) == 0
+    spec_3d_lines = json.loads(at.get("plotly_chart")[0].proto.spec)
+    assert len(spec_3d_lines["data"]) >= 3, "3D 打开连线后应有选中点、近邻点与连线"
+
+    # 近邻跳到可比较作品后，Top1 邻居余弦值应与手算一致（展示精度 4 位）
+    assert jump_similarity == pytest.approx(max(
+        sim for work_id, sim in _expected_ranked(vectors, app_env.work_ids["app1"])
+    ))
+
+
+

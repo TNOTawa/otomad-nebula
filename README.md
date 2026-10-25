@@ -23,6 +23,21 @@
   旧点位置不变；积累较多后可重新生成新版本星云作对比；
 - **质量门禁**：`python qa.py` 一个入口完成 ruff、pytest、文档/入口/配置检查。
 
+**v0.2 新增（迭代 A/B，现有向量无需重算）**：
+
+- **高维近邻探索（A1）**：选中作品查看 joint / audio / video 三模态 Top5 近邻（真实高维余弦），
+  2D 高亮并连线，3D 提供连线开关与“搜索 + 下拉选择”等价入口；
+- **高维近邻密度（A2）**：按第 5 近邻的**高维余弦距离**染色（越大越稀疏），不使用 UMAP 平面距离；
+- **筛选星云（A2）**：按来源 / 榜单 / 年份构建独立星云版本，筛选条件落库；跨版本坐标不可比；
+- **分阶段耗时（A4）**：批次与单部作品的 download/probe/extract/preprocess/forward/save 耗时入库，
+  自动输出 `logs/perf_<run_id>.csv`，可用 `pipeline.py timings` 查看；
+- **低风险提速（A5）**：切片去 AAC 音轨（零向量漂移）、复用作品级 ffprobe；preset / 分辨率
+  对照实验有实测数据（见 ARCHITECTURE §6.2），会改变向量的方案留待 v0.3；
+- **身份关联去重（B1）**：本地视频与 Bilibili 条目自动（标题+时长双校验）/ 手动（CSV）关联；
+  duplicate 默认不进星云与近邻索引，已有本地向量可复制给 canonical，避免重复下载编码；
+- **片段稳定性报告（A3）**：对片段级向量做留一重聚合，量化单个片段对作品 Top-k 近邻结论的影响，
+  输出 JSON/CSV，只用于风险评估，不参与坐标与质量评价。
+
 ## 环境要求
 
 | 依赖 | 要求 | 说明 |
@@ -116,13 +131,15 @@ otomad-nebula/
 │   └── maps/<map_vNNN>/       # UMAP 坐标、模型、meta.json
 ├── temp/                      # 流水线临时目录（成功自动清理，失败保留排查）
 ├── logs/                      # 运行日志
-├── nebula/                    # 核心库：config/db/sampling/media/embed/pipeline/...
+├── nebula/                    # 核心库：config/db/sampling/media/embed/pipeline/
+│                              #   similarity(近邻) identity(身份关联) stability(稳定性) mapplot/appdata
+├── tools/                     # 证据/报告工具：bench_peav.py、verify_peav.py、clip_stability.py
 ├── tests/                     # pytest 测试（含 tests/fixtures 合成视频工厂）
-├── docs/                      # 契约、ADR、质量规范
-├── ingest.py                  # 导入本地视频 / 选票 / 周报
-├── pipeline.py                # 下载 → 切片 → 推理 → 保存 → 清理
-├── map.py                     # 生成/更新 2D/3D 星云
-├── app.py                     # Streamlit 交互界面
+├── docs/                      # 契约（CONTRACTS/CONTRACTS_V2）、ADR、质量规范
+├── ingest.py                  # 导入本地视频 / 选票 / 周报 / link-local 身份关联
+├── pipeline.py                # 下载 → 切片 → 推理 → 保存 → 清理（含分阶段耗时）
+├── map.py                     # 生成/更新 2D/3D 星云（build / list / transform / variants）
+├── app.py                     # Streamlit 交互界面（近邻、密度、筛选）
 ├── qa.py                      # 唯一质量入口
 └── config.yaml                # 所有运行参数的唯一来源
 ```
@@ -250,13 +267,108 @@ otomad-nebula/
    新增作品较多时，也可以 `map.py build` 重新生成一个完整新版本并保留旧版本。
 4. 建议每天检查一次周报是否更新，只在发现新内容时运行，不需要常驻高负载程序。
 
+### v0.2：观察、筛选与运维（迭代 A/B）
+
+现有 33 部作品与 map_v001 可以直接使用本节功能，不需要重新编码。
+
+#### A1 高维近邻探索（界面）
+
+启动界面后点击任意点（或通过侧栏搜索/下拉选择作品），详情面板显示 joint / audio / video
+三个模态的 Top5 近邻与余弦值；缺失模态显示“无该模态向量”。2D 视图默认高亮 Top5 并画出
+选中点到近邻的连线，3D 视图提供“显示近邻连线”开关（默认关闭）。
+近邻与相似度全部来自高维余弦（nebula.similarity），与 UMAP 平面距离无关。
+
+#### A2 高维近邻密度与筛选星云
+
+- 染色维度选择“高维近邻密度”：值为 1 - 第 5 近邻余弦相似度，越大表示局部越稀疏；
+- 侧栏可按来源（全部 / 本地 / Bilibili）、榜单、选票年份筛选当前显示的作品；
+- 需要让“筛选后的子集重新布局”时，构建独立星云版本：
+
+```powershell
+# 只含 Bilibili 来源、2025 选票年份的作品
+python map.py build --dataset bilibili --vote-year 2025
+
+# 用不同 n_neighbors 生成对照版本（每个都是独立 map_vNNN）
+python map.py variants --n-neighbors 8 15 30
+
+python map.py list
+```
+
+- 筛选条件写入 map_runs.filter_json，并记录在该版本的 meta.json 中；
+- **筛选星云与全量星云、以及不同筛选版本之间的坐标不可直接比较**（界面会显示版本与筛选条件）；
+- 默认排除已做身份关联的 duplicate；需要对照“包含重复实体”的版本时加 `--include-duplicates`。
+
+#### A3 片段稳定性报告
+
+```powershell
+python tools/clip_stability.py --k 5
+python tools/clip_stability.py --version peav-small-16f__f16_clip8s_x5_48k --out-dir logs
+```
+
+- 默认读取配置派生的当前 `embedding_version`，输出 `logs/clip_stability.json`（完整明细）与
+  `logs/clip_stability.csv`（每部作品一行汇总）；
+- 指标：留一重聚合后的 Top-k 重叠率、最大名次变化、平均余弦漂移；`mean_overlap` 越低，
+  说明该作品结论越依赖某一个 8 秒片段；
+- 只读已保存的 clip_joint / work_joint 向量，不加载模型、不重新编码、不参与 UMAP 坐标，
+  也不作为作品质量指标；输出目录可用 `--out-dir` 指定；
+- 可用 `--work-ids 1 2 3 ...` 只评估部分作品（例如只复盘 P0 的 33 部），
+  近邻空间仍是全部 canonical 作品，不会因筛选而改变比较基准。
+
+#### A4 性能与分阶段计时
+
+- 每次批处理自动登记 `pipeline_runs`（批次级）与 `work_timings`（单部作品的分阶段耗时）；
+- 阶段字段：`download_s / probe_s / extract_s / preprocess_s / forward_s / save_s / total_s`；
+- 运行后查看 `logs/perf_<run_id>.csv`；失败作品也会记录已经发生的阶段耗时；
+- 查看最近批次的单部分阶段耗时：
+
+```powershell
+python pipeline.py timings                 # 默认最近一批
+python pipeline.py timings --run-id 3      # 指定批次
+python pipeline.py timings --limit-runs 5  # 列出最近 5 个批次
+```
+
+- 计时只用于定位瓶颈，不进入向量与星云，也不改变 `embedding_version`。
+
+#### A5 低风险提速（行为不变）
+
+- 切片输出 mp4 只保留视频轨（不再编码 AAC）：PE-AV 从 mp4 取画面、从 wav 取音频，
+  少一次音频编码并减小临时文件；
+- 同一部作品只执行一次 ffprobe，结果复用给全部片段（`extract_clip(info=...)`）；
+- 以上优化不改变采样方案、向量内容与 `embedding_version`；对照基准可用
+  `tools/bench_peav.py`（模型加载/批大小/设备/精度）与 `tools/verify_peav.py`；
+- 实测（详见 ARCHITECTURE §6.2）：去 AAC 音轨向量零漂移（sha1 全等，max abs diff=0）；
+  preset veryfast→ultrafast 在 5 片段上 11.07s→5.88s（1.88×）但体积约 2.35×；
+  分辨率缩到高 336 可再快约 2.4× 但会改变向量（joint cos 最低 0.99812），需新向量版本，
+  留待 v0.3 评估。v0.2 只采纳零漂移优化。
+
+#### B1 身份关联与星云去重
+
+```powershell
+# 先 dry-run 看候选（标题规范化后完全相等 + 时长差 <= 3s）
+python ingest.py link-local --list-key votes_2025 --dry-run
+
+# 建立关联，并把本地已有向量复制登记给 canonical（避免重复下载/编码）
+python ingest.py link-local --list-key votes_2025
+
+# 读取 input/lists/local_bv_links.csv 手动覆盖清单
+python ingest.py link-local --list-key votes_2025 --manual
+```
+
+- 关联后 duplicate 默认不进入星云、近邻索引与界面，但其作品记录、本地视频与向量保留；
+- 若本地作品已有当前版本向量，会复制登记给 canonical 并标记 completed，流水线自动跳过下载/编码；
+  `--no-copy` 只建立关联、不复制向量；
+- 关联可撤销（数据库 `unlink_work`）；拿不准的候选不会自动合并。
+
 ### 界面使用
 
-- 侧栏：选择星云版本、2D/3D 切换、染色维度、按文件名/标题/BV 搜索、点大小与透明度；
-- 主图：Plotly 散点图，支持缩放、旋转、悬浮；点击点显示详情；
-- 详情：标题、BV/URL（可点击跳转 Bilibili）、时长、发布日期、作者、选票排名/得分、本地文件；
+- 侧栏：星云版本、2D/3D 切换、染色维度（含“高维近邻密度”）、按文件名/标题/BV 搜索、
+  点大小/透明度、数据集筛选（来源 / 榜单 / 年份）；
+- 主图：Plotly 散点图，支持缩放、旋转、悬浮；点击点（或搜索 + 下拉选择）显示详情；
+- 详情：标题、BV/URL（可点击跳转 Bilibili）、时长、发布日期、作者、选票排名/得分、本地文件，
+  以及三个模态的 Top5 近邻（余弦值）；2D 高亮近邻并连线，3D 可开关连线；
 - 3D 点击选择在部分浏览器/Plotly 版本下不可用，可用“搜索 + 下拉选择作品”的等价入口；
-- 无数据（尚未生成星云）时页面显示中文提示，而不是报错堆栈。
+- 无数据（尚未生成星云）时页面显示中文提示，而不是报错堆栈；筛选星云会标注
+  “坐标仅在本版本内可比”。
 
 ## 数据目录与安全清理
 
@@ -311,7 +423,15 @@ otomad-nebula/
 - 默认测试离线、快速，不下载模型、不访问网络、不需要 GPU；
 - 需要真实 PE-AV 权重或网络的测试分别用 `model` / `network` / `integration` 标记标出；
 - E2E 测试使用 `tests/fixtures/video_factory.py` 现场合成的视频（首次会缓存到
-  `tests/fixtures/out/`），不依赖任何私人素材。
+  `tests/fixtures/out/`），不依赖任何私人素材；
+- v0.2 测试覆盖：`tests/test_similarity.py`（高维近邻/密度）、`tests/test_identity.py`
+  （身份关联与去重）、`tests/test_stability.py`（留一稳定性数学性质 + CLI）、
+  `tests/test_app.py`（近邻面板、筛选）、`tests/test_mapplot.py`（筛选星云与变体）、
+  `tests/test_db.py`（schema v2 迁移、work_links、计时）；
+- `tests/test_invariants.py` 静态检查 similarity / stability / identity 的导入边界
+  （不依赖 UMAP / 模型 / UI），并覆盖 filter_json 落库、duplicate 默认排除、计时非负等 v2 不变量；
+- QA 的 CLI 冒烟额外覆盖 `map.py variants`、`ingest.py link-local`、
+  `tools/clip_stability.py --help`。
 
 ## 常见问题
 
@@ -330,6 +450,10 @@ otomad-nebula/
 `pipeline.py retry <work_id>` 单独重试。需要登录的视频在
 `download.cookies_file` 配置 cookies 文件；网络受限时配置 `download.proxy`。
 
+已知边界：8.7 小时的活动直播回放（BV1b6ivBzEpb）全量下载代价过高，本轮记录为 failed
+并保留可读原因（未来可改用分段下载）；竖屏视频的下载格式已通过
+`config.yt_dlp_format` 中的 `width<=480` 与 `best` 兜底修复。
+
 **怎么确认音画没有错位？**
 `pipeline.py process-local --verify-sync N` 会对前 N 部作品比较切片里
 视频与音频的时长差（容差 0.15 秒）；也可用 `nebula.media.clip_duration_report` 手动抽查。
@@ -338,6 +462,21 @@ otomad-nebula/
 先确认已成功运行 `map.py build`（`map.py list` 能看到 `map_vNNN` 且状态 ready），
 且处理完成的作品数量 >= 3（UMAP 至少需要 3 部作品）。自定义配置路径时设置
 `NEBULA_CONFIG` 环境变量指向配置文件。
+
+**为什么两张星云（或筛选版 vs 全量版）的坐标对不上？**
+UMAP 是非线性降维，训练集变化会让整个布局重新排布：筛选星云与全量星云、不同筛选星云、
+不同 `n_neighbors` 变体之间的坐标都不可直接比较。请只在“同一 map 版本内”比较位置；
+需要对比不同数据子集时，分别生成版本，在侧栏切换查看。
+
+**做了身份关联后，旧的星云会变吗？**
+不会。星云是构建时的快照：关联之前生成的旧版本（如 P0 的 `map_v001`）保留当时的作品集合，
+不回溯改写；重新运行 `map.py build` 生成的新版本默认排除 duplicate。
+同理，失败/未完成的作品没有向量，不会出现在任何星云里（例如 2025 试运行 30 部里 1 部下载失败，
+`map_v002` 为 29 部）。
+
+**近邻相似度和图上的远近为什么不一致？**
+近邻/相似度/近邻密度都使用高维余弦（模型向量空间），主图是 UMAP 二维/三维投影；
+投影只近似保持邻域关系，所以“图上距离”不能当作语义相似度。
 
 **3D 图上点击没有反应？**
 Plotly/Streamlit 在部分环境不支持 3D 点击选择，使用侧栏搜索 + 下拉选择作品即可。
@@ -354,6 +493,8 @@ qa.py 已强制 UTF-8 输出；其他命令行建议使用 PowerShell 7，且
 | P1 | 2025 年约 100 部作品自动处理；支持多维染色与跳转；失败可重试 | `ingest.py import-votes ...`、`pipeline.py run-pending --source bilibili`、`pipeline.py status` |
 | P2 | 多个历史年份合并；按年份比较；星云版本化保存 | 多次 `ingest.py import-votes --year ...`、`map.py build`、`map.py list` |
 | P3 | 新一期周报出现后自动/半自动增量收录 | `ingest.py import-weekly ...`、`pipeline.py run-pending`、`map.py transform` |
+| v0.2 A1/A2 | 近邻面板三模态可切换；高维近邻密度染色；筛选星云 filter_json 正确、跨版本坐标不可比提示 | `streamlit run app.py`、`map.py build --dataset/--vote-year`、`map.py variants` |
+| v0.2 A3/A4/B1 | 稳定性报告 JSON+CSV 生成；`perf_<run_id>.csv` 生成且耗时非负；link-local 关联后 duplicate 默认不进星云 | `tools/clip_stability.py`、`pipeline.py status`、`ingest.py link-local` |
 
 交付前至少确认：
 
@@ -362,13 +503,20 @@ qa.py 已强制 UTF-8 输出；其他命令行建议使用 PowerShell 7，且
 - [ ] 同一视频重复处理不会重复编码（数据库状态 completed，向量文件 mtime 不变）；
 - [ ] 失败文件中止后不影响其他作品，且错误信息可读；
 - [ ] `map.py build` 后 `app.py` 能渲染 2D/3D、染色与搜索；
+- [ ] 现有 33 部作品无需重新编码即可使用 A1/A2 近邻、密度与筛选功能；
+- [ ] 筛选星云的 filter_json 与界面展示一致，并提示“坐标仅在本版本内可比”；
+- [ ] `tools/clip_stability.py` 能生成 `logs/clip_stability.json` 与 `.csv`，且不加载模型；
+- [ ] `logs/perf_<run_id>.csv` 与 `work_timings` 字段齐全且非负；
+- [ ] `ingest.py link-local` 关联后 duplicate 默认不出现在星云/近邻索引，unlink 可恢复；
 - [ ] `data/` 已备份，临时目录与下载原视频已清理。
 
 ## 文档索引
 
-- `ARCHITECTURE.md`：数据模型、模块边界、关键不变量、可复现性；
-- `docs/CONTRACTS.md`：模块接口与写权限契约（并行开发约定）；
-- `docs/adr/`：关键决策记录（PE-AV 选型、采样规则、星云版本、测试嵌入器边界）；
+- `ARCHITECTURE.md`：数据模型、模块边界、关键不变量、可复现性（含 v0.2 近邻/身份/稳定性层）；
+- `docs/CONTRACTS.md`：v0.1 模块接口与写权限契约；
+- `docs/CONTRACTS_V2.md`：v0.2/v0.3 迭代契约（DB v2、近邻、筛选、身份关联、稳定性、计时）；
+- `docs/adr/`：关键决策记录——0001-0004（PE-AV 选型、采样规则、星云版本、测试嵌入器边界），
+  0005（身份关联与星云去重）、0006（筛选地图与坐标不可比）、0007（高维近邻密度）；
 - `docs/agents/QUALITY.md`：质量与验证原则；
 - `音MAD星云计划 · 完整执行方案.md`：项目背景与分阶段计划。
 

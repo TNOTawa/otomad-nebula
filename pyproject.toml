@@ -1,6 +1,6 @@
 [project]
 name = "otomad-nebula"
-version = "0.1.0"
+version = "0.2.0"
 description = "音MAD星云计划：音MAD作品多模态向量数据库与可交互星云可视化"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"

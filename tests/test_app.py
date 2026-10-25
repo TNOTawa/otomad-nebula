@@ -33,8 +33,49 @@ def _ensure_embedding_version(catalog: Catalog, config: Config) -> None:
     )
 
 
-def _seed_app_data(catalog: Catalog, config: Config, count: int = 6) -> list[int]:
-    """登记若干作品、一个选票榜单与一个就绪星云版本。"""
+def _add_map_version(
+    catalog: Catalog,
+    config: Config,
+    work_ids: list[int],
+    version: str,
+    *,
+    filter_spec: dict | None = None,
+    note: str = "AppTest 测试",
+) -> None:
+    """登记一个指定版本/筛选条件的星云（坐标仅用于 AppTest）。"""
+
+    coords = [
+        (
+            work_id,
+            float(index),
+            float(index * 2),
+            float(-index),
+            float(index * 3),
+            float(-index * 2),
+        )
+        for index, work_id in enumerate(work_ids)
+    ]
+    catalog.create_map_run(
+        version,
+        embedding_version=config.embedding_version,
+        params={"metric": "cosine", "random_state": 42},
+        coords=coords,
+        coords_path=f"maps/{version}/coords.parquet",
+        model_2d_path=f"maps/{version}/map_2d.joblib",
+        model_3d_path=f"maps/{version}/map_3d.joblib",
+        note=note,
+        filter_spec=filter_spec,
+    )
+
+
+def _create_map(catalog: Catalog, config: Config, work_ids: list[int]) -> None:
+    _add_map_version(catalog, config, work_ids, "map_v001")
+
+
+def _seed_app_data(
+    catalog: Catalog, config: Config, count: int = 6, *, create_map: bool = True
+) -> list[int]:
+    """登记若干 Bilibili 作品、一个选票榜单与一个就绪星云版本。"""
 
     _ensure_embedding_version(catalog, config)
     work_ids: list[int] = []
@@ -53,28 +94,72 @@ def _seed_app_data(catalog: Catalog, config: Config, count: int = 6) -> list[int
     )
     for index, work_id in enumerate(work_ids):
         catalog.add_appearance(work_id, list_id, rank=index + 1, votes=100 - index)
-    coords = [
-        (
-            work_id,
-            float(index),
-            float(index * 2),
-            float(-index),
-            float(index * 3),
-            float(-index * 2),
-        )
-        for index, work_id in enumerate(work_ids)
-    ]
-    catalog.create_map_run(
-        "map_v001",
-        embedding_version=config.embedding_version,
-        params={"metric": "cosine", "random_state": 42},
-        coords=coords,
-        coords_path="maps/map_v001/coords.parquet",
-        model_2d_path="maps/map_v001/map_2d.joblib",
-        model_3d_path="maps/map_v001/map_3d.joblib",
-        note="AppTest 测试",
-    )
+    if create_map:
+        _create_map(catalog, config, work_ids)
     return work_ids
+
+
+def _seed_mixed_data(catalog: Catalog, config: Config, count: int = 6) -> list[int]:
+    """本地/Bilibili 混合作品 + 2025/2024 榜单 + 周报，用于筛选测试。"""
+
+    _ensure_embedding_version(catalog, config)
+    work_ids: list[int] = []
+    for index in range(count):
+        if index % 3 == 0:
+            work_id, _ = catalog.upsert_local_work(
+                f"clips/本地作品 {index}.mp4", title=f"本地作品 {index}"
+            )
+        else:
+            work_id, _ = catalog.upsert_bilibili_work(
+                f"BV1xx411c7{index:02d}", title=f"合成作品 {index}"
+            )
+        work_ids.append(work_id)
+    votes_2025 = catalog.ensure_list(
+        "votes_2025", name="2025年音MAD选票", kind="votes", vote_year=2025
+    )
+    votes_2024 = catalog.ensure_list(
+        "votes_2024", name="2024年音MAD选票", kind="votes", vote_year=2024
+    )
+    weekly = catalog.ensure_list("weekly_001", name="第1期周报", kind="weekly")
+    for index, work_id in enumerate(work_ids):
+        catalog.add_appearance(work_id, votes_2025, rank=index + 1, votes=100 - index)
+        if index % 2 == 0:
+            catalog.add_appearance(work_id, weekly)
+    for work_id in (work_ids[0], work_ids[1]):
+        catalog.add_appearance(work_id, votes_2024, rank=1)
+    _create_map(catalog, config, work_ids)
+    return work_ids
+
+
+def _add_vectors(
+    catalog: Catalog,
+    config: Config,
+    work_ids: list[int],
+    *,
+    seed: int = 0,
+    kinds_by_work: dict[int, tuple[str, ...]] | None = None,
+) -> None:
+    """为作品写三种模态的合成 npy，供高维近邻功能使用。"""
+
+    version = config.embedding_version
+    rng = np.random.default_rng(seed)
+    for work_id in work_ids:
+        if kinds_by_work is None:
+            kinds = ("work_joint", "work_audio", "work_video")
+        else:
+            kinds = kinds_by_work.get(work_id, ("work_joint", "work_audio", "work_video"))
+        for kind in kinds:
+            vector = rng.normal(size=8).astype(np.float32)
+            path = config.paths.embeddings / version / str(work_id) / f"{kind}.npy"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(path, vector)
+            catalog.register_embedding(
+                work_id,
+                version=version,
+                kind=kind,
+                path=config.data_relpath(path),
+                dim=8,
+            )
 
 
 # --------------------------------------------------------------------------- 工具
@@ -225,3 +310,265 @@ def test_app_manual_selection_shows_detail(
     assert any("合成作品 3" in header for header in headers)
     markdowns = [str(element.value) for element in app_test.markdown]
     assert any("https://www.bilibili.com/video/BV1xx411c703" in text for text in markdowns)
+
+
+# --------------------------------------------------------------------------- 迭代 A2：近邻探索
+def test_app_neighbor_panel_three_modalities(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids = _seed_app_data(catalog, config)
+    _add_vectors(catalog, config, work_ids)
+    app_test = _run_app(monkeypatch, repo_root, config)
+
+    assert not app_test.exception
+    tables = [element.value for element in app_test.dataframe]
+    assert len(tables) == 3  # 三个模态各一张 Top5 表
+    for table in tables:
+        assert list(table.columns) == ["排名", "作品", "余弦相似度"]
+        assert len(table) == 5
+        assert table["排名"].tolist() == [1, 2, 3, 4, 5]
+        values = [float(value) for value in table["余弦相似度"]]
+        assert values == sorted(values, reverse=True)
+        assert all(-1.0 <= value <= 1.0 for value in values)
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("高维近邻已就绪" in caption for caption in captions)
+
+
+def test_app_highlight_and_lines_2d(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids = _seed_app_data(catalog, config)
+    _add_vectors(catalog, config, work_ids)
+    app_test = _run_app(monkeypatch, repo_root, config)
+
+    assert not app_test.exception
+    spec = _chart_spec(app_test)
+    traces = {trace.get("name"): trace for trace in spec["data"]}
+    assert "选中作品" in traces
+    assert "Top5 近邻" in traces
+    assert "近邻连线" in traces
+    assert len(_decode_array(traces["Top5 近邻"]["x"])) == 5
+    line_trace = traces["近邻连线"]
+    assert line_trace["mode"] == "lines"
+    assert len(line_trace["x"]) == 15  # 5 条线段 × (起点, 终点, None)
+
+
+def test_app_3d_lines_toggle(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids = _seed_app_data(catalog, config)
+    _add_vectors(catalog, config, work_ids)
+    app_test = _run_app(monkeypatch, repo_root, config)
+
+    app_test.radio(key="projection").set_value("3d").run()
+    assert not app_test.exception
+    spec = _chart_spec(app_test)
+    names = [trace.get("name") for trace in spec["data"]]
+    assert "选中作品" in names
+    assert "Top5 近邻" in names
+    assert "近邻连线" not in names  # 3D 默认关闭连线
+    assert app_test.checkbox(key="show_lines_3d").value is False
+
+    app_test.checkbox(key="show_lines_3d").set_value(True).run()
+    assert not app_test.exception
+    spec = _chart_spec(app_test)
+    line_traces = [trace for trace in spec["data"] if trace.get("name") == "近邻连线"]
+    assert len(line_traces) == 1
+    assert line_traces[0]["type"] == "scatter3d"
+    assert len(line_traces[0]["z"]) == 15
+
+
+def test_app_density_knn_color(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids = _seed_app_data(catalog, config)
+    _add_vectors(catalog, config, work_ids)
+    app_test = _run_app(monkeypatch, repo_root, config)
+
+    app_test.selectbox(key="color_field").set_value("density_knn").run()
+    assert not app_test.exception
+    spec = _chart_spec(app_test)
+    marker = spec["data"][0]["marker"]
+    assert "近邻" in marker["colorbar"]["title"]["text"]
+    assert len(_decode_array(marker["color"])) == len(work_ids)
+
+
+def test_app_filters(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids = _seed_mixed_data(catalog, config)
+    _add_vectors(catalog, config, work_ids)
+    app_test = _run_app(monkeypatch, repo_root, config)
+
+    spec = _chart_spec(app_test)
+    assert len(_decode_array(spec["data"][0]["x"])) == 6
+
+    app_test.selectbox(key="filter_source").set_value("local").run()
+    assert not app_test.exception
+    spec = _chart_spec(app_test)
+    assert len(_decode_array(spec["data"][0]["x"])) == 2
+
+    app_test.multiselect(key="filter_years").set_value([2024]).run()
+    assert not app_test.exception
+    spec = _chart_spec(app_test)
+    assert len(_decode_array(spec["data"][0]["x"])) == 1
+
+    # 恢复来源筛选后按周报榜单过滤
+    app_test.selectbox(key="filter_source").set_value("all").run()
+    app_test.multiselect(key="filter_years").set_value([]).run()
+    app_test.multiselect(key="filter_lists").set_value(["weekly_001"]).run()
+    assert not app_test.exception
+    spec = _chart_spec(app_test)
+    assert len(_decode_array(spec["data"][0]["x"])) == 3
+
+    # 组合筛选不匹配时给出中文提示（Bilibili 作品都不在 2024 年周报里）
+    app_test.selectbox(key="filter_source").set_value("bilibili").run()
+    app_test.multiselect(key="filter_lists").set_value(["votes_2024"]).run()
+    app_test.multiselect(key="filter_years").set_value([2024]).run()
+    app_test.multiselect(key="filter_lists").set_value(["weekly_001"]).run()
+    assert not app_test.exception
+    infos = [str(element.value) for element in app_test.info]
+    assert any("没有作品" in message for message in infos)
+
+
+def test_app_neighbor_jump(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from nebula.similarity import load_similarity_index
+
+    work_ids = _seed_app_data(catalog, config)
+    _add_vectors(catalog, config, work_ids)
+    index = load_similarity_index(catalog, config)
+    try:
+        target = index.neighbors(work_ids[0], kind="work_joint", k=1)[0].work_id
+    finally:
+        index.close()
+
+    app_test = _run_app(monkeypatch, repo_root, config)
+    app_test.selectbox(key="neighbor_jump").set_value(target).run()
+    assert not app_test.exception
+    headers = [str(element.value) for element in app_test.subheader]
+    assert any(str(target) in header or "作品" in header for header in headers)
+    target_work = catalog.get_work(target)
+    assert any(str(target_work["title"]) in header for header in headers)
+    assert app_test.selectbox(key="manual_work").value == target
+
+
+def test_app_missing_modality_caption(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids = _seed_app_data(catalog, config)
+    _add_vectors(
+        catalog,
+        config,
+        work_ids,
+        kinds_by_work={work_ids[5]: ("work_joint", "work_video")},
+    )
+    app_test = _run_app(monkeypatch, repo_root, config)
+
+    app_test.selectbox(key="manual_work").set_value(work_ids[5]).run()
+    assert not app_test.exception
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("无音频模态向量" in caption for caption in captions)
+    tables = [element.value for element in app_test.dataframe]
+    assert len(tables) == 2  # 只有联合与画面两个模态
+
+
+# --------------------------------------------------------------------------- 默认星云版本选择（UX）
+def _seed_version_choice_env(
+    catalog: Catalog, config: Config, *, with_total: bool = True
+) -> list[int]:
+    """构造多个星云版本：总星云 + 2025 筛选星云 + n_neighbors 变体。"""
+
+    work_ids = _seed_app_data(catalog, config, count=6, create_map=with_total)
+    if not with_total:
+        _add_map_version(
+            catalog,
+            config,
+            work_ids[:4],
+            "map_v001",
+            filter_spec={"list_key": "votes_2025"},
+        )
+        _add_map_version(
+            catalog,
+            config,
+            work_ids[:2],
+            "map_v002",
+            filter_spec={"vote_year": 2025},
+        )
+        return work_ids
+    # 总星云 map_v001 之后又生成了 2025 子集与 n_neighbors 变体
+    _add_map_version(
+        catalog,
+        config,
+        work_ids[:4],
+        "map_v002",
+        filter_spec={"list_key": "votes_2025"},
+        note="2025 独立星云",
+    )
+    _add_map_version(
+        catalog,
+        config,
+        work_ids[:2],
+        "map_v003",
+        filter_spec={"vote_year": 2025},
+        note="2025 变体 n_neighbors=30",
+    )
+    return work_ids
+
+
+def test_app_default_prefers_latest_unfiltered_map(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """默认打开“最新且 filter_json 为空的总星云”，而不是最新版本。"""
+
+    _seed_version_choice_env(catalog, config, with_total=True)
+    app_test = _run_app(monkeypatch, repo_root, config)
+
+    assert not app_test.exception
+    # 最新版本是 map_v003（筛选变体），但默认应选总星云 map_v001
+    assert app_test.selectbox(key="map_version").value == "map_v001"
+    spec = _chart_spec(app_test)
+    assert len(_decode_array(spec["data"][0]["x"])) == 6
+
+
+def test_app_manual_map_switch_keeps_user_choice(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """用户手动切到筛选星云后，后续交互不应被默认逻辑改回总星云。"""
+
+    _seed_version_choice_env(catalog, config, with_total=True)
+    app_test = _run_app(monkeypatch, repo_root, config)
+    assert app_test.selectbox(key="map_version").value == "map_v001"
+
+    app_test.selectbox(key="map_version").set_value("map_v003").run()
+    assert not app_test.exception
+    assert app_test.selectbox(key="map_version").value == "map_v003"
+    spec = _chart_spec(app_test)
+    assert len(_decode_array(spec["data"][0]["x"])) == 2
+
+    # 其它控件交互后仍保持用户选择的版本
+    app_test.selectbox(key="filter_source").set_value("bilibili").run()
+    assert not app_test.exception
+    assert app_test.selectbox(key="map_version").value == "map_v003"
+
+    # 再切回总星云也正常
+    app_test.selectbox(key="map_version").set_value("map_v001").run()
+    assert not app_test.exception
+    assert app_test.selectbox(key="map_version").value == "map_v001"
+    spec = _chart_spec(app_test)
+    assert len(_decode_array(spec["data"][0]["x"])) == 6
+
+
+def test_app_default_falls_back_to_latest_when_all_maps_filtered(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """没有总星云（全部带筛选）时，回退到最新 ready 版本。"""
+
+    _seed_version_choice_env(catalog, config, with_total=False)
+    app_test = _run_app(monkeypatch, repo_root, config)
+
+    assert not app_test.exception
+    assert app_test.selectbox(key="map_version").value == "map_v002"
+    spec = _chart_spec(app_test)
+    assert len(_decode_array(spec["data"][0]["x"])) == 2
