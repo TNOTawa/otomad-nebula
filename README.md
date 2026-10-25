@@ -628,6 +628,7 @@ qa.py 已强制 UTF-8 输出；其他命令行建议使用 PowerShell 7，且
 - `ARCHITECTURE.md`：数据模型、模块边界、关键不变量、可复现性（含 v0.2 近邻/身份/稳定性层）；
 - `docs/CONTRACTS.md`：v0.1 模块接口与写权限契约；
 - `docs/CONTRACTS_V2.md`：v0.2/v0.3 迭代契约（DB v2、近邻、筛选、身份关联、稳定性、计时）；
+- [docs/reports/embedding-pipeline.md](docs/reports/embedding-pipeline.md)：嵌入流程报告（采样 → 切片 → PE-AV → 聚合 → 存储/版本 → 实测耗时与实验局限）；
 - `docs/adr/`：关键决策记录——0001-0004（PE-AV 选型、采样规则、星云版本、测试嵌入器边界），
   0005（身份关联与星云去重）、0006（筛选地图与坐标不可比）、0007（高维近邻密度）、
   0008（音画错位实验方法与局限）、0009（近邻解释：相对分位/互为 Top-k/hubness）；
