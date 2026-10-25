@@ -1,0 +1,68 @@
+# 音MAD星云计划 配置文件
+# 所有相对路径都相对于本配置文件所在目录（即项目根目录）。
+
+project:
+  name: otomad-nebula
+
+paths:
+  input_local: input/local   # P0 本地测试视频目录
+  input_lists: input/lists   # 选票 CSV / 周报清单
+  data: data                 # 永久数据（SQLite、向量、UMAP 坐标）
+  temp: temp                 # 流水线临时目录，成功后自动清理
+  logs: logs
+
+database:
+  filename: catalog.sqlite
+
+media:
+  ffmpeg: ffmpeg
+  ffprobe: ffprobe
+  clip_seconds: 8.0          # 每个音画同步片段的长度（实验参数，P0 验证后固定）
+  clips_per_work: 5          # 每部作品最多截取的片段数
+  min_duration_seconds: 1.0  # 短于此长度的文件直接记为失败
+  audio_sample_rate: 48000
+  audio_channels: 2
+  video_crf: 18
+  video_preset: veryfast
+  extract_timeout_seconds: 300
+  probe_timeout_seconds: 60
+
+model:
+  checkpoint: facebook/pe-av-small-16-frame
+  revision: 9f888eea95c83622212bb742e91bf01d3b46fe96
+  version: peav-small-16f   # 写入数据库的模型版本标签
+  frames: 16                # 该检查点固定 16 帧；仅用于校验与记录
+  device: auto              # auto | cpu | cuda
+  dtype: auto               # auto | float32 | bfloat16
+  batch_size: 5             # 一次前向的片段数
+  cache_dir: .cache/hf
+  local_files_only: false
+
+umap:
+  metric: cosine
+  n_neighbors: 15
+  min_dist: 0.1
+  random_state: 42
+  n_jobs: 1                 # 固定为 1 以保证可复现
+  n_epochs: null            # null 表示使用 UMAP 默认值
+  dimensions: [2, 3]        # 分别训练二维与三维投影
+
+download:
+  yt_dlp_format: "bv*[height<=480]+ba/b[height<=480]/b"
+  max_height: 480           # 编码只需要低分辨率，避免保存原始大文件
+  cookies_file: null
+  proxy: null
+  retries: 3
+
+bilibili:
+  api_timeout_seconds: 20
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
+app:
+  title: 音MAD 星云
+  point_size: 6
+  opacity: 0.85
+  density_grid: 40          # “按密度染色”时的二维网格数
+
+logging:
+  level: INFO
