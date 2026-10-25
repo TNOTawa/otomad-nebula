@@ -22,9 +22,17 @@ from . import EMBEDDING_KINDS
 from .errors import DatabaseError
 from .util import normalize_relpath, now_utc_iso
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 STATUSES = ("pending", "downloading", "encoding", "completed", "failed")
+
+#: 旧版“均匀抽 ≤N 段再平均”的表征名；迁移时自动为已有 embedding_versions 补登
+LEGACY_REPRESENTATION_NAME = "legacy_5clip_mean"
+
+REPRESENTATION_KINDS = ("legacy", "full_mean", "temporal_stats", "transformer")
+REPRESENTATION_VECTOR_KINDS = ("joint", "audio", "video")
+REPRESENTATION_STATUSES = ("building", "ready", "failed")
+SEQUENCE_STATUSES = ("in_progress", "assembled", "failed")
 
 TRANSITIONS: dict[str, frozenset[str]] = {
     "pending": frozenset({"downloading", "encoding", "failed"}),
@@ -146,12 +154,60 @@ CREATE TABLE IF NOT EXISTS clips (
     idx INTEGER NOT NULL,
     start_s REAL NOT NULL,
     duration_s REAL NOT NULL,
+    valid_duration_s REAL,
+    weight REAL,
     PRIMARY KEY (work_id, version, idx)
 );
+
+-- 全片编码的片段级恢复状态（v0.4）：每成功编码一批就更新 n_clips_done
+CREATE TABLE IF NOT EXISTS sequence_states (
+    work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    version TEXT NOT NULL,
+    duration_s REAL NOT NULL,
+    n_clips INTEGER NOT NULL,
+    n_clips_done INTEGER NOT NULL DEFAULT 0,
+    partial_relpath TEXT,
+    status TEXT NOT NULL DEFAULT 'in_progress'
+        CHECK (status IN ('in_progress', 'assembled', 'failed')),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (work_id, version)
+);
+
+-- 表征层（v0.4）：聚合器版本，独立于 PE-AV 编码；binding 到 sequence_version
+CREATE TABLE IF NOT EXISTS representations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    sequence_version TEXT NOT NULL REFERENCES embedding_versions(version),
+    kind TEXT NOT NULL
+        CHECK (kind IN ('legacy', 'full_mean', 'temporal_stats', 'transformer')),
+    dim INTEGER NOT NULL DEFAULT 0,
+    path_prefix TEXT,
+    params_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'building'
+        CHECK (status IN ('building', 'ready', 'failed')),
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (name, sequence_version)
+);
+
+CREATE TABLE IF NOT EXISTS representation_vectors (
+    representation_id INTEGER NOT NULL
+        REFERENCES representations(id) ON DELETE CASCADE,
+    work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('joint', 'audio', 'video')),
+    path TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (representation_id, work_id, kind)
+);
+CREATE INDEX IF NOT EXISTS ix_representation_vectors_rep
+    ON representation_vectors(representation_id, kind);
 
 CREATE TABLE IF NOT EXISTS map_runs (
     version TEXT PRIMARY KEY,
     embedding_version TEXT NOT NULL REFERENCES embedding_versions(version),
+    representation_id INTEGER REFERENCES representations(id),
     params_json TEXT NOT NULL,
     filter_json TEXT,
     coords_path TEXT,
@@ -216,6 +272,7 @@ CREATE TABLE IF NOT EXISTS work_timings (
     preprocess_s REAL NOT NULL DEFAULT 0,
     forward_s REAL NOT NULL DEFAULT 0,
     save_s REAL NOT NULL DEFAULT 0,
+    events_s REAL NOT NULL DEFAULT 0,
     total_s REAL NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     UNIQUE (run_id, work_id)
@@ -311,16 +368,97 @@ class Catalog:
         """把旧版本数据库原地迁移到当前 schema 版本。只做向后兼容的加表/加列。"""
 
         if current == "1":
+            # v1 -> v2：筛选星云把条件写入 map_runs.filter_json
             columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(map_runs)")}
             if "filter_json" not in columns:
                 conn.execute("ALTER TABLE map_runs ADD COLUMN filter_json TEXT")
-            conn.execute(
-                "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (SCHEMA_VERSION,)
-            )
+            current = "2"
+        if current == "2":
+            self._migrate_v2_to_v3(conn)
             return
         raise DatabaseError(
             f"数据库 schema 版本不兼容: 文件为 {current}, 程序需要 {SCHEMA_VERSION}; "
             "请备份后重建或手工迁移"
+        )
+
+    def _migrate_v2_to_v3(self, conn: sqlite3.Connection) -> None:
+        """v2 -> v3：全片序列列/状态表/表征层/地图绑定表征。
+
+        - clips 增加有效时长与权重（旧行为 NULL）；
+        - work_timings 增加事件扫描耗时；
+        - map_runs 增加 representation_id；
+        - 已有 embedding_versions 补登 legacy 表征，旧地图回填到对应 legacy 表征。
+        """
+
+        def columns(table: str) -> set[str]:
+            return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+        clip_columns = columns("clips")
+        if "valid_duration_s" not in clip_columns:
+            conn.execute("ALTER TABLE clips ADD COLUMN valid_duration_s REAL")
+        if "weight" not in clip_columns:
+            conn.execute("ALTER TABLE clips ADD COLUMN weight REAL")
+        timing_columns = columns("work_timings")
+        if "events_s" not in timing_columns:
+            conn.execute(
+                "ALTER TABLE work_timings ADD COLUMN events_s REAL NOT NULL DEFAULT 0"
+            )
+        map_columns = columns("map_runs")
+        if "representation_id" not in map_columns:
+            conn.execute(
+                "ALTER TABLE map_runs ADD COLUMN representation_id INTEGER "
+                "REFERENCES representations(id)"
+            )
+
+        now = now_utc_iso()
+        params_json = json.dumps(
+            {
+                "source": "embeddings",
+                "embedding_kind": "work_joint",
+                "aggregation": "l2-normalize-mean-l2-normalize",
+                "note": "v0.3 及以前：旧版均匀采样片段平均",
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        for row in conn.execute(
+            "SELECT version FROM embedding_versions ORDER BY created_at, version"
+        ).fetchall():
+            version = str(row["version"])
+            exists = conn.execute(
+                "SELECT 1 FROM representations WHERE name = ? AND sequence_version = ?",
+                (LEGACY_REPRESENTATION_NAME, version),
+            ).fetchone()
+            if exists is None:
+                conn.execute(
+                    """
+                    INSERT INTO representations (
+                        name, sequence_version, kind, dim, path_prefix, params_json,
+                        status, note, created_at, updated_at
+                    ) VALUES (?, ?, 'legacy', 0, NULL, ?, 'ready', ?, ?, ?)
+                    """,
+                    (
+                        LEGACY_REPRESENTATION_NAME,
+                        version,
+                        params_json,
+                        "v0.3 及以前的 5 片段平均表征；向量来自 embeddings 表 work_* 文件",
+                        now,
+                        now,
+                    ),
+                )
+        conn.execute(
+            """
+            UPDATE map_runs SET representation_id = (
+                SELECT r.id FROM representations r
+                WHERE r.kind = 'legacy' AND r.sequence_version = map_runs.embedding_version
+                LIMIT 1
+            )
+            WHERE representation_id IS NULL
+            """
+        )
+        conn.execute(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+            (SCHEMA_VERSION,),
         )
 
     # ------------------------------------------------------------------ 作品
@@ -776,19 +914,376 @@ class Catalog:
         work_id: int,
         *,
         version: str,
-        clips: Sequence[tuple[int, float, float]],
+        clips: Sequence[tuple[Any, ...]],
     ) -> None:
+        """替换某作品的片段计划。
+
+        clips 的每个元素可以是 (idx, start_s, duration_s)（旧格式，valid/weight 记 NULL），
+        也可以是 (idx, start_s, duration_s, valid_duration_s, weight)（v0.4 全片格式）。
+        """
+
+        normalized: list[tuple[int, str, int, float, float, float | None, float | None]] = []
+        for item in clips:
+            values = tuple(item)
+            if len(values) == 3:
+                idx, start, duration = values
+                valid = None
+                weight = None
+            elif len(values) == 5:
+                idx, start, duration, valid, weight = values
+                valid = None if valid is None else float(valid)
+                weight = None if weight is None else float(weight)
+            else:
+                raise DatabaseError(
+                    f"片段格式非法（需要 3 或 5 元组）: {values!r}"
+                )
+            normalized.append(
+                (work_id, version, int(idx), float(start), float(duration), valid, weight)
+            )
         with self.transaction() as conn:
             conn.execute("DELETE FROM clips WHERE work_id = ? AND version = ?", (work_id, version))
             conn.executemany(
-                "INSERT INTO clips(work_id, version, idx, start_s, duration_s) VALUES (?, ?, ?, ?, ?)",
-                [(work_id, version, int(idx), float(start), float(dur)) for idx, start, dur in clips],
+                "INSERT INTO clips(work_id, version, idx, start_s, duration_s, "
+                "valid_duration_s, weight) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                normalized,
             )
 
     def get_clips(self, work_id: int, *, version: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM clips WHERE work_id = ? AND version = ? ORDER BY idx",
             (work_id, version),
+        ).fetchall()
+        return _as_dicts(rows)
+
+    # ------------------------------------------------------------------ 全片序列状态
+    def upsert_sequence_state(
+        self,
+        work_id: int,
+        *,
+        version: str,
+        duration_s: float,
+        n_clips: int,
+        n_clips_done: int = 0,
+        partial_relpath: str | None = None,
+        status: str = "in_progress",
+    ) -> None:
+        """登记/更新一部作品的全片编码进度（片段级恢复用）。"""
+
+        if status not in SEQUENCE_STATUSES:
+            raise DatabaseError(f"未知序列状态: {status}")
+        if int(n_clips) < 0:
+            raise DatabaseError(f"片段总数非法: {n_clips}")
+        if not 0 <= int(n_clips_done) <= int(n_clips):
+            raise DatabaseError(f"已完成片段数非法: {n_clips_done} / {n_clips}")
+        now = now_utc_iso()
+        with self.transaction() as conn:
+            if conn.execute("SELECT 1 FROM works WHERE id = ?", (work_id,)).fetchone() is None:
+                raise DatabaseError(f"作品不存在: {work_id}")
+            conn.execute(
+                """
+                INSERT INTO sequence_states (
+                    work_id, version, duration_s, n_clips, n_clips_done,
+                    partial_relpath, status, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(work_id, version) DO UPDATE SET
+                    duration_s = excluded.duration_s,
+                    n_clips = excluded.n_clips,
+                    n_clips_done = excluded.n_clips_done,
+                    partial_relpath = excluded.partial_relpath,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    work_id,
+                    version,
+                    float(duration_s),
+                    int(n_clips),
+                    int(n_clips_done),
+                    partial_relpath,
+                    status,
+                    now,
+                ),
+            )
+
+    def get_sequence_state(self, work_id: int, *, version: str) -> dict[str, Any] | None:
+        return _as_dict(
+            self.conn.execute(
+                "SELECT * FROM sequence_states WHERE work_id = ? AND version = ?",
+                (work_id, version),
+            ).fetchone()
+        )
+
+    def list_sequence_states(
+        self, *, version: str | None = None, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM sequence_states WHERE 1 = 1"
+        params: list[Any] = []
+        if version is not None:
+            sql += " AND version = ?"
+            params.append(version)
+        if status is not None:
+            if status not in SEQUENCE_STATUSES:
+                raise DatabaseError(f"未知序列状态: {status}")
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY work_id"
+        return _as_dicts(self.conn.execute(sql, params).fetchall())
+
+    def delete_sequence_state(self, work_id: int, *, version: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "DELETE FROM sequence_states WHERE work_id = ? AND version = ?",
+                (work_id, version),
+            )
+
+    # ------------------------------------------------------------------ 表征层
+    def register_representation(
+        self,
+        name: str,
+        *,
+        sequence_version: str,
+        kind: str,
+        params: Mapping[str, Any],
+        path_prefix: str | None = None,
+        note: str | None = None,
+    ) -> int:
+        """登记表征版本并返回 id；同名 + 同序列已存在时要求 kind/参数一致。"""
+
+        display = str(name or "").strip()
+        if not display:
+            raise DatabaseError("表征名不能为空")
+        if kind not in REPRESENTATION_KINDS:
+            raise DatabaseError(f"未知表征类型: {kind}")
+        payload = dict(params or {})
+        params_json = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        now = now_utc_iso()
+        with self.transaction() as conn:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM embedding_versions WHERE version = ?", (sequence_version,)
+                ).fetchone()
+                is None
+            ):
+                raise DatabaseError(f"序列版本未登记: {sequence_version}")
+            row = conn.execute(
+                "SELECT * FROM representations WHERE name = ? AND sequence_version = ?",
+                (display, sequence_version),
+            ).fetchone()
+            if row is not None:
+                if row["kind"] != kind or row["params_json"] != params_json:
+                    raise DatabaseError(
+                        f"表征 {display}@{sequence_version} 已存在但类型/参数不同；"
+                        "请使用新表征名，或构建工具 --force 重建"
+                    )
+                return int(row["id"])
+            cursor = conn.execute(
+                """
+                INSERT INTO representations (
+                    name, sequence_version, kind, dim, path_prefix, params_json,
+                    status, note, created_at, updated_at
+                ) VALUES (?, ?, ?, 0, ?, ?, 'building', ?, ?, ?)
+                """,
+                (display, sequence_version, kind, path_prefix, params_json, note, now, now),
+            )
+            return int(cursor.lastrowid)
+
+    def get_representation(
+        self,
+        representation_id: int | None = None,
+        *,
+        name: str | None = None,
+        sequence_version: str | None = None,
+    ) -> dict[str, Any] | None:
+        if representation_id is not None:
+            return _as_dict(
+                self.conn.execute(
+                    "SELECT * FROM representations WHERE id = ?", (int(representation_id),)
+                ).fetchone()
+            )
+        if name is None:
+            raise DatabaseError("get_representation 需要 representation_id 或 name")
+        if sequence_version is not None:
+            return _as_dict(
+                self.conn.execute(
+                    "SELECT * FROM representations WHERE name = ? AND sequence_version = ?",
+                    (name, sequence_version),
+                ).fetchone()
+            )
+        return _as_dict(
+            self.conn.execute(
+                "SELECT * FROM representations WHERE name = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+        )
+
+    def list_representations(
+        self,
+        *,
+        name: str | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM representations WHERE 1 = 1"
+        params: list[Any] = []
+        if name is not None:
+            sql += " AND name = ?"
+            params.append(name)
+        if kind is not None:
+            if kind not in REPRESENTATION_KINDS:
+                raise DatabaseError(f"未知表征类型: {kind}")
+            sql += " AND kind = ?"
+            params.append(kind)
+        if status is not None:
+            if status not in REPRESENTATION_STATUSES:
+                raise DatabaseError(f"未知表征状态: {status}")
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at, id"
+        return _as_dicts(self.conn.execute(sql, params).fetchall())
+
+    def update_representation_params(
+        self,
+        representation_id: int,
+        params: Mapping[str, Any],
+        *,
+        note: str | None = None,
+    ) -> None:
+        """更新表征参数（用于 --force 重建；正常流程应新建表征名）。"""
+
+        params_json = json.dumps(dict(params or {}), sort_keys=True, ensure_ascii=False)
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE representations SET params_json = ?, note = COALESCE(?, note), "
+                "updated_at = ? WHERE id = ?",
+                (params_json, note, now_utc_iso(), int(representation_id)),
+            )
+            if cursor.rowcount == 0:
+                raise DatabaseError(f"表征不存在: {representation_id}")
+
+    def set_representation_status(
+        self,
+        representation_id: int,
+        status: str,
+        *,
+        dim: int | None = None,
+        note: str | None = None,
+    ) -> None:
+        if status not in REPRESENTATION_STATUSES:
+            raise DatabaseError(f"未知表征状态: {status}")
+        with self.transaction() as conn:
+            if dim is None:
+                cursor = conn.execute(
+                    "UPDATE representations SET status = ?, note = COALESCE(?, note), "
+                    "updated_at = ? WHERE id = ?",
+                    (status, note, now_utc_iso(), int(representation_id)),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE representations SET status = ?, dim = ?, note = COALESCE(?, note), "
+                    "updated_at = ? WHERE id = ?",
+                    (status, int(dim), note, now_utc_iso(), int(representation_id)),
+                )
+            if cursor.rowcount == 0:
+                raise DatabaseError(f"表征不存在: {representation_id}")
+
+    def ensure_legacy_representation(self, sequence_version: str) -> int:
+        """确保某个旧序列版本有对应的 legacy 表征登记，返回表征 id。"""
+
+        row = self.get_representation(
+            name=LEGACY_REPRESENTATION_NAME, sequence_version=sequence_version
+        )
+        if row is not None:
+            return int(row["id"])
+        if self.get_embedding_version(sequence_version) is None:
+            raise DatabaseError(f"序列版本未登记: {sequence_version}")
+        params = {
+            "source": "embeddings",
+            "embedding_kind": "work_joint",
+            "aggregation": "l2-normalize-mean-l2-normalize",
+        }
+        return self.register_representation(
+            LEGACY_REPRESENTATION_NAME,
+            sequence_version=sequence_version,
+            kind="legacy",
+            params=params,
+            note="旧版均匀采样片段平均表征",
+        )
+
+    def clear_representation_vectors(self, representation_id: int) -> int:
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "DELETE FROM representation_vectors WHERE representation_id = ?",
+                (int(representation_id),),
+            )
+            return int(cursor.rowcount)
+
+    def register_representation_vector(
+        self,
+        representation_id: int,
+        work_id: int,
+        *,
+        kind: str,
+        path: str,
+        dim: int,
+    ) -> None:
+        if kind not in REPRESENTATION_VECTOR_KINDS:
+            raise DatabaseError(f"未知表征向量种类: {kind}")
+        if dim < 1:
+            raise DatabaseError(f"向量维度非法: {dim}")
+        if not path:
+            raise DatabaseError("向量路径不能为空")
+        with self.transaction() as conn:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM representations WHERE id = ?", (int(representation_id),)
+                ).fetchone()
+                is None
+            ):
+                raise DatabaseError(f"表征不存在: {representation_id}")
+            if (
+                conn.execute("SELECT 1 FROM works WHERE id = ?", (int(work_id),)).fetchone()
+                is None
+            ):
+                raise DatabaseError(f"作品不存在: {work_id}")
+            conn.execute(
+                """
+                INSERT INTO representation_vectors (
+                    representation_id, work_id, kind, path, dim, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(representation_id, work_id, kind) DO UPDATE SET
+                    path = excluded.path,
+                    dim = excluded.dim,
+                    created_at = excluded.created_at
+                """,
+                (int(representation_id), int(work_id), kind, path, int(dim), now_utc_iso()),
+            )
+
+    def list_representation_vectors(
+        self, representation_id: int, *, kind: str | None = None
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM representation_vectors WHERE representation_id = ?"
+        params: list[Any] = [int(representation_id)]
+        if kind is not None:
+            if kind not in REPRESENTATION_VECTOR_KINDS:
+                raise DatabaseError(f"未知表征向量种类: {kind}")
+            sql += " AND kind = ?"
+            params.append(kind)
+        sql += " ORDER BY work_id"
+        return _as_dicts(self.conn.execute(sql, params).fetchall())
+
+    def list_works_with_representation(
+        self, representation_id: int, *, kind: str = "joint"
+    ) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT w.*, v.path AS representation_path, v.dim AS representation_dim
+            FROM works w
+            JOIN representation_vectors v ON v.work_id = w.id
+            WHERE v.representation_id = ? AND v.kind = ?
+            ORDER BY w.id
+            """,
+            (int(representation_id), kind),
         ).fetchall()
         return _as_dicts(rows)
 
@@ -902,6 +1397,7 @@ class Catalog:
         model_3d_path: str | None = None,
         note: str | None = None,
         filter_spec: Mapping[str, Any] | None = None,
+        representation_id: int | None = None,
     ) -> None:
         """原子地登记一次星云生成：版本信息 + 全部坐标。"""
 
@@ -915,16 +1411,29 @@ class Catalog:
             ).fetchone()
             if exists is not None:
                 raise DatabaseError(f"星云版本已存在: {version}")
+            if representation_id is not None:
+                rep = conn.execute(
+                    "SELECT * FROM representations WHERE id = ?", (int(representation_id),)
+                ).fetchone()
+                if rep is None:
+                    raise DatabaseError(f"表征不存在: {representation_id}")
+                if str(rep["sequence_version"]) != embedding_version:
+                    raise DatabaseError(
+                        f"地图的向量版本与表征序列不一致: {embedding_version} != "
+                        f"{rep['sequence_version']}"
+                    )
             conn.execute(
                 """
                 INSERT INTO map_runs (
-                    version, embedding_version, params_json, filter_json, coords_path,
-                    model_2d_path, model_3d_path, n_works, status, note, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
+                    version, embedding_version, representation_id, params_json,
+                    filter_json, coords_path, model_2d_path, model_3d_path,
+                    n_works, status, note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
                 """,
                 (
                     version,
                     embedding_version,
+                    None if representation_id is None else int(representation_id),
                     json.dumps(dict(params), sort_keys=True, ensure_ascii=False),
                     (
                         json.dumps(dict(filter_spec), sort_keys=True, ensure_ascii=False)
@@ -952,16 +1461,33 @@ class Catalog:
             self.conn.execute("SELECT * FROM map_runs WHERE version = ?", (version,)).fetchone()
         )
 
-    def latest_map(self, *, ready_only: bool = True) -> dict[str, Any] | None:
-        sql = "SELECT * FROM map_runs"
+    def latest_map(
+        self, *, ready_only: bool = True, representation_id: int | None = None
+    ) -> dict[str, Any] | None:
+        clauses: list[str] = []
+        params: list[Any] = []
         if ready_only:
-            sql += " WHERE status = 'ready'"
+            clauses.append("status = 'ready'")
+        if representation_id is not None:
+            clauses.append("representation_id = ?")
+            params.append(int(representation_id))
+        sql = "SELECT * FROM map_runs"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at DESC, rowid DESC LIMIT 1"
-        return _as_dict(self.conn.execute(sql).fetchone())
+        return _as_dict(self.conn.execute(sql, params).fetchone())
 
-    def list_maps(self) -> list[dict[str, Any]]:
+    def list_maps(self, *, representation_id: int | None = None) -> list[dict[str, Any]]:
+        if representation_id is None:
+            return _as_dicts(
+                self.conn.execute("SELECT * FROM map_runs ORDER BY created_at, rowid").fetchall()
+            )
         return _as_dicts(
-            self.conn.execute("SELECT * FROM map_runs ORDER BY created_at, rowid").fetchall()
+            self.conn.execute(
+                "SELECT * FROM map_runs WHERE representation_id = ? "
+                "ORDER BY created_at, rowid",
+                (int(representation_id),),
+            ).fetchall()
         )
 
     def load_map_rows(self, version: str) -> list[dict[str, Any]]:
@@ -1330,6 +1856,12 @@ class Catalog:
             link_rows = self.conn.execute("SELECT COUNT(*) AS n FROM work_links").fetchone()
             run_rows = self.conn.execute("SELECT COUNT(*) AS n FROM pipeline_runs").fetchone()
             timing_rows = self.conn.execute("SELECT COUNT(*) AS n FROM work_timings").fetchone()
+            representation_rows = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM representations"
+            ).fetchone()
+            sequence_rows = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM sequence_states"
+            ).fetchone()
         except sqlite3.OperationalError:
             # 尚未 initialize
             return {"status": status, "tables_ready": False}
@@ -1346,4 +1878,6 @@ class Catalog:
             "links": int(link_rows["n"]) if link_rows else 0,
             "pipeline_runs": int(run_rows["n"]) if run_rows else 0,
             "timings": int(timing_rows["n"]) if timing_rows else 0,
+            "representations": int(representation_rows["n"]) if representation_rows else 0,
+            "sequences": int(sequence_rows["n"]) if sequence_rows else 0,
         }

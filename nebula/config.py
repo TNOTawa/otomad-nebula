@@ -21,6 +21,9 @@ _TOP_LEVEL_KEYS = {
     "paths",
     "database",
     "media",
+    "sampling",
+    "events",
+    "temporal",
     "model",
     "umap",
     "download",
@@ -39,6 +42,7 @@ class PathsConfig:
     logs: Path
     db_path: Path
     embeddings: Path
+    representations: Path
     maps: Path
 
 
@@ -55,6 +59,34 @@ class MediaConfig:
     video_preset: str
     extract_timeout_seconds: float
     probe_timeout_seconds: float
+    clip_height: int | None = None
+
+    long_video_seconds: float = 3600.0
+
+
+@dataclass(frozen=True)
+class SamplingConfig:
+    """全片采样模式与重叠参数。"""
+
+    mode: str
+    overlap_seconds: float
+
+
+@dataclass(frozen=True)
+class EventsConfig:
+    """v0.4.1 高频音画事件扫描参数。"""
+
+    enabled: bool
+    audio_rate_hz: int
+    video_fps: int
+    version: str
+
+
+@dataclass(frozen=True)
+class TemporalConfig:
+    """v0.4.2 固定时间结构表征参数。"""
+
+    stages: int
 
 
 @dataclass(frozen=True)
@@ -118,6 +150,9 @@ class Config:
     project_name: str
     paths: PathsConfig
     media: MediaConfig
+    sampling: SamplingConfig
+    events: EventsConfig
+    temporal: TemporalConfig
     model: ModelConfig
     umap: UmapConfig
     download: DownloadConfig
@@ -126,21 +161,49 @@ class Config:
     logging: LoggingConfig
 
     @property
-    def embedding_version(self) -> str:
-        """由模型版本 + 采样参数组成的向量版本号。
-
-        一旦模型或采样参数变化，版本号随之变化，旧向量不会被覆盖
-        （对应方案中“新的向量版本保存，而不是覆盖旧版本”的要求）。
-        """
+    def legacy_embedding_version(self) -> str:
+        """旧版“均匀抽 ≤N 段”序列版本号（v0.3 及以前的 5 片段平均）。"""
 
         clip = f"{self.media.clip_seconds:g}"
-        return (
+        version = (
             f"{slugify(self.model.version)}"
             f"__f{self.model.frames}"
             f"_clip{clip}s"
             f"_x{self.media.clips_per_work}"
             f"_{self.media.audio_sample_rate // 1000}k"
         )
+        if self.media.clip_height:
+            version += f"_h{int(self.media.clip_height)}"
+        return version
+
+    @property
+    def full_sequence_version(self) -> str:
+        """全片覆盖序列版本号（v0.4）：窗口采样参数 + 可选切片高度。"""
+
+        clip = f"{self.media.clip_seconds:g}"
+        overlap = f"{self.sampling.overlap_seconds:g}"
+        version = (
+            f"{slugify(self.model.version)}"
+            f"__f{self.model.frames}"
+            f"_full{clip}s"
+            f"_ov{overlap}"
+            f"_{self.media.audio_sample_rate // 1000}k"
+        )
+        if self.media.clip_height:
+            version += f"_h{int(self.media.clip_height)}"
+        return version
+
+    @property
+    def embedding_version(self) -> str:
+        """当前激活的序列版本号（由 sampling.mode 决定）。
+
+        一旦模型/采样/预处理参数变化，版本号随之变化，旧向量不会被覆盖
+        （对应方案中“新的向量版本保存，而不是覆盖旧版本”的要求）。
+        """
+
+        if self.sampling.mode == "full_coverage":
+            return self.full_sequence_version
+        return self.legacy_embedding_version
 
     def ensure_directories(self) -> None:
         for directory in (
@@ -150,6 +213,7 @@ class Config:
             self.paths.temp,
             self.paths.logs,
             self.paths.embeddings,
+            self.paths.representations,
             self.paths.maps,
             self.model.cache_dir,
         ):
@@ -295,6 +359,8 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
             "video_preset",
             "extract_timeout_seconds",
             "probe_timeout_seconds",
+            "clip_height",
+            "long_video_seconds",
         },
         "media",
     )
@@ -320,6 +386,44 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
         _fail("media.video_crf 必须在 0..51")
     if extract_timeout <= 0 or probe_timeout <= 0:
         _fail("media 超时参数必须大于 0")
+    clip_height_raw = _opt(media, "clip_height", "media", int)
+    if clip_height_raw is not None and clip_height_raw < 64:
+        _fail("media.clip_height 必须是 >=64 的整数或 null")
+    long_video_seconds = float(
+        _opt(media, "long_video_seconds", "media", (int, float)) or 3600.0
+    )
+    if long_video_seconds <= 0:
+        _fail("media.long_video_seconds 必须大于 0")
+
+    sampling = _section(data, "sampling")
+    _check_keys(sampling, {"mode", "overlap_seconds"}, "sampling")
+    sampling_mode = _req(sampling, "mode", "sampling", str)
+    if sampling_mode not in ("legacy", "full_coverage"):
+        _fail("sampling.mode 必须是 legacy 或 full_coverage")
+    overlap_seconds = float(_req(sampling, "overlap_seconds", "sampling", (int, float)))
+    if overlap_seconds < 0:
+        _fail("sampling.overlap_seconds 不能为负")
+    if sampling_mode == "full_coverage" and overlap_seconds >= clip_seconds:
+        _fail("sampling.overlap_seconds 必须小于 media.clip_seconds")
+
+    events = _section(data, "events")
+    _check_keys(events, {"enabled", "audio_rate_hz", "video_fps", "version"}, "events")
+    events_enabled = bool(_req(events, "enabled", "events", bool))
+    audio_rate_hz = int(_req(events, "audio_rate_hz", "events", int))
+    video_fps = int(_req(events, "video_fps", "events", int))
+    event_version = _req(events, "version", "events", str)
+    if not 20 <= audio_rate_hz <= 1000:
+        _fail("events.audio_rate_hz 必须在 20..1000")
+    if not 1 <= video_fps <= 120:
+        _fail("events.video_fps 必须在 1..120")
+    if not event_version.strip():
+        _fail("events.version 不能为空")
+
+    temporal = _section(data, "temporal")
+    _check_keys(temporal, {"stages"}, "temporal")
+    stages = int(_req(temporal, "stages", "temporal", int))
+    if not 2 <= stages <= 8:
+        _fail("temporal.stages 必须在 2..8")
 
     model = _section(data, "model")
     _check_keys(
@@ -419,6 +523,7 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
         logs=logs_dir,
         db_path=db_path,
         embeddings=(data_dir / "embeddings").resolve(),
+        representations=(data_dir / "representations").resolve(),
         maps=(data_dir / "maps").resolve(),
     )
     return Config(
@@ -438,7 +543,17 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
             video_preset=str(_req(media, "video_preset", "media", str)),
             extract_timeout_seconds=extract_timeout,
             probe_timeout_seconds=probe_timeout,
+            clip_height=clip_height_raw,
+            long_video_seconds=long_video_seconds,
         ),
+        sampling=SamplingConfig(mode=sampling_mode, overlap_seconds=overlap_seconds),
+        events=EventsConfig(
+            enabled=events_enabled,
+            audio_rate_hz=audio_rate_hz,
+            video_fps=video_fps,
+            version=event_version,
+        ),
+        temporal=TemporalConfig(stages=stages),
         model=ModelConfig(
             checkpoint=str(_req(model, "checkpoint", "model", str)),
             revision=revision,

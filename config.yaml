@@ -26,6 +26,24 @@ media:
   video_preset: veryfast
   extract_timeout_seconds: 300
   probe_timeout_seconds: 60
+  clip_height: null          # 非空时切片缩放到该高度（336 = 336p 实验）；null 保持原分辨率
+  long_video_seconds: 3600   # 超过此长度的视频在 full_coverage 下默认跳过，需 --allow-long 显式启动
+
+# v0.4 全片覆盖采样：legacy = 旧“均匀抽 ≤5 段”，full_coverage = 覆盖整条时间轴
+sampling:
+  mode: legacy               # legacy | full_coverage（v0.4 全片模式；全量迁移验证后切换默认）
+  overlap_seconds: 0.0       # full_coverage 相邻窗口的最小重叠（秒）
+
+# v0.4.1 高频音画事件扫描
+events:
+  enabled: true
+  audio_rate_hz: 100         # 音频事件序列时间分辨率（10ms）
+  video_fps: 30              # 视频事件扫描帧率（上限；源帧率更低时按实际）
+  version: events_v1
+
+# v0.4.2 固定时间结构表征
+temporal:
+  stages: 4                  # 按相对时间划分的阶段数
 
 model:
   checkpoint: facebook/pe-av-small-16-frame
