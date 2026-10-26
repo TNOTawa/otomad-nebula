@@ -59,6 +59,9 @@
   视觉 v2 表征按 coverage 权重加权；源视频持久缓存 `data/sources`，重建不再重复下载。
 - **跨模型近邻共识（v0.4.4）**：比较 PE-AV / CLIP / DINOv2 高维空间的互为近邻与 >=2/>=3
   空间共识边，评估 rank-average / concat 轻量融合；界面可叠加互为近邻/共识连线。不做风格标注。
+- **分层音画时序模型（v0.5-alpha，负结果）**：在冻结特征上跑通局部音画 token→Transformer→
+  全曲聚合的训练/验证链路；两次真实训练均未通过可行性标准（mask 低于 Full Mean 基线、
+  order 低于 chance、序敏感性弱、rank 仅 4.66）。仅研究产物，不注册 DB/地图。
 
 ## 环境要求
 
@@ -154,6 +157,8 @@ otomad-nebula/
 │   ├── visual_dense/<frame_version>/<work_id>/    # v0.4.3 帧级密集视觉特征（fp16）
 │   ├── visual_windows/<window_plan_version>/<frame_version>/<work_id>/  # v0.4.3.1 窗口层（权重）
 │   ├── sources/<bvid>/        # v0.4.3.1 Bilibili 源视频持久缓存（不随 temp 清理）
+│   ├── v05_tokens/<dataset_version>/  # v0.5-alpha token（110 部；PE-AV 窗口 4130 / 截断后 3904 段 / 141.1MB）
+│   ├── models/<model_version>/checkpoint.pt  # v0.5-alpha 研究 checkpoint（v1/v2）
 │   └── maps/<map_vNNN>/       # UMAP 坐标、模型、meta.json
 ├── temp/                      # 流水线临时目录（成功自动清理，失败保留排查）
 ├── logs/                      # 运行日志
@@ -161,12 +166,14 @@ otomad-nebula/
 │                              #   similarity(近邻/解释/片段) identity(身份关联) stability(稳定性)
 │                              #   avsync(错位实验) events(事件扫描) temporal(表征聚合)
 │                              #   dense_visual(密集视觉编码) visual_pipeline(视觉批处理)
+│                              #   v05_data/v05_model/v05_train(v0.5-alpha 研究模型)
 │                              #   representations(表征注册/加载) mapplot/appdata
 ├── tools/                     # 证据/报告工具：clip_stability.py、desync_experiment.py、
 │                              #   preflight_works.py、build_representation.py、compare_spaces.py、
 │                              #   events_probe.py、visual_pipeline.py、dense_preprocess_compare.py、
 │                              #   embedding_diagnostics.py、build_visual_windows.py、
-│                              #   build_consensus_graph.py、bench_ffmpeg/preprocess/peav、verify_peav
+│                              #   build_consensus_graph.py、build_v05_tokens.py、train_v05.py、
+│                              #   bench_ffmpeg/preprocess/peav、verify_peav
 ├── tests/                     # pytest 测试（含 tests/fixtures 合成视频工厂）
 ├── docs/                      # 契约（CONTRACTS/CONTRACTS_V2）、ADR、质量规范、
 │                              #   执行方案、reports（全片表征分析等）
@@ -782,6 +789,52 @@ python tools/build_consensus_graph.py \\
 
 > 共识与融合报告（方法/结果/案例）：`docs/reports/v044-consensus-fusion.md`（已回填并由 t4 复核）。
 
+### v0.5-alpha：分层音画时序模型（负结果，研究产物）
+
+v0.5-alpha 在冻结的 PE-AV/CLIP/DINOv2/事件特征上，跑通“局部音画 token → 局部 Transformer →
+全曲时序聚合”的端到端训练，用于验证**可学习时序表征是否成立**。**可行性验证未通过**（负结果），
+本轮不注册正式表征/不建地图，也不宣称学到可靠音MAD时序结构或风格：
+
+- **数据**：`data/v05_tokens/v05_alpha_v1/`（110 部 canonical、PE-AV 窗口 **4,130**；
+  按 max_segments=128 截断后 token 数据集实际 **3,904 段**（6 部 >128 段截断：work
+  36/38/42/56/57/117，丢 226 段）；**141.1MB**；0.5s×16 bin/段；fp16 npz + manifest）；
+- **模型**：`nebula/v05_data.py`（token 构建）、`nebula/v05_model.py`
+  （局部多模态 Transformer 256d/4heads/2 层 + 全曲 2 层；masked segment / AV mismatch / order
+  三头；4.31M 参数）、`nebula/v05_train.py`（确定性 90/20 split、变长 padding+mask、
+  三目标训练、验证指标、checkpoint/metrics/研究向量）；
+- **命令**：
+  ```powershell
+  python tools/build_v05_tokens.py --version v05_alpha_v1 --force
+  python tools/train_v05.py --version v05_alpha_v2 --dataset-version v05_alpha_v1 \
+      --epochs 40 --patience 12 --batch-size 4 --device auto
+  ```
+- **产物**：`data/models/v05_alpha_v1/checkpoint.pt`、`data/models/v05_alpha_v2/checkpoint.pt`；
+  `logs/v05_alpha_v1_metrics.json`、`logs/v05_alpha_v2_metrics.json`；
+  研究向量 `data/representations/transformer_alpha_v1/<sequence_version>/vectors.npy`
+  （**未注册 representations 表、未建 map**）。
+
+两次真实训练（v1 初始实现；v2 加 VICReg 方差/协方差正则 + mask 残差头）：
+
+| 指标 | v05_alpha_v1 | v05_alpha_v2 | 判定 |
+| --- | --- | --- | --- |
+| val mask cosine（基线 Full Mean） | 0.8149（0.8249） | **0.8131（0.8249）** | 均低于常量基线 ❌ |
+| mask MSE | — | 0.000365（基线 0.000342） | 略差 ❌ |
+| AV accuracy / AUC / 负例准确率 | 0.80 / 0.729 / 0.50 | **0.40 / 0.635 / 0.75** | 不稳定/低于 chance ❌ |
+| order accuracy（chance 0.167） | 0.05 | **0.10** | 远低于 chance ❌ |
+| mask reverse / shuffle drop | -0.0053 / -0.0018 | **-0.0048 / -0.0015** | 反向变好，无敏感性 ❌ |
+| work vector pairwise cosine / 有效秩 | 0.99901 / 1.03 | **0.9806 / 4.66** | 秩改善但仍远低于 >8 ❌ |
+| 段序 work cosine（normal/reversed/shuffled） | — | 0.999963 / 0.999929 | 几乎顺序不变 ❌ |
+| Top-5 Jaccard vs Full Mean | 0.0447 | **0.0468** | 远低于 0.3–0.8 ❌ |
+| duration R² / author balanced acc | 0.210 / 0.038 | 0.769 / 0.027 | duration 泄漏明显；author 近随机 |
+
+**结论：未通过 v0.5-alpha 可行性标准。** 工程链路完整（数据→模型→训练→验证→产物），
+v2 把 work vector 从严重坍缩（rank 1.03）改善到 rank 4.66，但 temporal 表征没有学到可用的
+顺序/跨模态结构，masked 重建不如常量均值基线。失败原因与下一步（补密集音频语义、局部
+visual↔audio InfoNCE、相对时间 order、whitening/duration 去偏、更多数据/30fps 子集）见
+`docs/reports/v05-alpha-validation.md`；设计见 `docs/plans/v0.5-alpha-temporal-model.md`。
+
+**边界**：研究产物、负结果；不注册 DB/地图、不覆盖 v0.4.x 表征；不宣称逐帧语义理解/风格分类。
+
 ### 界面使用
 
 - v0.4.4 新增“显示高维互为近邻连线”（默认关；只画 mutual，超过边数上限截断提示）与
@@ -813,6 +866,8 @@ python tools/build_consensus_graph.py \\
 - `data/visual_dense/<frame_version>/<work_id>/`：v0.4.3 帧级密集视觉特征（重编码可重建）；
 - `data/visual_windows/<window_plan_version>/<frame_version>/<work_id>/`：v0.4.3.1 窗口层（含权重，只读帧级特征可重建）；
 - `data/sources/`：Bilibili 源视频持久缓存（避免重建时重复下载，**不要随手清理**）；
+- `data/v05_tokens/<dataset_version>/`：v0.5-alpha 局部音画 token 数据集（研究产物，可重建）；
+- `data/models/<model_version>/`：v0.5-alpha 研究 checkpoint（负结果保留，不注册 DB）；
 - `data/maps/<map_vNNN>/`：UMAP 坐标、模型与参数（可从表征重建，但版本记录珍贵）。
 
 **可安全清理**：
@@ -826,8 +881,9 @@ python tools/build_consensus_graph.py \\
 **安全清理建议**：
 
 1. 清理前先备份数据库与向量：直接复制 `data/catalog.sqlite`、`data/embeddings/`、
-   `data/representations/`、`data/visual_dense/`、`data/visual_windows/` 与
-   `data/sources/` 目录即可（DB 中路径相对 data 登记）；
+   `data/representations/`、`data/visual_dense/`、`data/visual_windows/`、
+   `data/sources/`、`data/v05_tokens/` 与 `data/models/` 目录即可
+   （DB 中路径相对 data 登记；v0.5 研究产物不注册 DB）；
 2. 不要单独删除 `data/embeddings/` 中的某个版本目录，否则数据库里会出现
    指向不存在文件的记录；确实要删除时先备份，再用 SQLite 工具删掉对应登记行。
 3. 建议保留最近 1-2 个星云版本；旧版本可以删 `data/maps/map_vNNN/` 目录与
@@ -893,6 +949,11 @@ python tools/build_consensus_graph.py \\
 - v0.4.4 测试覆盖：`tests/test_consensus_graph.py`（mutual/共识/rank-average/concat 指标、
   确定性、JSON schema）、`tests/test_app.py`/`tests/test_appdata.py`（互为近邻/共识连线开关、
   截断、共识文件缺失回退）、`tests/test_invariants.py`（共识工具离线导入边界）；
+- v0.5-alpha 测试覆盖：`tests/test_v05_data.py`（15 条：token 构建/缺失/mask/截断/确定性）、
+  `tests/test_v05_model.py`（19 条：mask/padding/三头/前向不变量）、
+  `tests/test_v05_train.py`（15 条：划分/验证指标/checkpoint/离线冒烟）；
+  `tests/test_invariants.py` 另加 v0.5 离线边界（`v05_data` 不 import torch、
+  研究训练工具不写 DB/不注册表征）；
 - v0.4 全链路 E2E（`tests/test_e2e.py -k v04`）：4 部合成视频 → HashTestEmbedder 全片编码 →
   注入中断 → 只补缺失批 → `tools/build_representation.py full_mean` →
   `map.py build --representation full_mean_v1` → `appdata.load_nebula_frame` →
@@ -905,11 +966,13 @@ python tools/build_consensus_graph.py \\
   也纳入 qa.py 的 `--help` 冒烟；v0.4.3 新增 `visual_pipeline.py`、
   `dense_preprocess_compare.py`、`embedding_diagnostics.py` 同样纳入；
   v0.4.3.1/v0.4.4 的 `build_visual_windows.py` / `build_consensus_graph.py` 也纳入；
-- 最终门禁：`python qa.py --full` = **PASS 5/5**（2026-10-26 v0.4.3.1/v0.4.4；pytest
-  **901 passed, 1 skipped** 含 model/network，279.04s；ruff 全绿；
-  docs 含 v0.2.x/v0.4/v0.4.3/v0.4.3.1/v0.4.4；CLI **16 个入口** --help；
+  v0.5-alpha 的 `build_v05_tokens.py` / `train_v05.py` 也纳入（共 18 入口）；
+- 最终门禁：`python qa.py --full` = **PASS 5/5**（2026-10-26 v0.4.3.1/v0.4.4/v0.5-alpha；
+  pytest **951 passed, 1 skipped** 含 model/network，193.23s；ruff 全绿；
+  docs 含 v0.2.x/v0.4/v0.4.3/v0.4.3.1/v0.4.4/v0.5-alpha；CLI **18 个入口** --help；
   config 含 visual_dense/window plan/sources 校验，embedding_version=full 序列版本；
-  另：真实数据复核 5 PASS / 0 FAIL，真实 AppTest 7 空间/互邻/共识通过）。
+  总耗时 201.91s；另：v0.4.3.1/v0.4.4 真实数据复核 5 PASS / 0 FAIL，
+  v0.5-alpha 报告数字独立核对 23/23 通过，负结论保留）。
 
 ## 常见问题
 
@@ -1017,6 +1080,7 @@ qa.py 已强制 UTF-8 输出；其他命令行建议使用 PowerShell 7，且
 | v0.4.3 视觉表征/诊断 | CLIP-only / DINOv2-only 视觉表征可建地图；PCA/UMAP 诊断 JSON/CSV 生成 | `tools/visual_pipeline.py run`、`tools/embedding_diagnostics.py`、`map.py list` |
 | v0.4.3.1 权重修复 | 窗口层含 `window_weights` 且和为 1；v2 表征按 coverage 权重聚合；v1 只读保留；源缓存可复用 | `tools/build_visual_windows.py`、`tools/build_dense_visual_representation.py`、`tools/compare_spaces.py --a dense_visual_clip_v1 --b dense_visual_clip_v2` |
 | v0.4.4 共识 | `logs/neighbor_consensus.json/.csv` 生成（mutual/共识/融合指标）；界面可叠加互为近邻/共识连线 | `tools/build_consensus_graph.py`、`streamlit run app.py` |
+| v0.5-alpha 研究模型 | 数据/训练/验证链路跑通；两次训练均未过可行性标准（负结果）；未注册 DB/地图 | `tools/build_v05_tokens.py`、`tools/train_v05.py`、`docs/reports/v05-alpha-validation.md` |
 
 交付前至少确认：
 

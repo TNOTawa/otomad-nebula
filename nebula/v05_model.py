@@ -217,8 +217,9 @@ class V05AlphaModel(nn.Module):
 
         # ---------------------------------------------------------- 预测头
         self.mask_head = nn.Linear(hidden, int(cfg.paav_dim))
-        # 零初始化：初始 mask_pred == mask_mean（常量均值基线），训练只学残差
-        nn.init.zeros_(self.mask_head.weight)
+        # 小初始化：初始 mask_pred 接近 mask_mean（常量均值基线），同时保留对 mask token/
+        # 段内容的非零敏感性，训练主要学习相对均值的残差。
+        nn.init.normal_(self.mask_head.weight, std=0.01)
         nn.init.zeros_(self.mask_head.bias)
         self.av_head = nn.Sequential(
             nn.Linear(2 * hidden, hidden),

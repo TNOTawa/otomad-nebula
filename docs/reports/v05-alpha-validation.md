@@ -13,9 +13,12 @@
 | 训练/验证 | `nebula/v05_train.py`、`tools/train_v05.py` | 确定性 90/20 split、变长 padding+mask、三目标训练、验证指标、checkpoint/metrics/研究向量落盘 |
 | 测试 | `tests/test_v05_data.py`/`_model.py`/`_train.py` | 15+19+15 条 CPU 离线测试，均通过 |
 
-数据规模：110 部作品、4,130 段、141.1MB（6 部 >128 段截断：work 36/38/42/56/57/117）。
+数据规模：110 部作品、PE-AV 窗口 **4,130** 个；按 max_segments=128 截断后 token 数据集实际
+**3,904 段**（6 部 >128 段截断：work 36/38/42/56/57/117，原始 144/190/214/154/135/157 段，共丢 226 段）
+；文件 **141.1MB**。
 训练超参：hidden=256、4 heads、local/temporal 各 2 层、dropout=0.1、batch=4、AdamW lr=1e-3、
-epochs=40、patience=12、mask_ratio=0.2、seed=42；训练/验证按 work_id hash 固定（90/20 部）。
+mask_ratio=0.2、seed=42；训练/验证按 work_id hash 固定（90/20 部）。
+epochs/patience：v1 为 30/5（实际跑 22 epoch，best 17），v2 为 40/12（实际跑 37 epoch，best 25）。
 
 ## 2. 两次迭代与验证结果
 
@@ -72,7 +75,9 @@ epochs=40、patience=12、mask_ratio=0.2、seed=42；训练/验证按 work_id ha
 
 - 未把 `transformer_alpha_v1` 注册到 `representations` 表、未建星云地图；产物只落盘研究目录。
 - 未做全量 30fps 训练、未做多 seed/超参搜索、未做下游检索任务增益评估。
-- v05_alpha_v1/v2 的 checkpoint、metrics、vectors 均保留（不覆盖）。
+- v05_alpha_v1/v2 的 checkpoint、metrics 分别保留（不覆盖）；研究向量
+  `transformer_alpha_v1/<sequence_version>/vectors.npy` 为最近一次训练（v2）写入的共享路径，
+  未注册 DB、未建 map（v1 的向量不单独保留版本目录）。
 - 未重跑视觉编码；所有输入均为已有 PE-AV/CLIP/DINOv2 冻结向量。
 
 ## 5. 下一步建议（优先顺序）
@@ -98,8 +103,13 @@ epochs=40、patience=12、mask_ratio=0.2、seed=42；训练/验证按 work_id ha
 ```
 
 证据：
-- 数据：`data/v05_tokens/v05_alpha_v1/manifest.json`（110 works / 4130 segments / 6 truncated）
+- 数据：`data/v05_tokens/v05_alpha_v1/manifest.json`（110 works / PE-AV 窗口 4130 /
+  截断后 token 段 3904 / 6 truncated / 丢 226 段）
 - v1：`data/models/v05_alpha_v1/checkpoint.pt`、`logs/v05_alpha_v1_metrics.json`
 - v2：`data/models/v05_alpha_v2/checkpoint.pt`、`logs/v05_alpha_v2_metrics.json`
 - 研究向量（未注册）：`data/representations/transformer_alpha_v1/<sequence_version>/vectors.npy`
-- 训练日志：`logs/train_v05_alpha_v1.log`、`logs/train_v05_alpha_v2.log`
+- 训练日志：`logs/train_v05_alpha_v1.log`、`logs/train_v05_alpha_v2.log`；
+- t4 复核（2026-10-26）：报告数字与 metrics/manifest/checkpoint 逐项核对 **23/23 通过**；
+  核实 token 数据集 3,904 段（PE-AV 窗口 4,130，6 部截断丢 226 段）；研究产物未注册
+  representations 表、未建 map；最终 `python qa.py --full` = **PASS 5/5**
+  （pytest 951 passed, 1 skipped；18 CLI；docs v0.5-alpha 关键词通过），负结论保留。

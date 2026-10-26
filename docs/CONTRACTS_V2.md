@@ -1,4 +1,4 @@
-# 迭代 v0.2–v0.4 契约（内部约定）
+# 迭代 v0.2–v0.5-alpha 契约（内部约定）
 
 > 在 v0.1 的 docs/CONTRACTS.md 基础上新增。共享文件仍归 Lead；本文件是新增模块的接口依据。
 >
@@ -7,7 +7,8 @@
 > v0.4 全片覆盖与多尺度音画特征表征（config/db v4/representations/sampling/events/
 > temporal/map/compare_spaces）的接口、状态与能力边界见文末 §10（准确命名不是“逐帧语义理解系统”）；
 > v0.4.3 密集视觉通道（visual_versions/visual_sequences、dense_visual、source_kind）见 §10.3；
-> v0.4.3.1 窗口计划层/覆盖权重/源缓存与 v0.4.4 共识契约见 §10.7。
+> v0.4.3.1 窗口计划层/覆盖权重/源缓存与 v0.4.4 共识契约见 §10.7；
+> v0.5-alpha 研究模型（负结果、不注册 DB/地图）见 §10.8。
 
 ## 实现状态（v0.2.x）
 
@@ -303,13 +304,16 @@ def write_report(report: dict, *, json_path, csv_path) -> None
 | v0.4.3.1 基础层（schema v5/窗口计划/权重配置/源缓存路径） | ✅ 已提交（8afb8ed） | `visual_window_plans`/`visual_window_sequences`、`config.visual_window_plan_version`、`paths.sources`、`visual_dense.weight_scheme`、v2 表征名 | `tests/test_config.py`、`tests/test_core_v04.py`、本文件 §10.7 |
 | v0.4.3.1 权重修复/窗口重建/v2 表征/地图 | ✅ t1/t3/t5 完成 | `coverage_weights`、`window_weights`、`tools/build_visual_windows.py`、v2 表征与地图 | 窗口计划 win8s_ov0__coverage-v1、252/252 completed、9446 窗口、weight_sum 0.999999847..1.000000209；v2 id=6/7（512/384）各 110 向量；map_v015/map_v016=110；v1→v2 余弦 min CLIP 0.999972/DINO 0.999863；Top-5 Jaccard 0.9939/0.9970；报告已回填（`docs/reports/v0431-window-weights-and-versioning.md`） |
 | v0.4.4 共识图/轻量融合/界面连线 | ✅ t5/t2 完成 | `tools/build_consensus_graph.py`、`logs/neighbor_consensus.json/.csv`、界面互为近邻/共识连线 | mutual 61/75/73；共识边 53（全共识 22），覆盖 44/110（40.00%），强度 0.8050；融合 rank Jaccard 0.5331/共识 0.4303，concat 0.5358/0.4106 与 0.5385/0.4121；真实 AppTest 7 空间/互邻/共识通过；报告已回填（`docs/reports/v044-consensus-fusion.md`） |
+| v0.5-alpha 分层时序模型 | ❌ 可行性验证未通过（负结果；研究产物） | `nebula/v05_data.py`/`v05_model.py`/`v05_train.py`、`tools/build_v05_tokens.py`/`train_v05.py`；data/v05_tokens 110 部/PE-AV 窗口 4130（token 截断后 3904 段）/141.1MB；v1/v2 checkpoint+metrics；研究向量未注册 DB、未建 map | v1 mask 0.8149 vs 基线 0.8249/rank 1.03；v2 mask 0.8131/AV 0.40/AUC 0.635/order 0.10/rank 4.66/reverse -0.0048/Top-5 0.0468；报告 `docs/reports/v05-alpha-validation.md`（保留负结论） |
 
-**当前门禁（v0.4.3.1/v0.4.4，默认 sampling.mode=full_coverage）**：仓库内 `python qa.py --full` = **PASS 5/5**
-（2026-10-26；ruff 全绿；pytest **901 passed, 1 skipped**（model/network 已启用），279.04s；
-总耗时 291.41s；docs 10 篇 ADR 章节完整且含 v0.4.3/v0.4.3.1/v0.4.4；
-CLI **16 个入口** --help（含 build_visual_windows/build_consensus_graph）；
-config 含 v0.4/v0.4.3 visual_dense、visual_window_plan_version、visual_windows/sources 校验）。
-v0.4.3/v0.4.3.1/v0.4.4 真实数据与真实 AppTest 复核结果见 §10.6/§10.7；t4 最终复核 5 PASS/0 FAIL。
+**当前门禁（v0.4.3.1/v0.4.4/v0.5-alpha，默认 sampling.mode=full_coverage）**：仓库内
+`python qa.py --full` = **PASS 5/5**（2026-10-26；ruff 全绿；pytest **951 passed, 1 skipped**
+（model/network 已启用），193.23s；总耗时 201.91s；docs 10 篇 ADR 章节完整且含
+v0.4.3/v0.4.3.1/v0.4.4/v0.5-alpha；CLI **18 个入口** --help（含 build_visual_windows/
+build_consensus_graph/build_v05_tokens/train_v05）；config 含 v0.4/v0.4.3 visual_dense、
+visual_window_plan_version、visual_windows/sources 校验）。
+v0.4.3/v0.4.3.1/v0.4.4 真实数据与真实 AppTest 复核结果见 §10.6/§10.7；v0.5-alpha 负结果见 §10.8；
+t4 最终复核 23/23 报告数字核对通过，负结论未改。
 
 
 ### 10.2 版本命名与配置
@@ -559,4 +563,30 @@ python tools/compare_spaces.py --a legacy_5clip_mean --a-seq <sequence_version> 
   >=2 共识边 53、>=3 全共识 22、覆盖 44/110（40.00%）、平均强度 0.8050；
   跨空间 mutual Jaccard 0.3204/0.2407/0.3455；融合 rank-average Jaccard(vs spaces)=0.5331、
   vs 共识=0.4303；concat(equal) 0.5358/0.4106、concat(inv_sqrt_dim) 0.5385/0.4121；
-  真实 AppTest：默认 map_v012、7 空间切换、互邻 k=5、共识阈值 2/3 均通过；
+  真实 AppTest：默认 map_v012、7 空间切换、互邻 k=5、共识阈值 2/3 均通过。
+
+### 10.8 v0.5-alpha 研究模型契约（负结果，不注册）
+
+- **定位**：在冻结 PE-AV/CLIP/DINOv2/事件特征上验证“局部音画对齐 → 全曲时序聚合”的可学习
+  时序表征是否成立；只做研究验证，不做风格/流派结论；
+- **数据**：`tools/build_v05_tokens.py` 生成 `data/v05_tokens/<dataset_version>/`；
+  当前 v05_alpha_v1：110 部 canonical；PE-AV 窗口 **4,130**，max_segments=128 截断后 token
+  数据集实际 **3,904 段**（6 部截断、丢 226 段）；**141.1MB**；6 部 >128 段截断
+  （work 36/38/42/56/57/117）；0.5s×16 bin/段；输入为 PE-AV 窗口、CLIP/DINOv2 帧、100Hz/30fps 事件；
+  不重新编码/微调基础模型；
+- **模型/训练**：`nebula/v05_model.py`（局部多模态 Transformer 256d/4heads/2 层 + 全曲 2 层；
+  mask/AV/order 三头；4.31M 参数）；`nebula/v05_train.py`（确定性 90/20 split、变长 padding+mask、
+  AdamW、早停、验证指标/checkpoint/研究向量）；
+- **命令**：
+  `python tools/build_v05_tokens.py --version v05_alpha_v1 --force`；
+  `python tools/train_v05.py --version v05_alpha_v2 --dataset-version v05_alpha_v1 --epochs 40 --patience 12 --batch-size 4 --device auto`；
+- **产物（仅落盘，不注册）**：`data/models/v05_alpha_v1|v2/checkpoint.pt`、
+  `logs/v05_alpha_v1|v2_metrics.json`、`logs/v05_alpha_v1|v2_split.json`、
+  `data/representations/transformer_alpha_v1/<sequence_version>/vectors.npy`；
+  **不得写 representations/map_runs，不覆盖 v0.4.x 表征/地图**；
+- **结果（负）**：v1 val mask 0.8149（基线 0.8249）/order 0.05/rank 1.03/Top-5 0.0447/
+  reverse drop -0.0053；v2 val mask 0.8131/order 0.10/AV 0.40/AUC 0.635/rank 4.66/
+  Top-5 0.0468/reverse -0.0048/段序 work cosine 0.999963/0.999929；均未通过 alpha 标准；
+- **下一步**：补密集音频语义、局部 visual↔audio InfoNCE、相对时间 order、whitening/duration 去偏、
+  更多数据/30fps 子集；达标前不注册主表征/地图；报告
+  `docs/reports/v05-alpha-validation.md` 保留“未通过”负结论。

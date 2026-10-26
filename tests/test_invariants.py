@@ -1773,6 +1773,36 @@ def test_consensus_tool_import_boundary(repo_root: Path) -> None:
     )
 
 
+def test_v05_alpha_offline_boundaries(repo_root: Path) -> None:
+    """v0.5-alpha 研究层离线边界：数据构建不加载模型，训练工具不写正式表征/地图。"""
+
+    data_module = repo_root / "nebula" / "v05_data.py"
+    model_module = repo_root / "nebula" / "v05_model.py"
+    train_module = repo_root / "nebula" / "v05_train.py"
+    build_tool = repo_root / "tools" / "build_v05_tokens.py"
+    train_tool = repo_root / "tools" / "train_v05.py"
+    for path in (data_module, model_module, train_module, build_tool, train_tool):
+        assert path.is_file(), f"v0.5-alpha 文件缺失: {path}"
+
+    # 数据管道只读已有特征，不应加载 torch/模型/界面库
+    _assert_no_import(data_module, ("torch", "transformers", "umap", "streamlit", "plotly"))
+    _assert_no_import(build_tool, ("torch", "transformers", "umap", "streamlit", "plotly"))
+    # 模型层允许 torch，但不能依赖 UMAP/界面/网络
+    _assert_no_import(
+        model_module, ("transformers", "umap", "streamlit", "plotly", "requests")
+    )
+    # 研究训练链路不得注册正式 representations / 地图（负结果，只落盘研究产物）
+    for path in (data_module, train_module, build_tool, train_tool):
+        text = path.read_text(encoding="utf-8")
+        for forbidden in (
+            "register_representation",
+            "create_map_run",
+            "set_representation_status",
+            "register_representation_vector",
+        ):
+            assert forbidden not in text, f"{path.name} 不应调用正式登记接口: {forbidden}"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 采样规则
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1847,6 +1877,8 @@ def test_gitignore_mentions_runtime_artifacts(repo_root: Path) -> None:
         "data/embeddings",
         "data/visual_windows",
         "data/sources",
+        "data/v05_tokens",
+        "data/models",
         "data/maps",
         "temp/",
         "logs/",

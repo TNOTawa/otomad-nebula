@@ -55,6 +55,10 @@ Bilibili BV 清单 ───┘                                        │
 | 分析层 | `nebula/representations.py` | 表征注册/解析/向量落盘与加载；legacy 复用 embeddings，派生走 representation_vectors；矩阵按 work_id 排序、排除 duplicate；`source_kind` 区分 pe_av/visual | config、db、embed、numpy |
 | 领域层 | `nebula/dense_visual.py` | v0.4.3/v0.4.3.1 冻结视觉编码器（CLIP ViT-B/16、DINOv2-small）：单次 ffmpeg 流式解码、帧级 L2 特征、窗口池化、窗口覆盖权重、bundle/manifest 原子保存 | config、errors、numpy；torch/transformers 懒加载，不导入 db/UMAP/UI |
 | 编排层 | `nebula/visual_pipeline.py` | v0.4.3 密集视觉批处理：canonical+completed 作品、每部只下载一次、按编码器/版本建任务、visual_sequences 状态与断点续跑、完成后清理 temp | dense_visual、download、db、config、sampling |
+| 领域层 | `nebula/v05_data.py` | v0.5-alpha token 构建：从 PE-AV 窗口/CLIP+DINOv2 帧/100Hz+30fps 事件生成 0.5s×16bin 局部 token（npz+manifest），不加载模型 | config、db、dense_visual、events、errors、numpy |
+| 领域层 | `nebula/v05_model.py` | v0.5-alpha 研究模型：局部多模态 Transformer + 全曲时序 Transformer + mask/AV/order 三头（4.31M 参数） | torch、numpy |
+| 领域层/编排 | `nebula/v05_train.py` | v0.5-alpha 训练/验证：确定性 90/20 split、变长 mask、三目标、指标/checkpoint/研究向量；不注册 DB/地图 | torch、numpy、config、db、errors |
+| 入口层 | `ingest.py` / `pipeline.py` / `map.py` / `qa.py` / `tools/clip_stability.py` / `tools/desync_experiment.py` / `tools/preflight_works.py` / `tools/build_representation.py` / `tools/compare_spaces.py` / `tools/events_probe.py` / `tools/visual_pipeline.py` / `tools/dense_preprocess_compare.py` / `tools/embedding_diagnostics.py` / `tools/build_v05_tokens.py` / `tools/train_v05.py` | 参数解析、调用库代码、打印结果、返回退出码 | 对应库模块 |
 | 入口层 | `ingest.py` / `pipeline.py` / `map.py` / `qa.py` / `tools/clip_stability.py` / `tools/desync_experiment.py` / `tools/preflight_works.py` / `tools/build_representation.py` / `tools/compare_spaces.py` / `tools/events_probe.py` / `tools/visual_pipeline.py` / `tools/dense_preprocess_compare.py` / `tools/embedding_diagnostics.py` | 参数解析、调用库代码、打印结果、返回退出码 | 对应库模块 |
 
 依赖方向只有一条：入口层 → 展示层 / 编排层 → 领域层 → 基础层。
@@ -154,7 +158,14 @@ map_runs.source_kind ∈ {pe_av, visual}；视觉地图的 embedding_version 存
 - 视觉表征：`dense_visual_clip_v1`(id=4, 512 维) / `dense_visual_dino_v1`(id=5, 384 维)，
   各 110 部 joint 窗口向量；对应地图 `map_v013` / `map_v014`（`source_kind=visual`）。
   v0.4.3.1 重建 v2（`dense_visual_clip_v2`/`dense_visual_dino_v2`）后视觉 v1/v2 并存，
-  v1 只读保留；默认地图仍为 PE-AV 优先（`map_v012`），视觉空间需在侧栏手动切换。
+  v1 只读保留；默认地图仍为 PE-AV 优先（`map_v012`），视觉空间需在侧栏手动切换；
+- v0.5-alpha 研究产物（**不注册 DB/地图**）：`data/v05_tokens/v05_alpha_v1/`
+  110 部 / PE-AV 窗口 4,130（max_segments=128 截断后 token 段 3,904，6 部截断、丢 226 段）/
+  141.1MB；checkpoint `data/models/v05_alpha_v1`、
+  `data/models/v05_alpha_v2`；指标 `logs/v05_alpha_v1_metrics.json`、
+  `logs/v05_alpha_v2_metrics.json`；研究向量
+  `data/representations/transformer_alpha_v1/<sequence_version>/vectors.npy`；
+  两次训练 **可行性验证未通过（负结果）**，详见 `docs/reports/v05-alpha-validation.md`。
 
 ### 3.2 文件系统工件
 
@@ -331,6 +342,12 @@ logs/
     不同窗口计划不共享窗口/权重缓存；同一帧版本可配多个窗口计划，同一计划可跨多个帧版本；
     窗口覆盖权重写入 `window_weights.npy`/`manifest.json` 且 Σ=1（coverage-v1），
     作品向量必须按权重聚合；`data/sources/` 位于 data 下、不进入 temp 清理。
+22. **v0.5-alpha 研究产物不进入正式层（负结果边界）。**
+    token 数据集/checkpoint/metrics/研究向量只落盘到 `data/v05_tokens/`、`data/models/`、
+    `logs/`、`data/representations/transformer_alpha_v1/`；**不注册 representations 表、
+    不建 map、不覆盖 v0.4.x 表征/地图**；`nebula/v05_data.py` 只做数据构建，不 import torch/
+    transformers；训练工具只读已有冻结特征，不重新编码 PE-AV/CLIP/DINOv2；v0.5-alpha 未通过
+    可行性标准（负结果），不得在文档/界面宣称学到可靠时序结构、逐帧语义理解或风格分类。
 
 ## 5. 处理流程与失败语义
 
@@ -586,6 +603,29 @@ v0.4.3 新增的紧凑视觉通道（§6.6）用冻结 CLIP/DINOv2 提供 8fps �
   PCA 3D 仅辅助观察，不改变默认 UMAP 坐标语义；
 - 边界：共识是观察性邻域一致性证据，不是风格/流派分类；任何正式融合表征需新建版本并重新验证。
 
+### 6.8 v0.5-alpha 分层音画时序模型（负结果，研究产物）
+
+- 目标：在冻结 PE-AV/CLIP/DINOv2/事件特征上验证“局部音画对齐 → 全曲时序聚合”的可学习时序表征；
+- 数据：`tools/build_v05_tokens.py` 生成 `data/v05_tokens/v05_alpha_v1/`
+  （110 部；PE-AV 窗口 4,130；max_segments=128 截断后 token 段 3,904（6 部截断、丢 226 段）；
+  141.1MB；0.5s×16bin/段；fp16 npz+manifest），不重新编码；
+- 模型：`nebula/v05_model.py` 局部多模态 Transformer（256d/4heads/2 层）+ 全曲 2 层；
+  三头：masked segment（预测 PE-AV joint）、AV mismatch（batch 内音频互换负例）、order recovery；
+- 训练/验证：`tools/train_v05.py` 确定性 90/20 split（seed=42）、变长 padding+mask、
+  AdamW lr=1e-3、batch=4、mask_ratio=0.2；产物 checkpoint/metrics/研究向量；
+- 两次真实训练结果（v1 初始；v2 加 VICReg + mask 残差头）：
+  - v1：val mask cosine 0.8149（基线 0.8249）、order 0.05、AV 0.80/AUC 0.729、
+    有效秩 1.03、Top-5 Jaccard 0.0447、reverse drop -0.0053；
+  - v2：val mask cosine **0.8131**（基线 0.8249）、mask MSE 0.000365、order **0.10**、
+    AV **0.40**/AUC 0.635、有效秩 **4.66**、Top-5 Jaccard **0.0468**、
+    reverse drop **-0.0048**、段序 work cosine 0.999963/0.999929；
+  - **结论：未通过 alpha 可行性标准**；工程链路完整、v2 把 rank 从 1.03 改善到 4.66，
+    但 temporal 表征没有学到可用顺序/跨模态结构，mask 不如常量均值基线；
+- 原因：8s PE-AV 目标被全局风格主导、段序几乎不影响 work vector、AV 负例可走捷径、
+  数据/独立性不足、音频只有事件统计；详见 `docs/reports/v05-alpha-validation.md`；
+- 下一步：补密集音频语义、局部 visual↔audio InfoNCE、相对时间 order、whitening/duration 去偏、
+  更多数据/30fps 子集；达标前不注册主表征/地图。
+
 ## 7. 扩展点
 
 - **升级模型**：改 `config.yaml` 的 `model.checkpoint/version/frames`（Base 版本同理）
@@ -635,6 +675,9 @@ v0.4.3 新增的紧凑视觉通道（§6.6）用冻结 CLIP/DINOv2 提供 8fps �
 | `tools/visual_pipeline.py` | v0.4.3 密集视觉批处理 CLI（run/status/list/clean-temp） |
 | `tools/build_visual_windows.py` | v0.4.3.1 从已保存帧级特征重建窗口层（窗口计划/覆盖权重，不下载/不解码/不跑模型） |
 | `tools/build_consensus_graph.py` | v0.4.4 跨模型互为近邻/共识边与轻量融合评估（只读表征，不写 DB） |
+| `tools/build_v05_tokens.py` | v0.5-alpha 局部音画 token 数据集构建（只读冻结特征，不重新编码） |
+| `tools/train_v05.py` | v0.5-alpha 研究模型训练/验证（checkpoint/metrics/研究向量；不注册 DB/地图） |
+| `nebula/v05_data.py` / `v05_model.py` / `v05_train.py` | v0.5-alpha token 构建 / 模型 / 训练验证 |
 | `tools/dense_preprocess_compare.py` | v0.4.3 宽高比预处理对照（stretch vs letterbox） |
 | `tools/embedding_diagnostics.py` | v0.4.3 PCA/UMAP 低维投影诊断（Top-10 保持率、距离相关） |
 | `tools/bench_ffmpeg.py` / `bench_preprocess.py` / `bench_peav.py` / `verify_peav.py` | 提速/推理基准与真实模型验证证据脚本 |
@@ -696,6 +739,11 @@ v0.4.3 新增的紧凑视觉通道（§6.6）用冻结 CLIP/DINOv2 提供 8fps �
   `map_v012`（PE-AV 优先）、5 空间切换、视觉版本措辞与时间轴提示、
   视觉空间片段面板优雅降级；pilot 与全量证据见 `docs/reports/dense-visual-pilot.md`、
   `docs/reports/visual-dense-full-run.md`；
+- **v0.5-alpha 独立验收（负结果）**：token 数据集 110 部/PE-AV 窗口 4130（截断后 3904 段）/141.1MB、manifest 记录
+  6 部截断；v1/v2 checkpoint/metrics 与报告数字一致（v1 mask 0.8149/rank 1.03；
+  v2 mask 0.8131/rank 4.66/order 0.10/reverse -0.0048/Top-5 0.0468）；
+  研究产物未注册 representations 表、未建 map；v05_data 不 import torch、训练工具不写 DB；
+  测试 15+19+15 条 CPU 离线用例；报告保留“未通过”负结论，不改成成功；
 - **独立预言机**：E2E 使用 `tests/fixtures/video_factory.py` 现场合成的素材与独立断言，
   不复用实现方测试的断言逻辑；`qa.py` 的入口检查与 pytest 独立失败；
 - **默认离线**：网络/模型测试必须打 marker，默认测试不触网、不加载权重；
