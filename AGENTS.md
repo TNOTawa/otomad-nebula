@@ -47,7 +47,7 @@
 ## Project map
 
 - **Project:** otomad-nebula（音MAD星云计划）
-- **Purpose:** 用 PE-AV 多模态模型提取音MAD作品联合向量，持久化为可扩充的高维向量数据库，并用 UMAP 生成可交互 2D/3D 星云（外部元数据仅用于染色/筛选）。
+- **Purpose:** 用 PE-AV 多模态模型提取音MAD作品联合向量，持久化为可扩充的高维向量数据库，并用 UMAP 生成可交互 2D/3D 星云（外部元数据仅用于染色/筛选）。v0.4 的准确命名是**「全片覆盖与多尺度音画特征表征系统」**，不是「逐帧音MAD语义理解系统」：PE-AV 每 8s 仅 16 帧（≈2fps）稀疏语义，事件层是 30fps（96×54 灰度）/100Hz 统计；Temporal Stats 是人工分组/权重统计基线，**不是训练模型**；完整覆盖 ≠ 逐帧语义理解。
 - **Main entry point:** 方案文档要求的四个入口：`ingest.py`（导入/身份关联）、`pipeline.py`（下载/切片/编码/清理/计时；v0.4 用 `--sampling full_coverage` 开启全片覆盖）、`map.py`（UMAP 星云版本/筛选/变体/按表征建图）、`app.py`（Streamlit 可视化：2D/3D、近邻、染色、筛选、表征空间切换）；内部实现在 `nebula/`，新增 `similarity.py`（高维近邻）、`identity.py`（本地/BV 去重）、`stability.py`（片段稳定性）、`avsync.py`（错位实验）、`events.py`（高频事件）、`temporal.py`（Full Mean/Temporal Stats 聚合）、`representations.py`（表征注册/加载）。辅助入口：`tools/build_representation.py`、`tools/compare_spaces.py`、`tools/events_probe.py`。
 - **Architecture map:** `ARCHITECTURE.md`；接口与边界契约见 `docs/CONTRACTS.md` 与 `docs/CONTRACTS_V2.md`（v0.4 见 §10）；v0.4 设计契约 `docs/plans/v0.4-full-coverage-design.md`；全片表征分析 `docs/reports/full-coverage-analysis.md`；执行计划见 `音MAD星云计划 · 完整执行方案.md`。
 - **Build/setup:** Python 3.10 + `.venv`（uv）。`uv venv .venv`；`uv pip install -e ".[ml,dev]"`（ffmpeg/ffprobe 需在 PATH）；配置 `config.yaml`。

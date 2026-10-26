@@ -4,8 +4,8 @@
 >
 > **阅读提示**：本文件最初写于 v0.2 实现之前，正文中“将新增 / 追加 / 待实现”等未来时措辞
 > 属于历史设计记录；当前真实行为以下方“实现状态”表与实际代码为准。
-> v0.4 全片时序表征（config/db v3/representations/sampling/events/temporal/map/compare_spaces）
-> 的接口与状态见文末 §10。
+> v0.4 全片覆盖与多尺度音画特征表征（config/db v3/representations/sampling/events/
+> temporal/map/compare_spaces）的接口、状态与能力边界见文末 §10（准确命名不是“逐帧语义理解系统”）。
 
 ## 实现状态（v0.2.x）
 
@@ -254,11 +254,20 @@ def write_report(report: dict, *, json_path, csv_path) -> None
 .\\.venv\\Scripts\\ruff.exe check nebula tests
 ~~~
 
-## 10. v0.4 全片时序表征（新增，2026-10-25）
+## 10. v0.4 全片覆盖与多尺度音画特征表征（新增，2026-10-25）
 
 设计契约全文见 `docs/plans/v0.4-full-coverage-design.md`；本节只列接口与验收状态。
 核心原则：**序列层（PE-AV 片段/事件）只编码一次；聚合器变化只新增 representation，绝不重新编码；
 不同 sequence/representation 的向量禁止混入同一矩阵；旧数据/旧地图不覆盖。**
+
+> **能力边界与命名**：v0.4 的准确名称是**「全片覆盖与多尺度音画特征表征系统」**，
+> 不是「逐帧音MAD语义理解系统」。
+> - PE-AV 通道每 8s 仅 16 帧（≈2fps）稀疏联合语义；高频通道是 30fps（96×54 灰度）与
+>   100Hz 音频的节奏/运动/突变统计，**不是视觉语义**；
+> - `temporal_stats_v1` 是**人工设计分组与权重**的固定统计聚合基线，
+>   **不是训练/自监督学习模型**；它不包含可学习的音画时序关系；
+> - 完整时间覆盖 ≠ 逐帧语义理解；v0.4 不声称逐帧视觉语义、可学习时序或自监督全曲表示能力。
+> 详见 `ARCHITECTURE.md` §6.5 与 `docs/reports/full-coverage-analysis.md` §0。
 
 ### 10.1 状态（2026-10-25，实现与真实数据验收完成）
 
@@ -290,7 +299,7 @@ CLI 11 个入口 --help；config 含 v0.4 段校验，embedding_version=full 序
 | Sequence Version（legacy） | `Config.legacy_embedding_version`：`<slug(model.version)>__f<frames>_clip<clip_seconds>s_x<clips_per_work>_<khz>k[_h<height>]` |
 | Sequence Version（full） | `Config.full_sequence_version`：`<slug>__f<frames>_full<clip_seconds>s_ov<overlap>_<khz>k[_h<height>]` |
 | 当前激活 | `Config.embedding_version`：`sampling.mode` = `legacy` → legacy；`full_coverage` → full |
-| Representation | `legacy_5clip_mean` / `full_mean_v1` / `temporal_stats_v1` / `transformer_v1`（v0.5 预留） |
+| Representation | `legacy_5clip_mean` / `full_mean_v1` / `temporal_stats_v1` / `transformer_v1`（v0.5 预留）；前两者是统计聚合，`temporal_stats_v1` 为固定分组/权重统计基线（非学习模型） |
 | 地图 | `map_vNNN`，每次拟合新版本；`map_runs.representation_id` 绑定表征，`embedding_version` 记录其 sequence version |
 
 `config.yaml` 新增段：
