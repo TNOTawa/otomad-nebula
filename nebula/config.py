@@ -45,6 +45,8 @@ class PathsConfig:
     embeddings: Path
     representations: Path
     visual_dense: Path
+    visual_windows: Path
+    sources: Path
     maps: Path
 
 
@@ -112,6 +114,7 @@ class VisualDenseConfig:
     cache_dir: Path
     subset_fps: float
     subset_count: int
+    weight_scheme: str
     encoders: tuple[VisualEncoderConfig, ...]
 
 
@@ -221,6 +224,20 @@ class Config:
         return version
 
     @property
+    def visual_window_plan_version(self) -> str:
+        """窗口计划版本号：窗口时长 + 重叠 + 权重方案。
+
+        帧编码版本（visual_versions）只决定“帧 -> 向量”；窗口层由该计划决定，
+        改变 8s 窗口/overlap/权重方案时只重建窗口与表征，不重新编码帧。
+        """
+
+        clip = f"{self.media.clip_seconds:g}"
+        overlap = f"{self.sampling.overlap_seconds:g}"
+        return slugify(
+            f"win{clip}s_ov{overlap}__{self.visual_dense.weight_scheme}"
+        )
+
+    @property
     def embedding_version(self) -> str:
         """当前激活的序列版本号（由 sampling.mode 决定）。
 
@@ -242,6 +259,8 @@ class Config:
             self.paths.embeddings,
             self.paths.representations,
             self.paths.visual_dense,
+            self.paths.visual_windows,
+            self.paths.sources,
             self.paths.maps,
             self.model.cache_dir,
         ):
@@ -356,7 +375,7 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
     paths_section = _section(data, "paths")
     _check_keys(
         paths_section,
-        {"input_local", "input_lists", "data", "temp", "logs"},
+        {"input_local", "input_lists", "data", "temp", "logs", "sources"},
         "paths",
     )
     input_local = _path(project_root, _req(paths_section, "input_local", "paths", str), "paths.input_local")
@@ -364,6 +383,12 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
     data_dir = _path(project_root, _req(paths_section, "data", "paths", str), "paths.data")
     temp_dir = _path(project_root, _req(paths_section, "temp", "paths", str), "paths.temp")
     logs_dir = _path(project_root, _req(paths_section, "logs", "paths", str), "paths.logs")
+    sources_raw = _opt(paths_section, "sources", "paths", str)
+    sources_dir = (
+        _path(project_root, sources_raw, "paths.sources")
+        if sources_raw
+        else (data_dir / "sources").resolve()
+    )
 
     database = _section(data, "database")
     _check_keys(database, {"filename"}, "database")
@@ -466,6 +491,7 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
             "cache_dir",
             "subset_fps",
             "subset_count",
+            "weight_scheme",
             "encoders",
         },
         "visual_dense",
@@ -478,6 +504,7 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
     visual_dtype = _req(visual, "dtype", "visual_dense", str)
     visual_subset_fps = float(_req(visual, "subset_fps", "visual_dense", (int, float)))
     visual_subset_count = int(_req(visual, "subset_count", "visual_dense", int))
+    visual_weight_scheme = _req(visual, "weight_scheme", "visual_dense", str)
     if visual_fps <= 0 or visual_fps > 120:
         _fail("visual_dense.fps 必须在 (0, 120]")
     if visual_size < 32 or visual_size % 2 != 0:
@@ -494,6 +521,8 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
         _fail("visual_dense.subset_fps 必须大于 fps 且 <=120")
     if not 0 <= visual_subset_count <= 200:
         _fail("visual_dense.subset_count 必须在 0..200")
+    if visual_weight_scheme not in ("coverage-v1", "equal"):
+        _fail("visual_dense.weight_scheme 必须是 coverage-v1 或 equal")
     encoders_raw = _req(visual, "encoders", "visual_dense", list)
     if not encoders_raw:
         _fail("visual_dense.encoders 不能为空")
@@ -612,6 +641,8 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
         embeddings=(data_dir / "embeddings").resolve(),
         representations=(data_dir / "representations").resolve(),
         visual_dense=(data_dir / "visual_dense").resolve(),
+        visual_windows=(data_dir / "visual_windows").resolve(),
+        sources=sources_dir.resolve(),
         maps=(data_dir / "maps").resolve(),
     )
     return Config(
@@ -652,6 +683,7 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
             cache_dir=_path(project_root, _req(visual, "cache_dir", "visual_dense", str), "visual_dense.cache_dir"),
             subset_fps=visual_subset_fps,
             subset_count=visual_subset_count,
+            weight_scheme=visual_weight_scheme,
             encoders=tuple(visual_encoders),
         ),
         model=ModelConfig(

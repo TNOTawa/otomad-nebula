@@ -36,9 +36,12 @@ LEGACY_NAME = LEGACY_REPRESENTATION_NAME
 FULL_MEAN_V1 = "full_mean_v1"
 TEMPORAL_STATS_V1 = "temporal_stats_v1"
 TRANSFORMER_V1 = "transformer_v1"
-#: 密集视觉语义表征（v0.4.3）：CLIP-only / DINOv2-only 对照空间
+#: 密集视觉语义表征（v0.4.3）：CLIP-only / DINOv2-only 对照空间（等权窗口平均，历史）
 DENSE_VISUAL_CLIP_V1 = "dense_visual_clip_v1"
 DENSE_VISUAL_DINO_V1 = "dense_visual_dino_v1"
+#: v0.4.3.1 修复版：窗口覆盖权重（coverage-v1）+ 可独立演进的窗口计划
+DENSE_VISUAL_CLIP_V2 = "dense_visual_clip_v2"
+DENSE_VISUAL_DINO_V2 = "dense_visual_dino_v2"
 
 #: 界面显示名
 REPRESENTATION_LABELS: dict[str, str] = {
@@ -48,6 +51,8 @@ REPRESENTATION_LABELS: dict[str, str] = {
     TRANSFORMER_V1: "Temporal Transformer（v0.5，未开放）",
     DENSE_VISUAL_CLIP_V1: "Dense Visual·CLIP（密集视觉语义）",
     DENSE_VISUAL_DINO_V1: "Dense Visual·DINOv2（密集视觉结构）",
+    DENSE_VISUAL_CLIP_V2: "Dense Visual·CLIP v2（覆盖权重）",
+    DENSE_VISUAL_DINO_V2: "Dense Visual·DINOv2 v2（覆盖权重）",
 }
 
 #: CLI / 界面上的别名
@@ -69,6 +74,10 @@ _NAME_ALIASES: dict[str, str] = {
     "dense_visual_dino": DENSE_VISUAL_DINO_V1,
     "dense_visual_dino_v1": DENSE_VISUAL_DINO_V1,
     "dino_visual": DENSE_VISUAL_DINO_V1,
+    "dense_visual_clip_v2": DENSE_VISUAL_CLIP_V2,
+    "dense_visual_dino_v2": DENSE_VISUAL_DINO_V2,
+    "clip_visual_v2": DENSE_VISUAL_CLIP_V2,
+    "dino_visual_v2": DENSE_VISUAL_DINO_V2,
 }
 
 #: 表征向量支持的模态（与 DB representation_vectors.kind 一致）

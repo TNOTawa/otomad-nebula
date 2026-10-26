@@ -425,20 +425,25 @@ def test_visual_representation_kind_and_map_binding(catalog: Catalog):
         )
 
 
-def test_schema_v4_visual_tables_and_migration(tmp_path: Path):
-    db_path = tmp_path / "v4.sqlite"
+def test_schema_v5_visual_tables_and_migration(tmp_path: Path):
+    db_path = tmp_path / "v5.sqlite"
     first = Catalog(db_path)
     first.initialize()
     tables = {
         row[0] for row in first.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
-    assert {"visual_versions", "visual_sequences"} <= tables
+    assert {
+        "visual_versions",
+        "visual_sequences",
+        "visual_window_plans",
+        "visual_window_sequences",
+    } <= tables
     version = first.conn.execute(
         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
     ).fetchone()["value"]
-    assert version == SCHEMA_VERSION == "4"
-    # 模拟 v3 库重新迁移：v3 -> v4 会重建 representations 并保持既有数据
-    first.conn.execute("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'")
+    assert version == SCHEMA_VERSION == "5"
+    # 模拟 v4 库重新迁移：v4 -> v5 只加窗口计划表并更新版本
+    first.conn.execute("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'")
     first.close()
     migrated = Catalog(db_path)
     migrated.initialize()
@@ -453,9 +458,102 @@ def test_schema_v4_visual_tables_and_migration(tmp_path: Path):
             row[0]
             for row in migrated.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-        assert {"visual_versions", "visual_sequences"} <= tables
+        assert {"visual_window_plans", "visual_window_sequences"} <= tables
         _register_visual_version(migrated)
         assert migrated.get_visual_version(VISUAL_VERSION) is not None
     finally:
         migrated.close()
+
+
+def test_visual_window_plans_and_sequences(catalog: Catalog):
+    _register_visual_version(catalog)
+    plan = "win8s_ov0__coverage-v1"
+    catalog.register_visual_window_plan(
+        plan,
+        clip_seconds=8.0,
+        overlap_seconds=0.0,
+        weight_scheme="coverage-v1",
+        params={"note": "test"},
+    )
+    catalog.register_visual_window_plan(
+        plan,
+        clip_seconds=8.0,
+        overlap_seconds=0.0,
+        weight_scheme="coverage-v1",
+        params={"note": "test"},
+    )
+    saved_plan = catalog.get_visual_window_plan(plan)
+    assert saved_plan is not None and saved_plan["clip_seconds"] == 8.0
+    assert [row["version"] for row in catalog.list_visual_window_plans()] == [plan]
+    with pytest.raises(DatabaseError):
+        catalog.register_visual_window_plan(
+            plan, clip_seconds=4.0, overlap_seconds=0.0, weight_scheme="coverage-v1"
+        )
+    with pytest.raises(DatabaseError):
+        catalog.register_visual_window_plan(
+            "bad", clip_seconds=0.0, overlap_seconds=0.0, weight_scheme="coverage-v1"
+        )
+
+    work_id, _ = catalog.upsert_local_work("window.mp4")
+    catalog.upsert_visual_window_sequence(
+        work_id,
+        frame_version=VISUAL_VERSION,
+        window_plan_version=plan,
+        status="in_progress",
+        n_windows=2,
+    )
+    catalog.upsert_visual_window_sequence(
+        work_id,
+        frame_version=VISUAL_VERSION,
+        window_plan_version=plan,
+        status="completed",
+        windows_path="visual_windows/plan/frame/000001/windows.npy",
+        window_std_path="visual_windows/plan/frame/000001/window_std.npy",
+        window_weights_path="visual_windows/plan/frame/000001/window_weights.npy",
+        n_windows=2,
+        dim=512,
+        total_s=1.5,
+    )
+    row = catalog.get_visual_window_sequence(
+        work_id, frame_version=VISUAL_VERSION, window_plan_version=plan
+    )
+    assert row is not None
+    assert row["status"] == "completed" and row["n_windows"] == 2 and row["dim"] == 512
+    assert row["windows_path"].startswith("visual_windows/")
+    assert catalog.visual_window_status_summary(plan)["completed"] == 1
+    assert catalog.list_visual_window_sequences(window_plan_version=plan)[0]["work_id"] == work_id
+
+    # 不同窗口计划不复用同一窗口记录
+    other_plan = "win4s_ov0__coverage-v1"
+    catalog.register_visual_window_plan(
+        other_plan, clip_seconds=4.0, overlap_seconds=0.0, weight_scheme="coverage-v1"
+    )
+    assert (
+        catalog.get_visual_window_sequence(
+            work_id, frame_version=VISUAL_VERSION, window_plan_version=other_plan
+        )
+        is None
+    )
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_window_sequence(
+            work_id,
+            frame_version=VISUAL_VERSION,
+            window_plan_version="missing-plan",
+            status="completed",
+        )
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_window_sequence(
+            work_id,
+            frame_version=VISUAL_VERSION,
+            window_plan_version=plan,
+            status="done",
+        )
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_window_sequence(
+            work_id,
+            frame_version=VISUAL_VERSION,
+            window_plan_version=plan,
+            status="completed",
+            n_windows=-1,
+        )
 

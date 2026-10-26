@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,7 +23,7 @@ from . import EMBEDDING_KINDS
 from .errors import DatabaseError
 from .util import normalize_relpath, now_utc_iso
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 STATUSES = ("pending", "downloading", "encoding", "completed", "failed")
 
@@ -209,6 +210,36 @@ CREATE TABLE IF NOT EXISTS visual_sequences (
 );
 CREATE INDEX IF NOT EXISTS ix_visual_sequences_version_status
     ON visual_sequences(version, status);
+
+-- 窗口计划层（v0.4.3.1）：帧编码版本不变时，窗口时长/重叠/权重方案可独立演进
+CREATE TABLE IF NOT EXISTS visual_window_plans (
+    version TEXT PRIMARY KEY,
+    clip_seconds REAL NOT NULL,
+    overlap_seconds REAL NOT NULL,
+    weight_scheme TEXT NOT NULL,
+    params_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS visual_window_sequences (
+    work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    frame_version TEXT NOT NULL REFERENCES visual_versions(version),
+    window_plan_version TEXT NOT NULL REFERENCES visual_window_plans(version),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')),
+    windows_path TEXT,
+    window_std_path TEXT,
+    window_weights_path TEXT,
+    n_windows INTEGER,
+    dim INTEGER,
+    error TEXT,
+    total_s REAL NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (work_id, frame_version, window_plan_version)
+);
+CREATE INDEX IF NOT EXISTS ix_visual_window_sequences_plan
+    ON visual_window_sequences(window_plan_version, status);
 
 -- 表征层（v0.4）：聚合器版本，独立于 PE-AV 编码；binding 到 sequence_version
 CREATE TABLE IF NOT EXISTS representations (
@@ -430,6 +461,9 @@ class Catalog:
             current = "3"
         if current == "3":
             self._migrate_v3_to_v4(conn)
+            current = "4"
+        if current == "4":
+            self._migrate_v4_to_v5(conn)
             return
         raise DatabaseError(
             f"数据库 schema 版本不兼容: 文件为 {current}, 程序需要 {SCHEMA_VERSION}; "
@@ -601,6 +635,19 @@ class Catalog:
         )
         conn.execute("DROP TABLE map_runs")
         conn.execute("ALTER TABLE map_runs_v4 RENAME TO map_runs")
+        conn.execute(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+            ("4",),
+        )
+
+    def _migrate_v4_to_v5(self, conn: sqlite3.Connection) -> None:
+        """v4 -> v5：窗口计划层（visual_window_plans / visual_window_sequences）。
+
+        新表由 SCHEMA_SQL 在迁移前创建；这里只更新版本号。既有视觉数据保持
+        原样（仍可被 v1 表征读取），v0.4.3.1 通过 build_visual_windows 工具
+        从已保存帧级特征重建带覆盖权重的窗口层。
+        """
+
         conn.execute(
             "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
             (SCHEMA_VERSION,),
@@ -1654,6 +1701,190 @@ class Catalog:
             summary[str(row["status"])] = int(row["n"])
         return summary
 
+    # ------------------------------------------------------------------ 窗口计划层（v0.4.3.1）
+    def register_visual_window_plan(
+        self,
+        version: str,
+        *,
+        clip_seconds: float,
+        overlap_seconds: float,
+        weight_scheme: str,
+        params: Mapping[str, Any] | None = None,
+    ) -> None:
+        """登记窗口计划版本；同版本必须参数一致（防静默覆盖）。"""
+
+        display = str(version or "").strip()
+        if not display:
+            raise DatabaseError("窗口计划版本号不能为空")
+        clip = float(clip_seconds)
+        overlap = float(overlap_seconds)
+        scheme = str(weight_scheme or "").strip()
+        if not (math.isfinite(clip) and clip > 0):
+            raise DatabaseError(f"clip_seconds 非法: {clip_seconds!r}")
+        if not (math.isfinite(overlap) and 0 <= overlap < clip):
+            raise DatabaseError(f"overlap_seconds 非法: {overlap_seconds!r}")
+        if not scheme:
+            raise DatabaseError("weight_scheme 不能为空")
+        params_json = json.dumps(dict(params or {}), sort_keys=True, ensure_ascii=False)
+        row_values = (clip, overlap, scheme, params_json)
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM visual_window_plans WHERE version = ?", (display,)
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO visual_window_plans (
+                        version, clip_seconds, overlap_seconds, weight_scheme,
+                        params_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (display, clip, overlap, scheme, params_json, now_utc_iso()),
+                )
+                return
+            actual = (
+                float(row["clip_seconds"]),
+                float(row["overlap_seconds"]),
+                row["weight_scheme"],
+                row["params_json"],
+            )
+            if actual != row_values:
+                raise DatabaseError(
+                    f"窗口计划 {display} 已存在但参数不同；请使用新版本号而不是覆盖"
+                )
+
+    def get_visual_window_plan(self, version: str) -> dict[str, Any] | None:
+        return _as_dict(
+            self.conn.execute(
+                "SELECT * FROM visual_window_plans WHERE version = ?", (str(version),)
+            ).fetchone()
+        )
+
+    def list_visual_window_plans(self) -> list[dict[str, Any]]:
+        return _as_dicts(
+            self.conn.execute(
+                "SELECT * FROM visual_window_plans ORDER BY created_at, version"
+            ).fetchall()
+        )
+
+    def upsert_visual_window_sequence(
+        self,
+        work_id: int,
+        *,
+        frame_version: str,
+        window_plan_version: str,
+        status: str = "pending",
+        windows_path: str | None = None,
+        window_std_path: str | None = None,
+        window_weights_path: str | None = None,
+        n_windows: int | None = None,
+        dim: int | None = None,
+        error: str | None = None,
+        total_s: float = 0.0,
+    ) -> None:
+        """登记/更新一部作品在某个窗口计划下的窗口层状态。"""
+
+        if status not in VISUAL_SEQUENCE_STATUSES:
+            raise DatabaseError(f"未知窗口计划状态: {status}")
+        if n_windows is not None and int(n_windows) < 0:
+            raise DatabaseError(f"n_windows 不能为负: {n_windows}")
+        if dim is not None and int(dim) < 1:
+            raise DatabaseError(f"dim 非法: {dim}")
+        if float(total_s) < 0:
+            raise DatabaseError(f"total_s 不能为负: {total_s}")
+        now = now_utc_iso()
+        with self.transaction() as conn:
+            if conn.execute("SELECT 1 FROM works WHERE id = ?", (int(work_id),)).fetchone() is None:
+                raise DatabaseError(f"作品不存在: {work_id}")
+            if conn.execute(
+                "SELECT 1 FROM visual_versions WHERE version = ?", (str(frame_version),)
+            ).fetchone() is None:
+                raise DatabaseError(f"帧编码版本未登记: {frame_version}")
+            if conn.execute(
+                "SELECT 1 FROM visual_window_plans WHERE version = ?",
+                (str(window_plan_version),),
+            ).fetchone() is None:
+                raise DatabaseError(f"窗口计划版本未登记: {window_plan_version}")
+            conn.execute(
+                """
+                INSERT INTO visual_window_sequences (
+                    work_id, frame_version, window_plan_version, status,
+                    windows_path, window_std_path, window_weights_path,
+                    n_windows, dim, error, total_s, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(work_id, frame_version, window_plan_version) DO UPDATE SET
+                    status = excluded.status,
+                    windows_path = excluded.windows_path,
+                    window_std_path = excluded.window_std_path,
+                    window_weights_path = excluded.window_weights_path,
+                    n_windows = excluded.n_windows,
+                    dim = excluded.dim,
+                    error = excluded.error,
+                    total_s = excluded.total_s,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    int(work_id),
+                    str(frame_version),
+                    str(window_plan_version),
+                    status,
+                    windows_path,
+                    window_std_path,
+                    window_weights_path,
+                    None if n_windows is None else int(n_windows),
+                    None if dim is None else int(dim),
+                    error,
+                    float(total_s),
+                    now,
+                    now,
+                ),
+            )
+
+    def get_visual_window_sequence(
+        self, work_id: int, *, frame_version: str, window_plan_version: str
+    ) -> dict[str, Any] | None:
+        return _as_dict(
+            self.conn.execute(
+                "SELECT * FROM visual_window_sequences WHERE work_id = ? "
+                "AND frame_version = ? AND window_plan_version = ?",
+                (int(work_id), str(frame_version), str(window_plan_version)),
+            ).fetchone()
+        )
+
+    def list_visual_window_sequences(
+        self,
+        *,
+        frame_version: str | None = None,
+        window_plan_version: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM visual_window_sequences WHERE 1 = 1"
+        params: list[Any] = []
+        if frame_version is not None:
+            sql += " AND frame_version = ?"
+            params.append(str(frame_version))
+        if window_plan_version is not None:
+            sql += " AND window_plan_version = ?"
+            params.append(str(window_plan_version))
+        if status is not None:
+            if status not in VISUAL_SEQUENCE_STATUSES:
+                raise DatabaseError(f"未知窗口计划状态: {status}")
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY work_id"
+        return _as_dicts(self.conn.execute(sql, params).fetchall())
+
+    def visual_window_status_summary(self, window_plan_version: str) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT status, COUNT(*) AS n FROM visual_window_sequences "
+            "WHERE window_plan_version = ? GROUP BY status",
+            (str(window_plan_version),),
+        ).fetchall()
+        summary = {status: 0 for status in VISUAL_SEQUENCE_STATUSES}
+        for row in rows:
+            summary[str(row["status"])] = int(row["n"])
+        return summary
+
     # ------------------------------------------------------------------ 榜单
     def ensure_list(
         self,
@@ -2252,6 +2483,12 @@ class Catalog:
             visual_sequence_rows = self.conn.execute(
                 "SELECT COUNT(*) AS n FROM visual_sequences"
             ).fetchone()
+            window_plan_rows = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM visual_window_plans"
+            ).fetchone()
+            window_sequence_rows = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM visual_window_sequences"
+            ).fetchone()
         except sqlite3.OperationalError:
             # 尚未 initialize
             return {"status": status, "tables_ready": False}
@@ -2272,4 +2509,8 @@ class Catalog:
             "sequences": int(sequence_rows["n"]) if sequence_rows else 0,
             "visual_versions": int(visual_version_rows["n"]) if visual_version_rows else 0,
             "visual_sequences": int(visual_sequence_rows["n"]) if visual_sequence_rows else 0,
+            "visual_window_plans": int(window_plan_rows["n"]) if window_plan_rows else 0,
+            "visual_window_sequences": int(window_sequence_rows["n"])
+            if window_sequence_rows
+            else 0,
         }

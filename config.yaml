@@ -10,6 +10,7 @@ paths:
   data: data                 # 永久数据（SQLite、向量、UMAP 坐标）
   temp: temp                 # 流水线临时目录，成功后自动清理
   logs: logs
+  sources: data/sources      # Bilibili 源视频持久缓存（避免每次重建都重新下载；不随临时目录清理）
 
 database:
   filename: catalog.sqlite
@@ -56,6 +57,7 @@ visual_dense:
   cache_dir: .cache/hf
   subset_fps: 30.0           # 小样本高帧率对照
   subset_count: 16           # 30fps 对照作品数
+  weight_scheme: coverage-v1 # 窗口->作品聚合权重：coverage-v1（覆盖计数积分，默认）| equal（旧行为复现）
   encoders:                  # 固定 model + revision，禁止浮动版本
     - model: openai/clip-vit-base-patch16
       revision: 57c216476eefef5ab752ec549e440a49ae4ae5f3

@@ -40,6 +40,8 @@ def test_ensure_directories(config):
         config.paths.logs,
         config.paths.embeddings,
         config.paths.visual_dense,
+        config.paths.visual_windows,
+        config.paths.sources,
         config.paths.maps,
         config.model.cache_dir,
     ):
@@ -103,6 +105,10 @@ def test_visual_dense_config(config):
     assert visual.batch_size == 32
     assert visual.subset_fps == 30.0
     assert visual.subset_count == 16
+    assert visual.weight_scheme == "coverage-v1"
+    assert config.visual_window_plan_version.startswith("win8s_ov0__")
+    assert config.paths.visual_windows == (config.paths.data / "visual_windows").resolve()
+    assert config.paths.sources == (config.paths.data / "sources").resolve()
     assert len(visual.encoders) == 2
     models = {entry.model for entry in visual.encoders}
     assert models == {
@@ -128,4 +134,13 @@ def test_visual_dense_encoder_revision_required(tmp_path: Path, repo_root: Path)
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
     with pytest.raises(ConfigError, match="revision"):
+        load_config(path)
+
+
+def test_visual_dense_invalid_weight_scheme_rejected(tmp_path: Path, repo_root: Path):
+    data = yaml.safe_load((repo_root / "config.yaml").read_text(encoding="utf-8"))
+    data["visual_dense"]["weight_scheme"] = "magic"
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+    with pytest.raises(ConfigError, match="weight_scheme"):
         load_config(path)

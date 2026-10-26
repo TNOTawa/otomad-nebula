@@ -16,6 +16,10 @@ data/representations/*
 !data/representations/.gitkeep
 data/visual_dense/*
 !data/visual_dense/.gitkeep
+data/visual_windows/*
+!data/visual_windows/.gitkeep
+data/sources/*
+!data/sources/.gitkeep
 data/maps/*
 !data/maps/.gitkeep
 input/local/*
