@@ -5,8 +5,8 @@
 1. plan_clips()：旧版“均匀抽最多 N 段”（v0.3 legacy），片段之间可以有空隙；
    规则见函数 docstring。旧行为与旧测试保持不变。
 2. plan_full_coverage()：v0.4 全片覆盖采样，用几何均匀步长铺满整条时间轴：
-   无未覆盖间隙、无越界、最后一个窗口精确锚定结尾；权重按 1/覆盖计数 积分
-   归一，保证 ∑weight = 1。二者互不影响。
+   无未覆盖间隙、无越界、最后一个窗口精确锚定结尾；权重由公开的
+   coverage_weights() 按 1/覆盖计数 积分归一，保证 ∑weight = 1。二者互不影响。
 
 所有函数都刻意保持简单、确定、无随机数：同一视频在任何机器上得到相同的切片计划。
 """
@@ -112,36 +112,103 @@ class CoverageClip:
         return round(self.start_s + self.duration_s, 6)
 
 
-def _coverage_weights(windows: Sequence[tuple[float, float]], duration_s: float) -> list[float]:
-    """按 1/覆盖计数 积分计算每个窗口的归一化权重。
+def coverage_weights(
+    windows: Sequence[tuple[float, float]], duration_s: float
+) -> tuple[float, ...]:
+    """按 1/覆盖计数 积分计算每个窗口的归一化覆盖权重。
 
     时间轴按所有窗口的 start/end 切成若干段，每段内覆盖计数 c(t) 为覆盖它的
     窗口数；窗口 i 的原始积分 S_i = ∫_{窗口 i} 1/c(t) dt，最终
-    weight_i = S_i / duration_s（四舍五入到 1e-9）。由于
-    Σ_i S_i = ∫_时间轴 c(t)/c(t) dt = duration_s，因此 Σ weight_i = 1。
+    weight_i = S_i / duration_s（四舍五入到 1e-9）。由于窗口必须完整覆盖
+    [0, duration_s]，Σ_i S_i = ∫_时间轴 c(t)/c(t) dt = duration_s，
+    因此 Σ weight_i = 1。
+
+    plan_full_coverage 使用本函数生成 CoverageClip.weight；v0.4.3.1 修复把窗口
+    权重写进 dense_visual manifest，避免作品向量退化为窗口等权。
+
+    参数
+    ----
+    windows:
+        按时间顺序排列的 (start_s, end_s) 窗口序列，必须无间隙覆盖整条时间轴；
+        允许相邻窗口重叠（重叠区按 1/覆盖计数 均摊）。
+    duration_s:
+        视频总时长（秒），必须大于 0 且与窗口覆盖范围一致。
+
+    返回
+    ----
+    tuple[float, ...]:
+        与 windows 等长、和为 1 的权重（四舍五入到 1e-9）。
+
+    异常
+    ----
+    SamplingError:
+        时长非法、窗口为空/格式非法/越界、存在未覆盖间隙，或总覆盖长度与
+        duration_s 不一致时抛出。
     """
 
+    if not math.isfinite(duration_s) or duration_s <= 0:
+        raise SamplingError(f"视频时长非法: {duration_s!r}")
+    if isinstance(windows, (str, bytes)) or not isinstance(windows, Sequence):
+        raise SamplingError("windows 必须是 (start, end) 序列")
+    if not windows:
+        raise SamplingError("窗口列表不能为空")
+
+    pairs: list[tuple[float, float]] = []
+    for index, item in enumerate(windows):
+        try:
+            start, end = item
+        except (TypeError, ValueError) as exc:
+            raise SamplingError(f"第 {index} 个窗口必须是 (start, end) 二元组") from exc
+        if isinstance(start, bool) or isinstance(end, bool):
+            raise SamplingError(f"第 {index} 个窗口的 start/end 必须是数字")
+        try:
+            start_value = float(start)
+            end_value = float(end)
+        except (TypeError, ValueError) as exc:
+            raise SamplingError(f"第 {index} 个窗口的 start/end 不是数字") from exc
+        if not math.isfinite(start_value) or not math.isfinite(end_value):
+            raise SamplingError(f"第 {index} 个窗口的 start/end 必须有限")
+        if start_value < -1e-9:
+            raise SamplingError(f"第 {index} 个窗口起点为负: {start_value!r}")
+        if end_value <= start_value:
+            raise SamplingError(
+                f"第 {index} 个窗口结束必须大于起点: ({start_value!r}, {end_value!r})"
+            )
+        if end_value > duration_s + 1e-6:
+            raise SamplingError(
+                f"第 {index} 个窗口超出视频时长: end={end_value!r} duration={duration_s!r}"
+            )
+        pairs.append((max(start_value, 0.0), min(end_value, duration_s)))
+
+    # 把边界（含时间轴两端）切成互不重叠的小段，按中点归属统计覆盖计数。
     events = sorted(
-        {round(start, 9) for start, _end in windows} | {round(end, 9) for _start, end in windows}
+        {0.0, round(duration_s, 9)}
+        | {round(start, 9) for start, _end in pairs}
+        | {round(end, 9) for _start, end in pairs}
     )
-    integrals = [0.0] * len(windows)
+    integrals = [0.0] * len(pairs)
     for left, right in zip(events, events[1:], strict=False):
         if right - left <= 1e-12:
             continue
         midpoint = (left + right) / 2.0
         covering = [
             index
-            for index, (start, end) in enumerate(windows)
+            for index, (start, end) in enumerate(pairs)
             if start - 1e-9 <= midpoint <= end + 1e-9
         ]
         if not covering:
             raise SamplingError(
-                f"全片覆盖计划出现未覆盖间隙: [{left:.6f}, {right:.6f}]"
+                f"窗口未覆盖整条时间轴，存在未覆盖间隙: [{left:.6f}, {right:.6f}]"
             )
         share = (right - left) / len(covering)
         for index in covering:
             integrals[index] += share
-    return [round(value / duration_s, 9) for value in integrals]
+    total = sum(integrals)
+    if abs(total - duration_s) > max(1e-6, duration_s * 1e-9):
+        raise SamplingError(
+            f"窗口总覆盖长度 {total:.9f}s 与视频时长 {duration_s:.9f}s 不一致"
+        )
+    return tuple(round(value / duration_s, 9) for value in integrals)
 
 
 def plan_full_coverage(
@@ -224,7 +291,7 @@ def plan_full_coverage(
     starts.append(last_start)
 
     windows = [(start, start + clip_seconds) for start in starts]
-    weights = _coverage_weights(windows, duration_s)
+    weights = coverage_weights(windows, duration_s)
     return tuple(
         CoverageClip(
             index=index,

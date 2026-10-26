@@ -540,10 +540,10 @@ def test_bilibili_work_key_dedupes_by_bvid_and_part(catalog: Catalog) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def test_schema_v4_tables_and_columns(catalog: Catalog) -> None:
-    """v4 schema：保留 v2/v3 表列，并新增密集视觉表与 source_kind；版本号必须为 4。"""
+def test_schema_v5_tables_and_columns(catalog: Catalog) -> None:
+    """v5 schema：保留 v2/v3/v4 表列，并新增窗口计划表；版本号必须为 5。"""
 
-    assert SCHEMA_VERSION == "4"
+    assert SCHEMA_VERSION == "5"
     tables = {
         str(row[0])
         for row in catalog.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -557,6 +557,8 @@ def test_schema_v4_tables_and_columns(catalog: Catalog) -> None:
         "sequence_states",
         "visual_versions",
         "visual_sequences",
+        "visual_window_plans",
+        "visual_window_sequences",
     } <= tables
     map_columns = {
         str(row[1]) for row in catalog.conn.execute("PRAGMA table_info(map_runs)").fetchall()
@@ -599,6 +601,33 @@ def test_schema_v4_tables_and_columns(catalog: Catalog) -> None:
         "model_load_s",
         "total_s",
     } <= visual_sequence_columns
+    window_plan_columns = {
+        str(row[1])
+        for row in catalog.conn.execute("PRAGMA table_info(visual_window_plans)").fetchall()
+    }
+    assert {
+        "version",
+        "clip_seconds",
+        "overlap_seconds",
+        "weight_scheme",
+        "params_json",
+    } <= window_plan_columns
+    window_sequence_columns = {
+        str(row[1])
+        for row in catalog.conn.execute("PRAGMA table_info(visual_window_sequences)").fetchall()
+    }
+    assert {
+        "work_id",
+        "frame_version",
+        "window_plan_version",
+        "status",
+        "windows_path",
+        "window_std_path",
+        "window_weights_path",
+        "n_windows",
+        "dim",
+        "total_s",
+    } <= window_sequence_columns
     link_columns = {
         str(row[1]) for row in catalog.conn.execute("PRAGMA table_info(work_links)").fetchall()
     }
@@ -1436,6 +1465,315 @@ def test_visual_versions_matrices_are_isolated(config: Config) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# v0.4.3.1：窗口计划层 / 三层版本正交 / 源缓存
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _window_plan_version(
+    *,
+    clip: float = 8.0,
+    overlap: float = 0.0,
+    scheme: str = "coverage-v1",
+) -> str:
+    """按契约构造窗口计划版本号：win{clip}s_ov{overlap}__{weight_scheme}。"""
+
+    return f"win{clip:g}s_ov{overlap:g}__{scheme}"
+
+
+def _register_window_plan(
+    catalog: Catalog,
+    version: str,
+    *,
+    clip: float = 8.0,
+    overlap: float = 0.0,
+    scheme: str = "coverage-v1",
+    params: dict | None = None,
+) -> None:
+    catalog.register_visual_window_plan(
+        version,
+        clip_seconds=clip,
+        overlap_seconds=overlap,
+        weight_scheme=scheme,
+        params=params or {"test": "v0.4.3.1-window-plan"},
+    )
+
+
+def test_visual_window_plan_identity_and_conflicts(catalog: Catalog) -> None:
+    """窗口计划版本身份：clip/overlap/weight_scheme 必须进版本；同版本参数冲突报错。"""
+
+    version = _window_plan_version()
+    assert version == "win8s_ov0__coverage-v1"
+    _register_window_plan(catalog, version)
+    row = catalog.get_visual_window_plan(version)
+    assert row is not None
+    assert float(row["clip_seconds"]) == pytest.approx(8.0)
+    assert float(row["overlap_seconds"]) == pytest.approx(0.0)
+    assert row["weight_scheme"] == "coverage-v1"
+    assert {item["version"] for item in catalog.list_visual_window_plans()} == {version}
+
+    # 幂等；同版本参数不同必须拒绝
+    _register_window_plan(catalog, version)
+    assert len(catalog.list_visual_window_plans()) == 1
+    for kwargs in (
+        {"clip": 4.0},
+        {"overlap": 2.0},
+        {"scheme": "equal"},
+        {"params": {"other": True}},
+    ):
+        with pytest.raises(DatabaseError):
+            _register_window_plan(catalog, version, **kwargs)
+
+    # 不同窗口计划版本互不混淆
+    other = _window_plan_version(overlap=2.0, scheme="equal")
+    _register_window_plan(catalog, other, overlap=2.0, scheme="equal")
+    versions = {item["version"] for item in catalog.list_visual_window_plans()}
+    assert {version, other} <= versions
+
+    with pytest.raises(DatabaseError):
+        _register_window_plan(catalog, "", clip=8.0)
+    with pytest.raises(DatabaseError):
+        _register_window_plan(catalog, "bad-clip", clip=0.0)
+    with pytest.raises(DatabaseError):
+        _register_window_plan(catalog, "bad-overlap", clip=8.0, overlap=8.0)
+    with pytest.raises(DatabaseError):
+        _register_window_plan(catalog, "bad-scheme", scheme="")
+
+
+def test_visual_window_sequence_status_and_primary_key(catalog: Catalog) -> None:
+    """visual_window_sequences：(work_id, frame_version, plan) 主键、状态机与断点字段。"""
+
+    frame_version = _visual_version(_VISUAL_CLIP_MODEL, _VISUAL_CLIP_REV)
+    _register_visual_version(catalog, frame_version)
+    plan_version = _window_plan_version()
+    _register_window_plan(catalog, plan_version)
+    first = _v04_local_work(catalog, "window-seq-1")
+    second = _v04_local_work(catalog, "window-seq-2")
+
+    catalog.upsert_visual_window_sequence(
+        first, frame_version=frame_version, window_plan_version=plan_version
+    )
+    row = catalog.get_visual_window_sequence(
+        first, frame_version=frame_version, window_plan_version=plan_version
+    )
+    assert row is not None
+    assert row["status"] == "pending"
+    assert row["n_windows"] is None
+    summary = catalog.visual_window_status_summary(plan_version)
+    assert summary["pending"] == 1 and summary["completed"] == 0
+
+    catalog.upsert_visual_window_sequence(
+        first,
+        frame_version=frame_version,
+        window_plan_version=plan_version,
+        status="in_progress",
+        windows_path="visual_windows/p/f/000001/windows.npy",
+        window_std_path="visual_windows/p/f/000001/window_std.npy",
+        window_weights_path="visual_windows/p/f/000001/window_weights.npy",
+        n_windows=13,
+        dim=512,
+        total_s=1.5,
+    )
+    progressed = catalog.get_visual_window_sequence(
+        first, frame_version=frame_version, window_plan_version=plan_version
+    )
+    assert progressed is not None and progressed["status"] == "in_progress"
+    assert int(progressed["n_windows"]) == 13 and int(progressed["dim"]) == 512
+
+    catalog.upsert_visual_window_sequence(
+        first,
+        frame_version=frame_version,
+        window_plan_version=plan_version,
+        status="completed",
+        n_windows=13,
+        dim=512,
+    )
+    completed = catalog.get_visual_window_sequence(
+        first, frame_version=frame_version, window_plan_version=plan_version
+    )
+    assert completed is not None and completed["status"] == "completed"
+    # 同一主键始终一行
+    assert len(catalog.list_visual_window_sequences(window_plan_version=plan_version)) == 1
+
+    catalog.upsert_visual_window_sequence(
+        second,
+        frame_version=frame_version,
+        window_plan_version=plan_version,
+        status="failed",
+        error="synthetic",
+    )
+    summary = catalog.visual_window_status_summary(plan_version)
+    assert summary["completed"] == 1 and summary["failed"] == 1
+
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_window_sequence(
+            first,
+            frame_version=frame_version,
+            window_plan_version=plan_version,
+            status="done",
+        )
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_window_sequence(
+            first,
+            frame_version=frame_version,
+            window_plan_version=plan_version,
+            total_s=-0.1,
+        )
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_window_sequence(
+            first, frame_version="missing-frame", window_plan_version=plan_version
+        )
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_window_sequence(
+            first, frame_version=frame_version, window_plan_version="missing-plan"
+        )
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_window_sequence(
+            999999, frame_version=frame_version, window_plan_version=plan_version
+        )
+
+
+def test_visual_frame_version_and_window_plan_are_orthogonal(catalog: Catalog) -> None:
+    """同一帧版本可配多个窗口计划；同一窗口计划可跨多个帧版本（2x2 组合互不冲突）。"""
+
+    clip_model = "clip-vit-b16"
+    dino_model = "dinov2-small"
+    clip_version = _visual_version(clip_model, _VISUAL_CLIP_REV)
+    dino_version = _visual_version(dino_model, _VISUAL_DINO_REV)
+    _register_visual_version(
+        catalog, clip_version, model=clip_model, revision=_VISUAL_CLIP_REV, dim=512
+    )
+    _register_visual_version(
+        catalog, dino_version, model=dino_model, revision=_VISUAL_DINO_REV, dim=384
+    )
+    coverage_plan = _window_plan_version()
+    equal_plan = _window_plan_version(scheme="equal")
+    _register_window_plan(catalog, coverage_plan)
+    _register_window_plan(catalog, equal_plan, scheme="equal")
+    work = _v04_local_work(catalog, "window-orthogonal")
+
+    for frame_version in (clip_version, dino_version):
+        for plan_version in (coverage_plan, equal_plan):
+            catalog.upsert_visual_window_sequence(
+                work,
+                frame_version=frame_version,
+                window_plan_version=plan_version,
+                status="completed",
+                n_windows=3,
+                dim=4,
+            )
+
+    rows = catalog.list_visual_window_sequences()
+    assert len(rows) == 4
+    # 每个 (work, frame, plan) 组合都能独立取回
+    for frame_version in (clip_version, dino_version):
+        for plan_version in (coverage_plan, equal_plan):
+            row = catalog.get_visual_window_sequence(
+                work, frame_version=frame_version, window_plan_version=plan_version
+            )
+            assert row is not None and row["status"] == "completed"
+    # 窗口计划不修改帧版本表
+    assert catalog.get_visual_version(clip_version)["fps"] == pytest.approx(8.0)
+    assert catalog.get_visual_version(dino_version)["fps"] == pytest.approx(8.0)
+    # 每个计划各自统计，互不串行
+    assert catalog.visual_window_status_summary(coverage_plan)["completed"] == 2
+    assert catalog.visual_window_status_summary(equal_plan)["completed"] == 2
+
+
+def test_visual_window_plans_do_not_share_cache(config: Config) -> None:
+    """不同窗口计划的窗口层路径必须隔离，不共享缓存目录。"""
+
+    catalog = Catalog(config.paths.db_path)
+    try:
+        catalog.initialize()
+        work = _v04_local_work(catalog, "window-cache-isolation")
+        frame_version = _visual_version(_VISUAL_CLIP_MODEL, _VISUAL_CLIP_REV)
+        _register_visual_version(catalog, frame_version)
+        plan_a = _window_plan_version()
+        plan_b = _window_plan_version(overlap=2.0, scheme="equal")
+        _register_window_plan(catalog, plan_a)
+        _register_window_plan(catalog, plan_b, overlap=2.0, scheme="equal")
+
+        dir_a = config.paths.visual_windows / plan_a / frame_version / f"{work:06d}"
+        dir_b = config.paths.visual_windows / plan_b / frame_version / f"{work:06d}"
+        assert dir_a != dir_b
+        dir_a.mkdir(parents=True)
+        (dir_a / "windows.npy").write_bytes(b"a")
+        assert not dir_b.exists()
+
+        catalog.upsert_visual_window_sequence(
+            work,
+            frame_version=frame_version,
+            window_plan_version=plan_a,
+            status="completed",
+            windows_path=str(dir_a.relative_to(config.paths.data)),
+            window_weights_path=str((dir_a / "window_weights.npy").relative_to(config.paths.data)),
+            n_windows=2,
+            dim=4,
+        )
+        catalog.upsert_visual_window_sequence(
+            work,
+            frame_version=frame_version,
+            window_plan_version=plan_b,
+            status="completed",
+            windows_path=str(dir_b.relative_to(config.paths.data)),
+            n_windows=2,
+            dim=4,
+        )
+        row_a = catalog.get_visual_window_sequence(
+            work, frame_version=frame_version, window_plan_version=plan_a
+        )
+        row_b = catalog.get_visual_window_sequence(
+            work, frame_version=frame_version, window_plan_version=plan_b
+        )
+        assert row_a is not None and row_b is not None
+        assert row_a["windows_path"] != row_b["windows_path"]
+        assert row_a["windows_path"] == str(dir_a.relative_to(config.paths.data))
+        assert row_b["windows_path"] == str(dir_b.relative_to(config.paths.data))
+        # 清理 temp 不会删除窗口层/源缓存
+        Pipeline = __import__("nebula.pipeline", fromlist=["Pipeline"]).Pipeline
+        Pipeline(config).clean_temp()
+        assert (dir_a / "windows.npy").is_file()
+    finally:
+        catalog.close()
+
+
+def test_sources_path_is_under_data_and_not_temp_cleaned(config: Config) -> None:
+    """sources 位于 data 下、不在 temp 内，clean_temp 不删除持久缓存。"""
+
+    sources = config.paths.sources
+    assert sources.is_dir()
+    assert str(sources).startswith(str(config.paths.data))
+    assert not str(sources).startswith(str(config.paths.temp))
+    assert str(config.paths.visual_windows).startswith(str(config.paths.data))
+    assert "win" in config.visual_window_plan_version
+    assert config.visual_dense.weight_scheme in config.visual_window_plan_version
+
+    cache_file = sources / "BV1testcache" / "BV1testcache_p1.mp4"
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_bytes(b"fake-source")
+    temp_file = config.paths.temp / "staging" / "demo.mp4"
+    temp_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_file.write_bytes(b"temp")
+
+    Pipeline = __import__("nebula.pipeline", fromlist=["Pipeline"]).Pipeline
+    removed = Pipeline(config).clean_temp()
+    assert removed >= 1
+    assert not temp_file.exists()
+    assert cache_file.is_file(), "sources 持久缓存被 clean_temp 误删"
+
+
+def test_consensus_tool_import_boundary(repo_root: Path) -> None:
+    """跨模型共识工具必须离线纯数值：不加载模型/UMAP/界面库，不写 data。"""
+
+    tool = repo_root / "tools" / "build_consensus_graph.py"
+    assert tool.is_file(), "tools/build_consensus_graph.py 尚未交付"
+    _assert_no_import(
+        tool,
+        ("torch", "transformers", "umap", "streamlit", "plotly", "nebula.embed"),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 采样规则
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1507,6 +1845,8 @@ def test_gitignore_mentions_runtime_artifacts(repo_root: Path) -> None:
         ".venv",
         "data/catalog.sqlite",
         "data/embeddings",
+        "data/visual_windows",
+        "data/sources",
         "data/maps",
         "temp/",
         "logs/",

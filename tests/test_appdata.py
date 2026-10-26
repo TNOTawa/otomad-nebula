@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -17,15 +20,21 @@ from nebula.appdata import (
     available_color_fields,
     clip_heatmap_data,
     clip_pair_rows,
+    consensus_edges_for_visible,
+    consensus_neighbors,
+    diagnostics_artifacts,
     external_url,
     filter_frame,
     hover_text,
     hub_rows,
     load_event_timeline,
     load_nebula_frame,
+    load_neighbor_consensus,
     load_representation_options,
     map_matches_representation,
+    mutual_neighbor_edges,
     neighbor_rows,
+    pick_mutual_edge_kind,
     search_frame,
 )
 from nebula.config import Config
@@ -1152,3 +1161,212 @@ def test_load_representation_options_all_spaces_with_visual(seeded):
     assert map_info["version"] == "map_v003"
     assert map_info["representation_name"] == "temporal_stats_v1"
     assert len(frame) == len(work_ids)
+
+
+
+# --------------------------------------------------------------------------- v0.4.4 高维邻域连线
+def _write_consensus(config: Config, payload: object) -> Path:
+    config.paths.logs.mkdir(parents=True, exist_ok=True)
+    path = config.paths.logs / "neighbor_consensus.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_pick_mutual_edge_kind(seeded_with_vectors):
+    config, catalog, work_ids, index = seeded_with_vectors
+    assert pick_mutual_edge_kind(index) == "work_joint"
+    assert index.available_kinds == ("work_joint", "work_audio", "work_video")
+
+
+def test_mutual_neighbor_edges(seeded_with_vectors):
+    config, catalog, work_ids, index = seeded_with_vectors
+    result = mutual_neighbor_edges(index, work_ids, k=2)
+    assert result["kind"] == "work_joint"
+    assert result["k"] == 2
+    assert result["max_edges"] == 300
+    assert result["n_visible_works"] == len(work_ids)
+    neighbor_sets = {
+        work_id: {n.work_id for n in index.neighbors(work_id, kind="work_joint", k=2)}
+        for work_id in work_ids
+    }
+    for edge in result["edges"]:
+        a, b = edge["a_work_id"], edge["b_work_id"]
+        assert b in neighbor_sets[a] and a in neighbor_sets[b], "只允许互为近邻边"
+        assert edge["similarity"] == pytest.approx(
+            index.similarity(a, b, kind="work_joint"), abs=1e-6
+        )
+    similarities = [edge["similarity"] for edge in result["edges"]]
+    assert similarities == sorted(similarities, reverse=True)
+    assert result["n_total"] == len(result["edges"])
+    assert result["truncated"] is False
+
+    truncated = mutual_neighbor_edges(index, work_ids, k=2, max_edges=1)
+    assert truncated["n_total"] == result["n_total"]
+    assert len(truncated["edges"]) == min(1, result["n_total"])
+    assert truncated["truncated"] is (result["n_total"] > 1)
+
+    # 不存在的作品忽略；未知模态时没有可画边
+    extended = mutual_neighbor_edges(index, [*work_ids, 99999], k=2)
+    assert extended["n_visible_works"] == len(work_ids)
+    assert extended["n_total"] == result["n_total"]
+    unknown_kind = mutual_neighbor_edges(index, work_ids, kind="work_video", k=2)
+    with pytest.raises(NebulaError, match="k 必须"):
+        mutual_neighbor_edges(index, work_ids, k=0)
+    assert unknown_kind["kind"] == "work_video"
+
+
+def test_mutual_neighbor_edges_without_vectors(seeded):
+    config, catalog, work_ids = seeded
+    index = load_similarity_index(catalog, config)
+    try:
+        assert pick_mutual_edge_kind(index) is None
+        result = mutual_neighbor_edges(index, work_ids, k=5)
+        assert result["edges"] == []
+        assert result["n_visible_works"] == 0
+    finally:
+        index.close()
+
+
+def test_load_neighbor_consensus_formats(config: Config):
+    assert load_neighbor_consensus(config) is None
+
+    _write_consensus(
+        config,
+        {
+            "meta": {"tool": "build_consensus_graph", "spaces": ["a", "b"]},
+            "edges": [
+                {"work_pair": [1, 2], "consensus_count": 3, "spaces": ["a", "b", "c"]},
+                {"a_work_id": 2, "b_work_id": 3, "count": 2},
+                {"work_ids": "4,5", "spaces": ["a", "b"]},
+                {"bad": "edge"},
+            ],
+        },
+    )
+    consensus = load_neighbor_consensus(config)
+    assert consensus is not None
+    assert consensus["path"].endswith("neighbor_consensus.json")
+    assert consensus["n_edges"] == 3
+    assert (1, 2) in consensus["pairs"]
+    assert consensus["pairs"][(1, 2)]["consensus_count"] == 3
+    assert consensus["pairs"][(1, 2)]["spaces"] == ("a", "b", "c")
+    assert consensus["pairs"][(2, 3)]["consensus_count"] == 2
+    assert consensus["pairs"][(4, 5)]["consensus_count"] == 2  # 由 spaces 数量推导
+    assert consensus["meta"] == {"tool": "build_consensus_graph", "spaces": ["a", "b"]}
+    assert [edge["consensus_count"] for edge in consensus["edges"]] == [3, 2, 2]
+
+    # pairs 映射格式 + 计数直接给整数
+    _write_consensus(
+        config,
+        {
+            "pairs": {
+                "1:4": {"consensus_count": 2, "spaces": ["x", "y"]},
+                "2-5": 3,
+            }
+        },
+    )
+    mapped = load_neighbor_consensus(config)
+    assert mapped is not None
+    assert mapped["n_edges"] == 2
+    assert mapped["pairs"][(1, 4)]["consensus_count"] == 2
+    assert mapped["pairs"][(2, 5)]["consensus_count"] == 3
+    assert mapped["pairs"][(2, 5)]["spaces"] == ()
+
+    # t5 build_consensus_graph 的真实 schema：work_a/work_b + mutual_spaces + spaces 映射
+    _write_consensus(
+        config,
+        {
+            "tool": "neighbor_consensus",
+            "edges": [
+                {
+                    "work_a": 6,
+                    "work_b": 7,
+                    "consensus_count": 2,
+                    "consensus_strength": 0.666667,
+                    "is_consensus": True,
+                    "mutual_spaces": ["full_mean_v1", "dense_visual_clip_v2"],
+                    "spaces": {
+                        "full_mean_v1": {"rank_a": 1, "rank_b": 2, "mutual": True},
+                        "dense_visual_clip_v2": {"rank_a": 3, "rank_b": 1, "mutual": True},
+                    },
+                },
+                {
+                    "work_a": 7,
+                    "work_b": 8,
+                    "consensus_count": 3,
+                    "mutual_spaces": ["a", "b", "c"],
+                    "spaces": {"a": {}, "b": {}, "c": {}},
+                },
+            ],
+        },
+    )
+    tool_schema = load_neighbor_consensus(config)
+    assert tool_schema is not None
+    assert tool_schema["n_edges"] == 2
+    assert tool_schema["pairs"][(6, 7)]["consensus_count"] == 2
+    assert tool_schema["pairs"][(6, 7)]["spaces"] == (
+        "full_mean_v1",
+        "dense_visual_clip_v2",
+    )
+    assert tool_schema["pairs"][(7, 8)]["consensus_count"] == 3
+
+    # 坏 JSON -> None（界面回退普通互为近邻）
+    (config.paths.logs / "neighbor_consensus.json").write_text(
+        "{not valid json", encoding="utf-8"
+    )
+    assert load_neighbor_consensus(config) is None
+
+
+def test_consensus_edges_for_visible_and_neighbors(config: Config):
+    _write_consensus(
+        config,
+        {
+            "edges": [
+                {"work_pair": [1, 2], "consensus_count": 3, "spaces": ["a", "b", "c"]},
+                {"work_pair": [2, 3], "consensus_count": 2, "spaces": ["a", "b"]},
+                {"work_pair": [1, 4], "consensus_count": 1, "spaces": ["a"]},
+                {"work_pair": [5, 6], "consensus_count": 3, "spaces": ["a", "b", "c"]},
+            ]
+        },
+    )
+    consensus = load_neighbor_consensus(config)
+    assert consensus is not None
+    filtered = consensus_edges_for_visible(
+        consensus, [1, 2, 3, 4], min_count=2
+    )
+    assert [(e["a_work_id"], e["b_work_id"]) for e in filtered["edges"]] == [(1, 2), (2, 3)]
+    assert filtered["n_total"] == 2
+    assert filtered["truncated"] is False
+    low = consensus_edges_for_visible(consensus, [1, 2, 3, 4], min_count=1)
+    assert low["n_total"] == 3
+    truncated = consensus_edges_for_visible(
+        consensus, [1, 2, 3, 4], min_count=1, max_edges=1
+    )
+    assert truncated["truncated"] is True
+    assert len(truncated["edges"]) == 1
+
+    rows = consensus_neighbors(consensus, 2, min_count=2, limit=5)
+    assert [(row["work_id"], row["consensus_count"]) for row in rows] == [(1, 3), (3, 2)]
+    assert consensus_neighbors(consensus, 2, min_count=3) == [
+        {"work_id": 1, "consensus_count": 3, "spaces": ("a", "b", "c")}
+    ]
+    assert consensus_neighbors(consensus, 999) == []
+
+
+def test_diagnostics_artifacts(config: Config):
+    missing = diagnostics_artifacts(config)
+    assert missing["available"] is False
+    assert missing["html_dir"] is None and missing["json"] is None
+
+    config.paths.logs.mkdir(parents=True, exist_ok=True)
+    html_dir = config.paths.logs / "dim_diagnostics_v2_html"
+    html_dir.mkdir()
+    json_path = config.paths.logs / "dim_diagnostics_v2.json"
+    json_path.write_text("{}", encoding="utf-8")
+    csv_path = config.paths.logs / "dim_diagnostics_v2.csv"
+    csv_path.write_text("space,method\n", encoding="utf-8")
+
+    artifacts = diagnostics_artifacts(config)
+    assert artifacts["available"] is True
+    assert artifacts["html_dir"] == str(html_dir)
+    assert artifacts["json"] == str(json_path)
+    assert artifacts["csv"] == str(csv_path)

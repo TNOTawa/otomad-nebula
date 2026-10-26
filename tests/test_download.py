@@ -23,8 +23,10 @@ from nebula.download import (
     download_bilibili_playurl,
     http_get_text,
     is_valid_bvid,
+    resolve_bilibili_source,
 )
 from nebula.errors import DownloadError
+from tests.fixtures.video_factory import build_video_library, media_tools_available
 
 # 真实网络测试默认跳过；设置 NEBULA_NETWORK_TESTS=1 才运行。
 NETWORK_ENABLED = os.environ.get("NEBULA_NETWORK_TESTS") == "1"
@@ -1035,3 +1037,170 @@ def test_fetch_meta_real_multipart_uses_part_duration(config) -> None:
     assert meta.page_count >= 2
     assert meta.duration_s < 250  # 分P时长，而不是整部总时长（约 356）
     assert meta.part_title is not None
+
+
+# ---------------------------------------------------------------- 源视频持久缓存
+
+
+def _tiny_source_video(tmp_path: Path) -> Path:
+    if not media_tools_available():
+        pytest.skip("缺少 ffmpeg/ffprobe")
+    library = build_video_library(names=["short_4s.mp4"])
+    target = tmp_path / "source.mp4"
+    shutil.copy2(library["short_4s.mp4"], target)
+    return target
+
+
+def test_resolve_bilibili_source_downloads_once_and_reuses_cache(
+    config, tmp_path: Path
+) -> None:
+    video = _tiny_source_video(tmp_path)
+    calls: list[dict[str, Any]] = []
+    temp_dir = config.paths.temp / "work_000001"
+
+    def downloader(bvid: str, *, part: int, out_dir: Path, download: Any) -> Path:
+        calls.append({"bvid": bvid, "part": part, "out_dir": Path(out_dir)})
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        target = out_dir / f"{bvid}_p{part}.mp4"
+        shutil.copy2(video, target)
+        return target
+
+    path = resolve_bilibili_source(
+        config,
+        None,
+        VALID_BVID,
+        1,
+        temp_dir,
+        config.download,
+        downloader=downloader,
+    )
+    expected = (
+        config.paths.sources / VALID_BVID / f"{VALID_BVID}_p1.mp4"
+    ).resolve()
+    assert path == expected
+    assert path.is_file()
+    assert len(calls) == 1
+    assert calls[0]["out_dir"] == temp_dir / "download"
+    # 下载结果已移动进缓存，暂存目录不再保留同名文件
+    assert not (temp_dir / "download" / f"{VALID_BVID}_p1.mp4").exists()
+
+    second = resolve_bilibili_source(
+        config,
+        None,
+        VALID_BVID,
+        1,
+        temp_dir,
+        config.download,
+        downloader=downloader,
+    )
+    assert second == path
+    assert len(calls) == 1  # 缓存命中，不重复下载
+
+
+def test_resolve_bilibili_source_replaces_corrupt_cache(
+    config, tmp_path: Path
+) -> None:
+    video = _tiny_source_video(tmp_path)
+    cache_dir = config.paths.sources / VALID_BVID
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    corrupt = cache_dir / f"{VALID_BVID}_p1.mp4"
+    corrupt.write_bytes(b"not a valid mp4")
+
+    downloads = 0
+
+    def downloader(bvid: str, *, part: int, out_dir: Path, download: Any) -> Path:
+        nonlocal downloads
+        downloads += 1
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        target = out_dir / f"{bvid}_p{part}.mp4"
+        shutil.copy2(video, target)
+        return target
+
+    path = resolve_bilibili_source(
+        config,
+        None,
+        VALID_BVID,
+        1,
+        config.paths.temp / "work_000002",
+        config.download,
+        downloader=downloader,
+    )
+    assert downloads == 1
+    assert path == corrupt.resolve()
+    assert path.read_bytes() == video.read_bytes()
+
+
+def test_resolve_bilibili_source_cleans_staging_on_failure(
+    config, tmp_path: Path
+) -> None:
+    temp_dir = config.paths.temp / "work_000003"
+
+    def downloader(bvid: str, *, part: int, out_dir: Path, download: Any) -> Path:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        partial = out_dir / f"{bvid}_p{part}.mp4.part"
+        partial.write_bytes(b"partial-download")
+        raise DownloadError("模拟下载中断")
+
+    with pytest.raises(DownloadError):
+        resolve_bilibili_source(
+            config,
+            None,
+            VALID_BVID,
+            1,
+            temp_dir,
+            config.download,
+            downloader=downloader,
+        )
+    staging = temp_dir / "download"
+    assert not list(staging.glob(f"{VALID_BVID}_p1.*"))
+    assert not (config.paths.sources / VALID_BVID).exists()
+
+
+def test_resolve_bilibili_source_cache_not_deleted_by_failure(
+    config, tmp_path: Path
+) -> None:
+    video = _tiny_source_video(tmp_path)
+    cache_dir = config.paths.sources / VALID_BVID
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached = cache_dir / f"{VALID_BVID}_p1.mp4"
+    shutil.copy2(video, cached)
+
+    def downloader(bvid: str, *, part: int, out_dir: Path, download: Any) -> Path:
+        raise AssertionError("已有可 probe 缓存时不应下载")
+
+    path = resolve_bilibili_source(
+        config,
+        None,
+        VALID_BVID,
+        1,
+        config.paths.temp / "work_000004",
+        config.download,
+        downloader=downloader,
+    )
+    assert path == cached.resolve()
+    assert cached.is_file()
+
+
+def test_resolve_bilibili_source_rejects_invalid_args(config) -> None:
+    with pytest.raises(DownloadError):
+        resolve_bilibili_source(
+            config,
+            None,
+            "not-a-bvid",
+            1,
+            config.paths.temp / "work_000005",
+            config.download,
+        )
+    with pytest.raises(DownloadError):
+        resolve_bilibili_source(
+            config,
+            None,
+            VALID_BVID,
+            0,
+            config.paths.temp / "work_000005",
+            config.download,
+        )
+

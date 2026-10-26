@@ -42,7 +42,7 @@ Bilibili BV 清单 ───┘                                        │
 | 领域层 | `nebula/media.py` | ffprobe 探测、ffmpeg 音画同步切片、消融素材 | config、errors、util |
 | 领域层 | `nebula/embed.py` | Embedder 协议、PE-AV 推理、HashTestEmbedder、聚合、npy 原子读写 | config、errors、util；**不依赖 db/pandas** |
 | 编排层 | `nebula/pipeline.py` | 单部作品全流程、批处理、断点续跑、临时目录生命周期 | media、embed、ingest、download、db、config |
-| 数据层 | `nebula/ingest.py` / `nebula/download.py` | 本地扫描、选票/周报解析、Bilibili 元数据与下载 | db、config、errors |
+| 数据层 | `nebula/ingest.py` / `nebula/download.py` | 本地扫描、选票/周报解析、Bilibili 元数据与下载；v0.4.3.1 起 `resolve_bilibili_source` 优先复用 `data/sources` 持久缓存 | db、config、errors |
 | 数据层 | `nebula/mapplot.py` | 向量矩阵加载、UMAP 2D/3D、版本落盘、transform 增量 | db、config、umap-learn、joblib、numpy |
 | 展示层 | `nebula/appdata.py` | 纯数据准备：DataFrame、染色 `ColorSpec`（含高维近邻密度）、筛选、搜索、hover、近邻解释行、枢纽行、片段热图/配对纯数据 | pandas、numpy、db、config；**不导入 streamlit/plotly** |
 | 展示层 | `app.py` | Streamlit 页面：侧栏控件、Plotly 图、详情、近邻解释表、枢纽与片段级对应面板 | streamlit、plotly、appdata、similarity（经缓存） |
@@ -53,7 +53,7 @@ Bilibili BV 清单 ───┘                                        │
 | 领域层 | `nebula/events.py` | 高频音画事件扫描：音频 100Hz/视频 30fps 特征、音画互相关、窗口压缩为 32 维 | media、config、numpy；不导入模型/UMAP/UI |
 | 分析层 | `nebula/temporal.py` | 表征聚合：Full Mean（全片窗口均值）与 Temporal Stats（全局/阶段/漂移/动态/自相似/事件分组） | representations、numpy；确定性、顺序敏感性由测试约束 |
 | 分析层 | `nebula/representations.py` | 表征注册/解析/向量落盘与加载；legacy 复用 embeddings，派生走 representation_vectors；矩阵按 work_id 排序、排除 duplicate；`source_kind` 区分 pe_av/visual | config、db、embed、numpy |
-| 领域层 | `nebula/dense_visual.py` | v0.4.3 冻结视觉编码器（CLIP ViT-B/16、DINOv2-small）：单次 ffmpeg 流式解码、帧级 L2 特征、8s 窗口池化、bundle/manifest 原子保存 | config、errors、numpy；torch/transformers 懒加载，不导入 db/UMAP/UI |
+| 领域层 | `nebula/dense_visual.py` | v0.4.3/v0.4.3.1 冻结视觉编码器（CLIP ViT-B/16、DINOv2-small）：单次 ffmpeg 流式解码、帧级 L2 特征、窗口池化、窗口覆盖权重、bundle/manifest 原子保存 | config、errors、numpy；torch/transformers 懒加载，不导入 db/UMAP/UI |
 | 编排层 | `nebula/visual_pipeline.py` | v0.4.3 密集视觉批处理：canonical+completed 作品、每部只下载一次、按编码器/版本建任务、visual_sequences 状态与断点续跑、完成后清理 temp | dense_visual、download、db、config、sampling |
 | 入口层 | `ingest.py` / `pipeline.py` / `map.py` / `qa.py` / `tools/clip_stability.py` / `tools/desync_experiment.py` / `tools/preflight_works.py` / `tools/build_representation.py` / `tools/compare_spaces.py` / `tools/events_probe.py` / `tools/visual_pipeline.py` / `tools/dense_preprocess_compare.py` / `tools/embedding_diagnostics.py` | 参数解析、调用库代码、打印结果、返回退出码 | 对应库模块 |
 
@@ -100,8 +100,9 @@ works 1────N sequence_states N────1 embedding_versions  （全�
 works 1────N representation_vectors N────1 representations
 map_runs N────1 representations            （地图必须绑定一个表征，v0.4）
 works 1────N visual_sequences N────1 visual_versions   （密集视觉通道，v0.4.3）
+visual_versions 1────N visual_window_sequences N────1 visual_window_plans （窗口计划层，v0.4.3.1）
 representations.sequence_version ∈ embedding_versions（source_kind=pe_av）或 visual_versions（source_kind=visual）
-map_runs.source_kind ∈ {pe_av, visual}；视觉地图的 embedding_version 存视觉版本字符串
+map_runs.source_kind ∈ {pe_av, visual}；视觉地图的 embedding_version 存视觉版本 slug
 ~~~
 
 | 表 | 关键列 | 说明 |
@@ -124,6 +125,8 @@ map_runs.source_kind ∈ {pe_av, visual}；视觉地图的 embedding_version 存
 | `sequence_states` | `work_id`, `version`, `duration_s`, `n_clips`, `n_clips_done`, `partial_relpath`, `status` | 全片编码进度（v0.4）；status ∈ in_progress/assembled/failed；支持片段级断点恢复 |
 | `visual_versions` | `version` PK, `model_id`, `revision`, `preprocessing`, `fps`, `size`, `dim`, `params_json` | 冻结视觉编码器版本（v0.4.3）；同一版本参数不一致报错；encoder/revision/fps/size/preprocess 任一变化必须新版本 |
 | `visual_sequences` | `work_id`, `version`, `status`, `frames_path`, `windows_path`, `n_frames`, `n_windows`, `dim`, `decode_s/encode_s/model_load_s/total_s` | 密集视觉进度与工件（v0.4.3）；主键 `(work_id, version)`；status ∈ pending/in_progress/completed/failed；支持断点续跑与清理 |
+| `visual_window_plans` | `version` PK, `clip_seconds`, `overlap_seconds`, `weight_scheme`, `params_json` | 窗口计划版本（v0.4.3.1）：窗口时长/重叠/权重方案；同版本参数不一致报错；与帧编码版本正交 |
+| `visual_window_sequences` | `work_id`, `frame_version`, `window_plan_version`, `status`, `windows_path`, `window_std_path`, `window_weights_path`, `n_windows`, `dim`, `total_s` | 窗口层任务（v0.4.3.1）；主键 `(work_id, frame_version, window_plan_version)`；引用 visual_versions + visual_window_plans；支持从已保存帧重建/断点 |
 
 连接设置：WAL、`foreign_keys=ON`、`BEGIN IMMEDIATE` 事务、`busy_timeout`；
 所有写操作在事务内完成，读方法返回普通 `dict` 便于上层使用。
@@ -150,7 +153,8 @@ map_runs.source_kind ∈ {pe_av, visual}；视觉地图的 embedding_version 存
   140,149 帧 / 593 窗口；总存储 **673.9MB**；
 - 视觉表征：`dense_visual_clip_v1`(id=4, 512 维) / `dense_visual_dino_v1`(id=5, 384 维)，
   各 110 部 joint 窗口向量；对应地图 `map_v013` / `map_v014`（`source_kind=visual`）。
-  默认地图仍为 PE-AV 优先（`map_v012`），视觉空间需在侧栏手动切换。
+  v0.4.3.1 重建 v2（`dense_visual_clip_v2`/`dense_visual_dino_v2`）后视觉 v1/v2 并存，
+  v1 只读保留；默认地图仍为 PE-AV 优先（`map_v012`），视觉空间需在侧栏手动切换。
 
 ### 3.2 文件系统工件
 
@@ -171,11 +175,15 @@ data/
 │       └── .partial/                  # 编码中：batch_0000.npz ... 原子写入，完成后删除
 ├── representations/<name>/<sequence_version>/<work_id>/
 │   └── {joint,audio,video}.npy        # 派生表征向量（full_mean/temporal_stats/dense visual）
-├── visual_dense/<visual_version>/<work_id>/   # v0.4.3 密集视觉通道
+├── visual_dense/<frame_version>/<work_id>/   # v0.4.3 帧级密集视觉通道
 │   ├── dense_visual.npz               # 帧级 fp16 向量 + 时间戳/版本/维度元数据
+│   └── manifest.json                  # version/encoder/revision/fps/size/preprocess/duration/n_frames/dim
+├── visual_windows/<window_plan_version>/<frame_version>/<work_id>/  # v0.4.3.1 窗口层
 │   ├── windows.npy                    # (T,d) float32 窗口池化（与 PE-AV 8s 窗口对齐）
 │   ├── window_std.npy                 # (T,d) float32 窗口内变化幅度（可选）
-│   └── manifest.json                  # version/encoder/revision/fps/size/preprocess/duration/n_frames/dim/n_windows/window_times
+│   ├── window_weights.npy             # (T,) float32 覆盖权重（Σ=1；coverage-v1）
+│   └── manifest.json                  # frame/window plan/fps/clip_seconds/overlap/weight_scheme/n_windows/window_times
+├── sources/<bvid>/<bvid>_p<part>.*    # v0.4.3.1 Bilibili 源视频持久缓存（不随 temp 清理）
 └── maps/<map_version>/
     ├── coords.parquet                 # work_id, x2, y2, x3, y3, z3
     ├── map_2d.joblib                  # 已训练的 2D UMAP 模型（供 transform）
@@ -194,6 +202,12 @@ data/
 - v0.4.3 视觉层是**独立命名空间**：`visual_version` 形如
   `encoder@revision__fps{fps}_s{size}_{preprocess}`（例 `openai/clip-vit-base-patch16@<rev>__fps8_s224_letterbox`），
   与 PE-AV `sequence_version` 互不混用；帧级 fp16、窗口级 fp32，bundle/manifest 原子写；
+- v0.4.3.1 拆出**窗口层**：帧级特征只依赖 Frame Encoding Version；窗口层由
+  Window Plan Version（`clip_seconds + overlap_seconds + weight_scheme`）决定，存
+  `data/visual_windows/<window_plan_version>/<frame_version>/<work_id>/`；
+  修改窗口/权重只重建窗口层与表征，不重新解码/编码帧；
+- 源视频持久缓存在 `data/sources/`，`temp/` 只放切片/中间文件；
+  `clean-temp` 不得删除 sources 缓存；
 - 所有 npy / joblib / parquet 写入都走“临时文件 + 原子替换”，避免半文件；
   全片编码的 `.partial/batch_*.npz` 逐批原子写入，重启只补缺失批。
 
@@ -308,6 +322,15 @@ logs/
     `visual_sequences` 主键 `(work_id, version)`，状态 ∈ pending/in_progress/completed/failed，
     只处理 canonical + completed 作品、每部只下载一次、全部任务成功后清理 temp；
     **视觉向量/地图禁止与 PE-AV 序列/地图混入同一矩阵**；帧级冻结特征不是逐帧语义理解。
+21. **三层版本正交与缓存隔离（v0.4.3.1）。**
+    Frame Encoding Version（model+revision+fps+size+preprocess）只决定帧级特征；
+    Window Plan Version（clip_seconds+overlap_seconds+weight_scheme，配置由
+    `config.visual_window_plan_version` 派生）只决定窗口池化/权重；
+    Representation Version 只决定聚合器；三者任一变化必须新建对应层版本，禁止覆盖；
+    `visual_window_sequences` 主键 `(work_id, frame_version, window_plan_version)`，
+    不同窗口计划不共享窗口/权重缓存；同一帧版本可配多个窗口计划，同一计划可跨多个帧版本；
+    窗口覆盖权重写入 `window_weights.npy`/`manifest.json` 且 Σ=1（coverage-v1），
+    作品向量必须按权重聚合；`data/sources/` 位于 data 下、不进入 temp 清理。
 
 ## 5. 处理流程与失败语义
 
@@ -513,11 +536,55 @@ v0.4.3 新增的紧凑视觉通道（§6.6）用冻结 CLIP/DINOv2 提供 8fps �
   `dense_visual_dino_v1`(id=5) 各 110 向量；`map_v013`（CLIP-only）/
   `map_v014`（DINOv2-only）各 110 部；宽高比对照采用 letterbox（CLIP 窗口余弦 mean 0.9425、
   DINO 0.8725；帧数一致）；视觉 vs PE-AV 窗口 RSA：CLIP-video mean 0.6949、DINO-video 0.7246；
-  30fps 窗口级饱和（8fps↔30fps 余弦 CLIP 0.9998、DINO 0.9994）；5 个表征空间可切换，
+  30fps 窗口级饱和（8fps↔30fps 余弦 CLIP 0.9998、DINO 0.9994）；v0.4.3 有 5 个表征空间可切换，
+  v0.4.3.1 重建后视觉 v2 空间加入并与 v1 并存（以实际登记表征/地图为准）；
   默认仍为 PE-AV 优先（`map_v012`）。详见
   `docs/reports/visual-dense-full-run.md`（数字已回填、t4 复核）；
 - **边界**：帧级冻结特征提高时间密度，但仍是“特征”而非“逐帧语义理解”，也没有可学习的
   音画时序关系；30fps 只用于帧级轨迹研究，不默认全量。
+
+### 6.7 窗口计划层与跨模型共识（v0.4.3.1 / v0.4.4）
+
+**v0.4.3.1：覆盖权重修复与三层版本分离**
+
+- 问题：v0.4.3 的窗口视觉向量未保存 `plan_full_coverage` 的覆盖权重，构建 v1 表征时
+  退化为等权；且视觉版本号不含窗口时长/overlap/权重方案，改窗口计划会复用旧版本；
+- 三层版本：
+  | 层 | 内容 | 示例 |
+  | --- | --- | --- |
+  | Frame Encoding Version | model+revision+fps+size+preprocess | `openai-clip-vit-base-patch16-<rev>__fps8_s224_letterbox` |
+  | Window Plan Version | clip_seconds+overlap_seconds+weight_scheme | `win8s_ov0__coverage-v1` |
+  | Representation Version | 聚合器 + 引用的窗口计划 | `dense_visual_clip_v2` / `dense_visual_dino_v2` |
+- 窗口层：`tools/build_visual_windows.py` 从已保存帧级特征重建
+  `data/visual_windows/<window_plan_version>/<frame_version>/<work_id>/`
+  （`windows.npy`/`window_std.npy`/`window_weights.npy`/`manifest.json`），
+  不下载/不解码/不跑模型；DB 用 `visual_window_plans`/`visual_window_sequences`（schema v5）；
+- 权重：`nebula.sampling.coverage_weights` 与 `plan_full_coverage` 同源，
+  写入窗口层；作品向量按 `Σ w_i * window_i` 聚合（`weight_scheme=coverage-v1`）；
+  `weight_scheme=equal` 仅用于复现旧行为/对照；
+- 源缓存：`data/sources/` 持久保存 Bilibili 源视频，`temp/` 只放切片；
+  重建不重复下载，`clean-temp` 不影响 sources；
+- v2 表征/地图：v1（`dense_visual_clip_v1`/`dense_visual_dino_v1`、map_v013/v014）
+  保留只读；v2 另建表征与地图（`dense_visual_clip_v2` id=6 → map_v015；
+  `dense_visual_dino_v2` id=7 → map_v016），不覆盖旧版本，坐标跨版本不可比；
+- **真实结果（2026-10-26）**：window plan=win8s_ov0__coverage-v1；252/252 窗口任务 completed、
+  0 failed，共 9446 窗口（8fps 4130×2、30fps 593×2）；weight_sum 0.999999847..1.000000209；
+  v2 表征各 110 joint；v1→v2 逐作品余弦 CLIP min 0.999972 / DINO min 0.999863；
+  Top-5 Jaccard CLIP 0.9939（稳定 108/110）/ DINO 0.9970（稳定 109/110）——
+  **本数据 8s/ov0 下影响很小，但修复了权重正确性，overlap>0/短窗口下差异会放大**；
+- 边界：这是同一帧级特征上的**权重修复**，不改变模型能力，不宣称新的语义理解。
+
+**v0.4.4：跨模型近邻共识与轻量融合**
+
+- 目标：用现有高维表征回答“多个模型共同认可的相似作品是否更有解释力”，不训练新模型；
+- 方法：对 `full_mean_v1` + `dense_visual_clip_v2` + `dense_visual_dino_v2`
+  （可配）计算 Top-k 有向/互为近邻，统计跨空间保留率、>=2/>=3 空间共识边、覆盖与强度；
+  另做 rank-average 与 concat 轻量融合基线（不写 DB）；
+- 工具：`tools/build_consensus_graph.py` → `logs/neighbor_consensus.json/.csv`；
+- 界面：侧栏“显示高维互为近邻连线”（默认关，只画 mutual，边数截断提示）与
+  “仅显示跨模型共识边”（共识 JSON 缺失时回退并提示）；详情显示共识近邻摘要；
+  PCA 3D 仅辅助观察，不改变默认 UMAP 坐标语义；
+- 边界：共识是观察性邻域一致性证据，不是风格/流派分类；任何正式融合表征需新建版本并重新验证。
 
 ## 7. 扩展点
 
@@ -566,6 +633,8 @@ v0.4.3 新增的紧凑视觉通道（§6.6）用冻结 CLIP/DINOv2 提供 8fps �
 | `tools/compare_spaces.py` | v0.4 两个表征空间的邻域迁移对比（Jaccard/稳定对/余弦相关/hubness） |
 | `tools/events_probe.py` | v0.4.1 事件扫描探针/预览 CLI（离线合成或单部作品） |
 | `tools/visual_pipeline.py` | v0.4.3 密集视觉批处理 CLI（run/status/list/clean-temp） |
+| `tools/build_visual_windows.py` | v0.4.3.1 从已保存帧级特征重建窗口层（窗口计划/覆盖权重，不下载/不解码/不跑模型） |
+| `tools/build_consensus_graph.py` | v0.4.4 跨模型互为近邻/共识边与轻量融合评估（只读表征，不写 DB） |
 | `tools/dense_preprocess_compare.py` | v0.4.3 宽高比预处理对照（stretch vs letterbox） |
 | `tools/embedding_diagnostics.py` | v0.4.3 PCA/UMAP 低维投影诊断（Top-10 保持率、距离相关） |
 | `tools/bench_ffmpeg.py` / `bench_preprocess.py` / `bench_peav.py` / `verify_peav.py` | 提速/推理基准与真实模型验证证据脚本 |
@@ -597,6 +666,28 @@ v0.4.3 新增的紧凑视觉通道（§6.6）用冻结 CLIP/DINOv2 提供 8fps �
   真实 AppTest 默认 `map_v012`（Temporal Stats），三空间切换 map_v011/map_v008/map_v012，
   时间轴与 full 序列片段面板正常（8 PASS / 0 FAIL）；报告见
   `docs/reports/full-coverage-analysis.md`；
+- **v0.4.3.1 独立验收**：`coverage_weights` 与 `plan_full_coverage` 逐项一致且 Σ=1；
+  `save_bundle` 的 `window_weights` roundtrip/旧 manifest None 兼容；
+  `visual_window_plans`/`visual_window_sequences` 主键/参数冲突/状态；
+  帧编码版本与窗口计划正交（同一帧可配多计划、同一计划可跨帧版本）；
+  不同窗口计划不共享缓存；`data/sources` 在 data 下且不被 `clean-temp` 清理；
+  schema v4→v5 迁移幂等；v1 表征/地图只读保留；v2 权重重建不重跑视觉模型；
+- **v0.4.3.1 真实数据验收（2026-10-26）**：window plan=win8s_ov0__coverage-v1（DB 仅 1 个）；
+  252/252 窗口任务 completed、0 failed、9446 窗口；weight_sum 0.999999847..1.000000209；
+  coverage-vs-equal max 0.022221/mean 0.001713（78/252 差>1e-3）；v2 表征 id=6/7（512/384）、
+  各 110 joint；v2 地图 map_v015/map_v016=110；逐作品余弦 CLIP 0.999999/0.999972、
+  DINO 0.999996/0.999863；Top-5 Jaccard CLIP 0.9939（稳定 108/110）/DINO 0.9970（109/110）；
+  FullMean×CLIP v2 0.3355/0.7342，FullMean×DINO v2 0.3065/0.7596；详见
+  `docs/reports/v0431-window-weights-and-versioning.md`；
+- **v0.4.4 独立验收**：`tools/build_consensus_graph.py` 离线导入（不加载模型/UMAP/界面/写 data）；
+  mutual/共识/rank-average/concat 指标与 JSON schema 由合成数据单测；界面互为近邻/共识叠加、
+  截断、缺失回退、3D 正常；
+  **真实结果（2026-10-26）**：full_mean_v1 / CLIP v2 / DINO v2 的 mutual 边 61/75/73；
+  >=2 共识边 53（>=3 全共识 22），覆盖 44/110（40.00%），平均强度 0.8050；
+  跨空间 mutual Jaccard 0.3204/0.2407/0.3455；rank-average 融合 Jaccard(vs spaces)=0.5331、
+  vs 共识=0.4303；concat(equal) 0.5358/0.4106、concat(inv_sqrt) 0.5385/0.4121；
+  真实 AppTest 默认 map_v012、7 空间切换（v008/v011/v012/v013/v014/v015/v016）、互邻 k=5、
+  共识阈值 2/3 均通过；详见 `docs/reports/v044-consensus-fusion.md`；
 - **v0.4.3 独立验收**：视觉版本参数冲突/命名含 revision+preprocess（DB/目录 slug）、
   visual_sequences 状态/主键/断点、`kind=visual` 表征登记与视觉地图绑定
   （`source_kind=visual`）、不同视觉版本矩阵隔离；

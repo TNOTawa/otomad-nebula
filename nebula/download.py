@@ -23,6 +23,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -1153,3 +1154,158 @@ def _require_inside(path: Path, out_dir: Path) -> None:
         path.resolve().relative_to(out_dir.resolve())
     except ValueError as exc:
         raise DownloadError(f"下载结果不在目标目录内: {path}（目录: {out_dir}）") from exc
+
+# ---------------------------------------------------------------- 源视频持久缓存
+
+
+def _sources_root_for(config: Any) -> Path:
+    """Bilibili 源视频持久缓存目录（config.paths.sources，旧配置回退 data/sources）。"""
+
+    paths = getattr(config, "paths", None)
+    configured = getattr(paths, "sources", None) if paths is not None else None
+    if configured is not None:
+        return Path(configured)
+    data_dir = getattr(paths, "data", Path("data"))
+    return Path(data_dir) / "sources"
+
+
+def _probe_cached_source(path: Path, *, timeout_s: float) -> bool:
+    """缓存文件是否可 probe 且有视频轨与有效时长。"""
+
+    try:
+        from .media import MediaError, probe_media
+    except ImportError:  # pragma: no cover - 防御性分支
+        return False
+    try:
+        info = probe_media(path, timeout_s=timeout_s)
+    except MediaError:
+        return False
+    return info.has_video and info.duration_s > 0
+
+
+def _find_cached_source(
+    cache_dir: Path, bvid: str, part: int, *, timeout_s: float
+) -> Path | None:
+    """在 data/sources/<bvid>/ 下找可 probe 的 <bvid>_p<part>.* 文件。"""
+
+    if not cache_dir.is_dir():
+        return None
+    candidates = sorted(
+        path
+        for path in cache_dir.glob(f"{bvid}_p{part}.*")
+        if path.is_file()
+        and path.suffix.lower() not in _INCOMPLETE_SUFFIXES
+    )
+    for candidate in candidates:
+        if _probe_cached_source(candidate, timeout_s=timeout_s):
+            return candidate
+        LOGGER.warning("源缓存文件不可 probe，忽略: %s", candidate)
+    return None
+
+
+def _cleanup_staging(staging: Path, bvid: str, part: int) -> None:
+    """清理本次下载在暂存目录留下的半成品/临时文件（不动持久缓存）。"""
+
+    if not staging.is_dir():
+        return
+    for path in staging.glob(f"{bvid}_p{part}.*"):
+        if path.is_file():
+            with contextlib.suppress(OSError):
+                path.unlink()
+
+
+def _move_into_cache(source: Path, target: Path) -> Path:
+    """把下载结果原子移动到缓存路径（跨盘时先复制到同目录临时文件再 replace）。"""
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        try:
+            os.replace(source, target)
+        except OSError:
+            shutil.copy2(source, temporary)
+            os.replace(temporary, target)
+            with contextlib.suppress(OSError):
+                source.unlink()
+        return target
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+
+
+def _default_source_downloader(
+    bvid: str, *, part: int, out_dir: Path, download: DownloadConfig
+) -> Path:
+    return download_bilibili(bvid, part=part, out_dir=out_dir, download=download)
+
+
+def resolve_bilibili_source(
+    config: Any,
+    client: Any,
+    bvid: str,
+    part: int,
+    temp_dir: Path,
+    download: DownloadConfig,
+    *,
+    timeout_s: float = 600.0,
+    downloader: Callable[..., Path] | None = None,
+) -> Path:
+    """获取一部 Bilibili 作品的源视频路径（持久缓存优先，每部只下载一次）。
+
+    契约（与 PE-AV 流水线共享）：
+
+    1. 先查 config.paths.sources/<bvid>/<bvid>_p<part>.*，只有能 ffprobe 出
+       视频轨与有效时长的文件才复用；
+    2. 没有可复用缓存时，把视频下载到 temp_dir/download（暂存），成功后
+       原子移动到 config.paths.sources/<bvid>/；缓存永不删除；
+    3. 下载失败清理暂存半成品并抛 DownloadError，不破坏已有缓存；
+    4. client 预留给调用方做元数据校验/未来扩展，可为 None；测试可用
+       downloader 注入假下载函数（签名同 download_bilibili）。
+    """
+
+    clean = str(bvid or "").strip()
+    if not is_valid_bvid(clean):
+        raise DownloadError(f"BV 号格式非法: {bvid!r}")
+    if int(part) < 1:
+        raise DownloadError(f"分P必须 >= 1: {part}")
+    timeout = float(timeout_s)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise DownloadError(f"源缓存 probe 超时非法: {timeout_s!r}")
+
+    sources_root = _sources_root_for(config)
+    cache_dir = sources_root / clean
+    cached = _find_cached_source(cache_dir, clean, int(part), timeout_s=timeout)
+    if cached is not None:
+        LOGGER.info("复用 Bilibili 源视频缓存: %s", cached)
+        return cached
+
+    staging_root = Path(temp_dir) / "download"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    active_downloader = downloader if downloader is not None else _default_source_downloader
+    try:
+        downloaded = Path(
+            active_downloader(
+                clean, part=int(part), out_dir=staging_root, download=download
+            )
+        )
+        if not downloaded.is_file() or downloaded.stat().st_size <= 0:
+            raise DownloadError(f"下载后找不到有效视频文件: bvid={clean}, part={part}")
+        suffix = downloaded.suffix.lower()
+        if not suffix or suffix in _INCOMPLETE_SUFFIXES:
+            suffix = ".mp4"
+        cache_path = _move_into_cache(
+            downloaded, cache_dir / f"{clean}_p{int(part)}{suffix}"
+        )
+        LOGGER.info("Bilibili 源视频已写入持久缓存: %s", cache_path)
+        return cache_path
+    except NebulaError:
+        _cleanup_staging(staging_root, clean, int(part))
+        raise
+    except OSError as exc:
+        _cleanup_staging(staging_root, clean, int(part))
+        raise DownloadError(
+            f"源视频缓存写入失败: bvid={clean}, part={part}: {exc}"
+        ) from exc
+    except Exception:
+        _cleanup_staging(staging_root, clean, int(part))
+        raise

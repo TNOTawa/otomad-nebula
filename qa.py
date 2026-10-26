@@ -4,7 +4,7 @@
 
 1. ruff 静态检查：nebula/、tests/、项目根目录与 tools/ 下的 Python 脚本；
 2. pytest：tests/ 全量测试，默认排除 model / network 标记；
-3. 文档检查：README.md、ARCHITECTURE.md 存在且包含 v0.2.x / v0.4 / v0.4.3 关键内容；
+3. 文档检查：README.md、ARCHITECTURE.md 存在且包含 v0.2.x / v0.4 / v0.4.3 / v0.4.3.1 / v0.4.4 关键内容；
    docs/adr/ 至少 10 篇（含 0005 身份关联 / 0006 筛选地图 / 0007 高维近邻密度 / 0008 音画错位实验 /
    0009 近邻解释 / 0010 全片序列与表征）并包含
    Decision / Why / Options / Chosen / Consequences / How verified 章节；
@@ -12,9 +12,11 @@
    ingest.py link-local）、tools/clip_stability.py、tools/desync_experiment.py、
    tools/preflight_works.py、tools/build_representation.py、tools/compare_spaces.py、
    tools/events_probe.py、tools/visual_pipeline.py、tools/dense_preprocess_compare.py、
-   tools/embedding_diagnostics.py 的 --help 均能成功运行；
+   tools/embedding_diagnostics.py、tools/build_visual_windows.py、tools/build_consensus_graph.py
+   的 --help 均能成功运行；
 5. 配置有效性：config.yaml 可加载；可据此生成并加载一份临时隔离配置；ffmpeg/ffprobe 可用；
-   v0.4 配置段（sampling/events/temporal 与 representations 目录）与 v0.4.3 visual_dense 段有效。
+   v0.4 配置段（sampling/events/temporal 与 representations 目录）与 v0.4.3/v0.4.3.1
+   （visual_dense、weight_scheme、visual_window_plan、visual_windows/sources 路径）段有效。
 
 --full 额外运行带 model / network 标记的测试（需要 PE-AV 权重和网络；
        会为子进程设置 NEBULA_MODEL_TESTS=1 / NEBULA_NETWORK_TESTS=1）。
@@ -63,6 +65,8 @@ CLI_CHECKS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("tools/visual_pipeline.py", ()),
     ("tools/dense_preprocess_compare.py", ()),
     ("tools/embedding_diagnostics.py", ()),
+    ("tools/build_visual_windows.py", ()),
+    ("tools/build_consensus_graph.py", ()),
 )
 """必须能以 --help 成功运行的 CLI 入口（脚本, 子命令参数）。"""
 
@@ -87,6 +91,13 @@ V02_DOC_KEYWORDS: dict[str, tuple[str, ...]] = {
         "visual_dense",
         "密集视觉",
         "letterbox",
+        "v0.4.3.1",
+        "v0.4.4",
+        "visual_windows",
+        "window_plan",
+        "sources",
+        "consensus",
+        "coverage",
     ),
     "ARCHITECTURE.md": (
         "work_links",
@@ -108,6 +119,15 @@ V02_DOC_KEYWORDS: dict[str, tuple[str, ...]] = {
         "visual_dense",
         "dense_visual",
         "source_kind",
+        "v0.4.3.1",
+        "v0.4.4",
+        "visual_window_plans",
+        "visual_window_sequences",
+        "visual_windows",
+        "window_plan",
+        "sources",
+        "weight_scheme",
+        "consensus",
     ),
 }
 """v0.2.x / v0.4 文档必须覆盖的关键内容（存在性检查，不校验具体措辞）。"""
@@ -344,7 +364,10 @@ def check_docs(*, verbose: bool = False) -> CheckResult:
         print(f"  ADR 文件: {[path.name for path in adr_files]}")
     if problems:
         return CheckResult("docs", False, "；".join(problems), duration)
-    detail = f"README/ARCHITECTURE 含 v0.2.x/v0.4/v0.4.3 内容，ADR {len(adr_files)} 篇且章节完整"
+    detail = (
+        f"README/ARCHITECTURE 含 v0.2.x/v0.4/v0.4.3/v0.4.3.1/v0.4.4 内容，"
+        f"ADR {len(adr_files)} 篇且章节完整"
+    )
     return CheckResult("docs", True, detail, duration)
 
 
@@ -386,7 +409,8 @@ def check_cli(*, verbose: bool = False) -> CheckResult:
         "tools/desync_experiment.py、tools/preflight_works.py、"
         "tools/build_representation.py、tools/compare_spaces.py、tools/events_probe.py、"
         "tools/visual_pipeline.py、tools/dense_preprocess_compare.py、"
-        "tools/embedding_diagnostics.py）"
+        "tools/embedding_diagnostics.py、tools/build_visual_windows.py、"
+        "tools/build_consensus_graph.py）"
     )
     return CheckResult("cli", True, detail, duration)
 
@@ -437,8 +461,29 @@ def check_config(*, verbose: bool = False) -> CheckResult:
             problems.append(f"visual_dense.encoders[{position}].revision 为空（必须固定 revision）")
     if not cfg.paths.visual_dense.is_dir():
         problems.append(f"visual_dense 目录不存在: {cfg.paths.visual_dense}")
+    if visual.weight_scheme not in ("coverage-v1", "equal"):
+        problems.append(f"visual_dense.weight_scheme 非法: {visual.weight_scheme!r}")
+    window_plan = cfg.visual_window_plan_version
+    if not window_plan:
+        problems.append("visual_window_plan_version 为空")
+    elif visual.weight_scheme not in window_plan:
+        problems.append(
+            f"visual_window_plan_version 未包含权重方案 {visual.weight_scheme!r}: {window_plan!r}"
+        )
     if not str(cfg.paths.visual_dense).startswith(str(cfg.paths.data)):
         problems.append("visual_dense 目录不在 data 目录内")
+    for label, path in (
+        ("visual_windows", cfg.paths.visual_windows),
+        ("sources", cfg.paths.sources),
+    ):
+        if not str(path).startswith(str(cfg.paths.data)):
+            problems.append(f"{label} 目录不在 data 目录内: {path}")
+        if str(path).startswith(str(cfg.paths.temp)):
+            problems.append(f"{label} 目录不能位于 temp 下: {path}")
+    if not cfg.paths.visual_windows.is_dir():
+        problems.append(f"visual_windows 目录不存在: {cfg.paths.visual_windows}")
+    if not cfg.paths.sources.is_dir():
+        problems.append(f"sources 目录不存在: {cfg.paths.sources}")
     if cfg.legacy_embedding_version == cfg.full_sequence_version:
         problems.append("legacy 与 full 的序列版本号不应相同")
     if not str(cfg.paths.db_path).startswith(str(cfg.paths.data)):

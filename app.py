@@ -18,6 +18,7 @@ tests/test_app.py 通过该变量注入临时数据库。
 
 from __future__ import annotations
 
+import contextlib
 import html
 import os
 from collections.abc import Mapping, Sequence
@@ -37,14 +38,20 @@ from nebula.appdata import (
     available_color_fields,
     clip_heatmap_data,
     clip_pair_rows,
+    consensus_edges_for_visible,
+    consensus_neighbors,
+    diagnostics_artifacts,
     external_url,
     filter_frame,
     hub_rows,
     load_event_timeline,
     load_nebula_frame,
+    load_neighbor_consensus,
     load_representation_options,
     map_matches_representation,
+    mutual_neighbor_edges,
     neighbor_rows,
+    pick_mutual_edge_kind,
     search_frame,
 )
 from nebula.config import Config, load_config
@@ -67,6 +74,10 @@ _HEIGHT_2D = 680
 _HEIGHT_3D = 720
 _HEIGHT_CLIP_HEATMAP = 520
 _NEIGHBOR_K = 5
+_MUTUAL_EDGE_COLOR = "rgba(126, 200, 227, 0.50)"
+_CONSENSUS_EDGE_COLOR = "rgba(144, 190, 109, 0.60)"
+_MUTUAL_TRACE_NAME = "高维互为近邻"
+_CONSENSUS_TRACE_NAME = "跨模型共识边"
 
 _PROJECTION_LABELS = {"2d": "2D（平面）", "3d": "3D（三维）"}
 _SOURCE_LABELS = {"all": "全部", "local": "本地", "bilibili": "Bilibili"}
@@ -145,6 +156,12 @@ def _load_timeline_cached(
         return load_event_timeline(cat, cfg, sequence_version, work_id)
     finally:
         cat.close()
+
+
+@st.cache_data(show_spinner=False)
+def _load_consensus_cached(config_path: str) -> dict[str, Any] | None:
+    cfg = load_config(config_path)
+    return load_neighbor_consensus(cfg)
 
 
 @st.cache_resource(show_spinner="正在加载高维近邻索引…")
@@ -272,6 +289,10 @@ def _lookup_row(frame: pd.DataFrame, work_id: int) -> pd.Series | None:
     return matches.iloc[0]
 
 
+def _edge_work_id(edge: Mapping[str, Any], key: str) -> int:
+    return int(edge[key])
+
+
 # --------------------------------------------------------------------------- 图表
 def _build_figure(
     view: pd.DataFrame,
@@ -285,11 +306,15 @@ def _build_figure(
     selected_work_id: int | None = None,
     neighbor_ids: Sequence[int] = (),
     show_lines: bool = False,
+    mutual_edges: Sequence[Mapping[str, Any]] = (),
+    mutual_trace_name: str = _MUTUAL_TRACE_NAME,
+    mutual_line_color: str = _MUTUAL_EDGE_COLOR,
 ) -> go.Figure:
     """按投影方式构造 Plotly 散点图。
 
     除染色主 trace 外，选中作品与 Top5 近邻会用单独 trace 高亮；
-    2D/3D 是否画连线由 show_lines 控制（3D 默认关）。
+    2D/3D 是否画连线由 show_lines 控制（3D 默认关）；
+    mutual_edges 为可见作品间的高维互邻/共识边，叠加为单条 line trace。
     """
 
     is_3d = projection == "3d"
@@ -361,8 +386,37 @@ def _build_figure(
         else:
             traces.append(go.Scatter(x=xs[missing], y=ys[missing], **common))
 
-    # ---------------------------------------------------------------- 近邻高亮
     positions = {int(work_id): index for index, work_id in enumerate(view["work_id"].tolist())}
+
+    # ---------------------------------------------------------------- 互邻/共识边
+    if mutual_edges:
+        edge_x: list[float | None] = []
+        edge_y: list[float | None] = []
+        edge_z: list[float | None] = []
+        for edge in mutual_edges:
+            first = positions.get(_edge_work_id(edge, "a_work_id"))
+            second = positions.get(_edge_work_id(edge, "b_work_id"))
+            if first is None or second is None:
+                continue
+            edge_x.extend([xs[first], xs[second], None])
+            edge_y.extend([ys[first], ys[second], None])
+            if is_3d:
+                edge_z.extend([zs[first], zs[second], None])  # type: ignore[index]
+        if edge_x:
+            line_common: dict[str, Any] = {
+                "mode": "lines",
+                "line": {"color": mutual_line_color, "width": 1.0},
+                "hoverinfo": "skip",
+                "name": mutual_trace_name,
+            }
+            if is_3d:
+                traces.append(
+                    go.Scatter3d(x=edge_x, y=edge_y, z=edge_z, **line_common)
+                )
+            else:
+                traces.append(go.Scatter(x=edge_x, y=edge_y, **line_common))
+
+    # ---------------------------------------------------------------- 近邻高亮
     selected_position = None
     if selected_work_id is not None:
         selected_position = positions.get(int(selected_work_id))
@@ -535,6 +589,44 @@ def _selected_highlight_ids(
     except NebulaError:
         return []
 
+
+
+# --------------------------------------------------------------------------- 共识摘要
+def _render_consensus_summary(
+    consensus: Mapping[str, Any] | None,
+    frame: pd.DataFrame,
+    work_id: int,
+) -> None:
+    """详情面板展示当前作品的跨空间/跨模型共识近邻摘要（有 consensus JSON 时）。"""
+
+    if consensus is None:
+        return
+    rows = consensus_neighbors(consensus, work_id, min_count=2, limit=5)
+    with st.expander("跨空间 / 跨模型共识近邻", expanded=False):
+        if not rows:
+            st.caption(
+                "当前作品在共识图（logs/neighbor_consensus.json）中"
+                "没有 >=2 个空间的近邻边。"
+            )
+            return
+        by_id = frame.set_index("work_id")
+        lines: list[str] = []
+        for rank, row in enumerate(rows, start=1):
+            neighbor_id = int(row["work_id"])
+            if neighbor_id in by_id.index:
+                title = _work_label(by_id.loc[neighbor_id])
+            else:
+                title = f"作品 {neighbor_id}"
+            spaces = "、".join(str(name) for name in row["spaces"]) or "未标注空间"
+            lines.append(
+                f"{rank}. {_safe(title)} · 共识 {int(row['consensus_count'])} 个空间"
+                f"（{_safe(spaces)}）"
+            )
+        st.markdown(chr(10).join(lines))
+        st.caption(
+            "来自 logs/neighbor_consensus.json；仅作跨空间/跨模型一致性参考，"
+            "不改变星云坐标。"
+        )
 
 # --------------------------------------------------------------------------- 详情
 def _render_detail(row: pd.Series, cfg: Config) -> None:
@@ -932,6 +1024,144 @@ def _on_neighbor_jump(selectbox_key: str) -> None:
         st.session_state["pending_work_id"] = int(value)
 
 
+
+# --------------------------------------------------------------------------- 邻域连线 / 诊断
+def _render_sidebar_neighbor_edges(
+    visible_work_ids: Sequence[int],
+    index: SimilarityIndex | None,
+    consensus: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """侧栏“高维邻域连线”开关：互为 Top-k 或跨模型共识边。
+
+    返回 {edges,trace_name,line_color,truncated,n_total}；默认关闭时为空边。
+    """
+
+    overlay: dict[str, Any] = {
+        "edges": [],
+        "trace_name": _MUTUAL_TRACE_NAME,
+        "line_color": _MUTUAL_EDGE_COLOR,
+        "truncated": False,
+        "n_total": 0,
+    }
+    with st.sidebar:
+        st.subheader("高维邻域连线")
+        enabled = st.checkbox(
+            "显示高维互为近邻连线",
+            value=False,
+            key="show_mutual_edges",
+            help=(
+                "按当前表征空间的高维余弦计算可见作品间的互为 Top-k 近邻，"
+                "只画双向边；边数上限 300，超出会提示截断。"
+            ),
+        )
+        if not enabled:
+            return overlay
+        if index is None:
+            st.caption("高维近邻不可用，无法计算互为近邻连线。")
+            return overlay
+        kind = pick_mutual_edge_kind(index)
+        if kind is None:
+            st.caption("当前作品没有可用的高维模态向量，无法计算连线。")
+            return overlay
+        k = int(
+            st.selectbox(
+                "互为近邻 k",
+                options=(3, 5, 10),
+                index=1,
+                key="mutual_edges_k",
+            )
+        )
+        only_consensus = False
+        min_count = 2
+        if consensus is None:
+            st.caption(
+                "未找到跨模型共识边文件（logs/neighbor_consensus.json）；"
+                "当前仅显示普通互为近邻连线。"
+            )
+        else:
+            only_consensus = st.checkbox(
+                "仅显示跨模型共识边",
+                value=False,
+                key="show_consensus_only",
+                help="使用 logs/neighbor_consensus.json 的 consensus_count 过滤边",
+            )
+            if only_consensus:
+                min_count = int(
+                    st.selectbox(
+                        "共识强度阈值",
+                        options=(2, 3),
+                        index=0,
+                        key="consensus_min_count",
+                        format_func=lambda value: f">= {value} 个空间",
+                    )
+                )
+        visible = [int(work_id) for work_id in visible_work_ids]
+        if only_consensus and consensus is not None:
+            info = consensus_edges_for_visible(
+                consensus, visible, min_count=min_count
+            )
+            overlay = {
+                "edges": info["edges"],
+                "trace_name": _CONSENSUS_TRACE_NAME,
+                "line_color": _CONSENSUS_EDGE_COLOR,
+                "truncated": bool(info["truncated"]),
+                "n_total": int(info["n_total"]),
+            }
+            summary = (
+                f"跨模型共识边 {len(info['edges'])} 条"
+                f"（阈值 >= {min_count} 个空间）"
+            )
+        else:
+            info = mutual_neighbor_edges(index, visible, kind=kind, k=k)
+            overlay = {
+                "edges": info["edges"],
+                "trace_name": _MUTUAL_TRACE_NAME,
+                "line_color": _MUTUAL_EDGE_COLOR,
+                "truncated": bool(info["truncated"]),
+                "n_total": int(info["n_total"]),
+            }
+            summary = (
+                f"高维互为近邻边 {len(info['edges'])} 条"
+                f"（k={k}，模态 {KIND_LABELS.get(kind, kind)}）"
+            )
+        if info["truncated"]:
+            st.caption(
+                f"边数过多：共 {info['n_total']} 条，仅显示前 {info['max_edges']} 条"
+                f"（可缩小搜索/筛选范围或调整 k）。"
+            )
+            summary += "（已截断）"
+        st.caption(summary)
+    return overlay
+
+
+def _render_sidebar_diagnostics(cfg: Config) -> None:
+    """侧栏低维投影诊断说明：PCA 3D 辅助观察，不新增地图、不改默认 UMAP。"""
+
+    artifacts = diagnostics_artifacts(cfg)
+    with st.sidebar, st.expander("低维投影诊断（PCA 辅助观察）", expanded=False):
+        st.caption(
+            "星云默认仍使用 UMAP；这里只提供 PCA/UMAP 邻域保持率诊断产物路径，"
+            "用于辅助判断高维近邻是否被低维投影扭曲（不新增地图）。"
+        )
+        if not artifacts["available"]:
+            st.caption(
+                "未找到诊断产物；可运行 tools/embedding_diagnostics.py "
+                "生成 logs/dim_diagnostics_v2_html。"
+            )
+            return
+        if artifacts["html_dir"]:
+            st.caption("诊断 HTML 目录（可在本地文件管理器/浏览器打开）：")
+            st.code(str(artifacts["html_dir"]), language="text")
+            with contextlib.suppress(ValueError):
+                st.markdown(
+                    f"[在本地打开诊断 HTML 目录]({Path(str(artifacts['html_dir'])).as_uri()})"
+                )
+        if artifacts["json"]:
+            st.caption("诊断 JSON / CSV：")
+            st.code(str(artifacts["json"]), language="text")
+            if artifacts["csv"]:
+                st.code(str(artifacts["csv"]), language="text")
+
 # --------------------------------------------------------------------------- 侧栏
 def _render_sidebar_map_settings(
     spaces: list[dict[str, Any]],
@@ -962,8 +1192,8 @@ def _render_sidebar_map_settings(
             format_func=lambda index: spaces[index]["label"],
             key="representation_space",
             help=(
-                "Legacy / Full Mean / Temporal Stats / Dense Visual（CLIP、DINOv2）"
-                "等表征空间；不同空间的坐标不可直接比较"
+                "Legacy / Full Mean / Temporal Stats / Dense Visual"
+                "（CLIP、DINOv2，v1/v2）等表征空间；不同空间的坐标不可直接比较"
             ),
         )
         selected_space = spaces[int(space_index)]
@@ -1227,12 +1457,14 @@ def main() -> None:
             f"高维近邻已就绪：{len(index.work_ids)} 部作品，"
             f"模态 {', '.join(KIND_LABELS[kind] for kind in index.available_kinds)}"
         )
+    consensus = _load_consensus_cached(config_path)
 
     color_field, query, point_size, opacity = _render_sidebar_display_settings(
         frame, cfg, has_similarity=index is not None
     )
     if similarity_state.error:
         st.sidebar.caption(f"高维近邻不可用：{similarity_state.error}")
+    _render_sidebar_diagnostics(cfg)
     source, selected_lists, selected_years = _render_sidebar_filters(frame, map_info)
 
     try:
@@ -1262,6 +1494,9 @@ def main() -> None:
         return
 
     selected_id, show_lines = _render_sidebar_selection(view, projection)
+    edge_overlay = _render_sidebar_neighbor_edges(
+        view["work_id"].tolist(), index, consensus
+    )
     neighbor_ids = _selected_highlight_ids(index, selected_id)
     positions = view.index.to_numpy()
     view_values = [spec.values[int(position)] for position in positions]
@@ -1279,6 +1514,9 @@ def main() -> None:
         selected_work_id=selected_id,
         neighbor_ids=neighbor_ids,
         show_lines=show_lines,
+        mutual_edges=edge_overlay["edges"],
+        mutual_trace_name=str(edge_overlay["trace_name"]),
+        mutual_line_color=str(edge_overlay["line_color"]),
     )
     event = st.plotly_chart(
         figure,
@@ -1305,6 +1543,7 @@ def main() -> None:
     if selected_row is not None and selected_id is not None:
         st.divider()
         _render_detail(selected_row, cfg)
+        _render_consensus_summary(consensus, frame, selected_id)
         _render_timeline_panel(config_path, map_info, selected_id)
         _render_neighbor_panel(frame, view, index, selected_id, similarity_state.error)
 

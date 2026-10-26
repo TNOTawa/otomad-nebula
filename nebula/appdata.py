@@ -47,6 +47,18 @@ COLOR_FIELDS: list[tuple[str, str]] = [
 _CONTINUOUS_FIELDS = frozenset({"duration_s", "publish_date", "rank", "votes"})
 _NEIGHBOR_DENSITY_FIELD = "density_knn"
 _NEIGHBOR_DENSITY_K = 5
+
+#: 高维互为近邻连线默认参数（v0.4.4 界面叠加，不改变地图坐标语义）
+DEFAULT_MUTUAL_EDGE_LIMIT = 300
+DEFAULT_MUTUAL_K = 5
+MUTUAL_EDGE_DEFAULT_KIND = "work_joint"
+_MUTUAL_EDGE_KIND_ORDER: tuple[str, ...] = ("work_joint", "work_audio", "work_video")
+
+#: 跨模型共识边产物（t5 build_consensus_graph）与低维诊断产物文件名
+CONSENSUS_FILE_NAME = "neighbor_consensus.json"
+DIAGNOSTICS_HTML_DIR_NAME = "dim_diagnostics_v2_html"
+DIAGNOSTICS_JSON_NAME = "dim_diagnostics_v2.json"
+DIAGNOSTICS_CSV_NAME = "dim_diagnostics_v2.csv"
 _CATEGORICAL_FIELDS = frozenset({"author_uid", "vote_year", "source"})
 _ALL_FIELD_IDS = frozenset(field_id for field_id, _ in COLOR_FIELDS)
 
@@ -670,7 +682,9 @@ def load_representation_options(
         representations.TEMPORAL_STATS_V1: 2,
         representations.DENSE_VISUAL_CLIP_V1: 3,
         representations.DENSE_VISUAL_DINO_V1: 4,
-        representations.TRANSFORMER_V1: 5,
+        representations.DENSE_VISUAL_CLIP_V2: 5,
+        representations.DENSE_VISUAL_DINO_V2: 6,
+        representations.TRANSFORMER_V1: 7,
     }
     options.sort(
         key=lambda option: (
@@ -1500,3 +1514,357 @@ def hover_text(df: pd.DataFrame) -> list[str]:
     if len(df) == 0:
         return []
     return [_hover_one(record) for record in df.to_dict("records")]
+
+
+
+# --------------------------------------------------------------------------- 高维邻域连线（v0.4.4）
+def pick_mutual_edge_kind(index: "SimilarityIndex") -> str | None:
+    """选择用于互邻连线的模态：优先 joint，其次 audio/video。"""
+
+    for kind in _MUTUAL_EDGE_KIND_ORDER:
+        if kind in index.available_kinds:
+            return kind
+    return None
+
+
+def mutual_neighbor_edges(
+    index: "SimilarityIndex",
+    work_ids: Iterable[int],
+    *,
+    kind: str = MUTUAL_EDGE_DEFAULT_KIND,
+    k: int = DEFAULT_MUTUAL_K,
+    max_edges: int | None = None,
+) -> dict[str, Any]:
+    """对可见作品计算“互为 Top-k 高维近邻”边（只保留双向边）。
+
+    返回 {kind,k,edges,n_total,truncated,max_edges,n_visible_works}；
+    edges 每条为 {a_work_id,b_work_id,similarity}，按相似度降序、id 升序稳定排序。
+    边数超过 max_edges（默认 DEFAULT_MUTUAL_EDGE_LIMIT=300）时返回截断信息，
+    由界面提示“仅显示前 N 条”。
+    """
+
+    if int(k) < 1:
+        raise NebulaError(f"互为近邻的 k 必须 >= 1，收到 {k}")
+    visible: list[int] = []
+    seen: set[int] = set()
+    for raw in work_ids:
+        work_id = int(raw)
+        if work_id in seen:
+            continue
+        seen.add(work_id)
+        if index.has_vector(work_id, kind):
+            visible.append(work_id)
+    neighbor_sets: dict[int, set[int]] = {}
+    for work_id in visible:
+        try:
+            neighbors = index.neighbors(work_id, kind=kind, k=int(k))
+        except NebulaError:
+            continue
+        neighbor_sets[work_id] = {int(neighbor.work_id) for neighbor in neighbors}
+
+    edges: list[dict[str, Any]] = []
+    for a_work_id in visible:
+        forward = neighbor_sets.get(a_work_id, set())
+        for b_work_id in forward:
+            if b_work_id <= a_work_id:
+                continue
+            if a_work_id not in neighbor_sets.get(b_work_id, set()):
+                continue
+            try:
+                similarity = float(index.similarity(a_work_id, b_work_id, kind=kind))
+            except NebulaError:  # pragma: no cover - 防御性分支
+                continue
+            edges.append(
+                {
+                    "a_work_id": int(a_work_id),
+                    "b_work_id": int(b_work_id),
+                    "similarity": round(similarity, 6),
+                }
+            )
+    edges.sort(key=lambda edge: (-edge["similarity"], edge["a_work_id"], edge["b_work_id"]))
+    total = len(edges)
+    limit = DEFAULT_MUTUAL_EDGE_LIMIT if max_edges is None else int(max_edges)
+    if limit < 1:
+        raise NebulaError(f"边数上限必须 >= 1，收到 {limit}")
+    return {
+        "kind": kind,
+        "k": int(k),
+        "edges": edges[:limit],
+        "n_total": total,
+        "truncated": total > limit,
+        "max_edges": limit,
+        "n_visible_works": len(visible),
+    }
+
+
+def _coerce_work_id(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _consensus_pair(edge: Mapping[str, Any]) -> tuple[int, int] | None:
+    """从共识边记录里兼容解析作品对（work_pair / pair / a_work_id+b_work_id 等）。"""
+
+    for key in ("work_pair", "pair", "work_ids", "ids"):
+        value = edge.get(key)
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            pair = (_coerce_work_id(value[0]), _coerce_work_id(value[1]))
+            if pair[0] is not None and pair[1] is not None:
+                return pair  # type: ignore[return-value]
+        if isinstance(value, str):
+            pieces = value.replace("-", ":").replace(",", ":").split(":")
+            if len(pieces) == 2:
+                pair = (_coerce_work_id(pieces[0]), _coerce_work_id(pieces[1]))
+                if pair[0] is not None and pair[1] is not None:
+                    return pair  # type: ignore[return-value]
+    for first_key, second_key in (
+        ("a_work_id", "b_work_id"),
+        ("work_a", "work_b"),
+        ("work_id_a", "work_id_b"),
+        ("a", "b"),
+    ):
+        pair = (
+            _coerce_work_id(edge.get(first_key)),
+            _coerce_work_id(edge.get(second_key)),
+        )
+        if pair[0] is not None and pair[1] is not None:
+            return pair  # type: ignore[return-value]
+    return None
+
+
+def _consensus_spaces(edge: Mapping[str, Any]) -> tuple[str, ...]:
+    """共识边涉及的空间名（兼容 t5 工具 mutual_spaces 列表与 spaces 映射）。"""
+
+    for key in (
+        "mutual_spaces",
+        "spaces",
+        "representations",
+        "space_names",
+        "models",
+        "model_names",
+    ):
+        value = edge.get(key)
+        if isinstance(value, (Mapping, list, tuple)):
+            names = tuple(str(name) for name in value if str(name or "").strip())
+            if names:
+                return names
+    return ()
+
+
+def _consensus_count(edge: Mapping[str, Any]) -> int:
+    for key in ("consensus_count", "count", "support", "n_spaces", "n_models", "votes"):
+        value = edge.get(key)
+        if isinstance(value, bool) or value is None:
+            continue
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        if count >= 1:
+            return count
+    spaces = _consensus_spaces(edge)
+    if spaces:
+        return len(spaces)
+    # 单条边至少代表 1 个空间的共识
+    return 1
+
+
+def load_neighbor_consensus(config: Config) -> dict[str, Any] | None:
+    """读取 logs/neighbor_consensus.json（t5 跨模型共识图产物）。
+
+    文件不存在/不可解析时返回 None（界面提示并回退普通互为近邻）。
+    兼容多种字段命名：edges 列表或 pairs 映射、work_pair/a_work_id+b_work_id、
+    consensus_count/count/len(spaces)。返回规范化后的
+    {path,edges,pairs,n_edges,meta}；edges 按共识强度降序。
+    """
+
+    path = Path(config.paths.logs) / CONSENSUS_FILE_NAME
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("读取跨模型共识边失败 %s: %s", path, exc)
+        return None
+
+    records: list[Mapping[str, Any]] = []
+    pairs_mapping: Mapping[str, Any] | None = None
+    if isinstance(raw, list):
+        records = [item for item in raw if isinstance(item, Mapping)]
+    elif isinstance(raw, Mapping):
+        edges_value = raw.get("edges")
+        if isinstance(edges_value, list):
+            records = [item for item in edges_value if isinstance(item, Mapping)]
+        pairs_value = raw.get("pairs")
+        if isinstance(pairs_value, Mapping):
+            pairs_mapping = pairs_value
+        elif isinstance(raw.get("edge_pairs"), list):
+            records = records + [
+                item for item in raw["edge_pairs"] if isinstance(item, Mapping)
+            ]
+    else:
+        return None
+
+    pairs: dict[tuple[int, int], dict[str, Any]] = {}
+    for record in records:
+        pair = _consensus_pair(record)
+        if pair is None:
+            continue
+        a_work_id, b_work_id = sorted(pair)
+        if a_work_id == b_work_id:
+            continue
+        spaces = _consensus_spaces(record)
+        count = _consensus_count(record)
+        key = (a_work_id, b_work_id)
+        existing = pairs.get(key)
+        if existing is None:
+            pairs[key] = {
+                "a_work_id": a_work_id,
+                "b_work_id": b_work_id,
+                "consensus_count": int(count),
+                "spaces": spaces,
+            }
+        else:
+            existing["consensus_count"] = max(int(existing["consensus_count"]), int(count))
+            existing["spaces"] = tuple(dict.fromkeys(existing["spaces"] + spaces))
+
+    if pairs_mapping is not None:
+        for key_text, value in pairs_mapping.items():
+            pair = _consensus_pair({"pair": key_text})
+            if pair is None:
+                continue
+            a_work_id, b_work_id = sorted(pair)
+            if a_work_id == b_work_id:
+                continue
+            if isinstance(value, Mapping):
+                count = _consensus_count(value)
+                spaces = _consensus_spaces(value)
+            else:
+                count = _consensus_count({"count": value})
+                spaces = ()
+            key = (a_work_id, b_work_id)
+            if key not in pairs:
+                pairs[key] = {
+                    "a_work_id": a_work_id,
+                    "b_work_id": b_work_id,
+                    "consensus_count": int(count),
+                    "spaces": spaces,
+                }
+            else:
+                pairs[key]["consensus_count"] = max(
+                    int(pairs[key]["consensus_count"]), int(count)
+                )
+                pairs[key]["spaces"] = tuple(
+                    dict.fromkeys(pairs[key]["spaces"] + spaces)
+                )
+
+    edges = sorted(
+        pairs.values(),
+        key=lambda edge: (
+            -int(edge["consensus_count"]),
+            edge["a_work_id"],
+            edge["b_work_id"],
+        ),
+    )
+    meta = raw.get("meta") if isinstance(raw, Mapping) else None
+    return {
+        "path": str(path),
+        "edges": edges,
+        "pairs": pairs,
+        "n_edges": len(edges),
+        "meta": meta,
+    }
+
+
+def consensus_edges_for_visible(
+    consensus: Mapping[str, Any],
+    work_ids: Iterable[int],
+    *,
+    min_count: int = 2,
+    max_edges: int | None = None,
+) -> dict[str, Any]:
+    """按可见作品与共识强度过滤共识边（>= min_count，默认 2 个空间）。"""
+
+    if int(min_count) < 1:
+        raise NebulaError(f"共识强度阈值必须 >= 1，收到 {min_count}")
+    visible = {int(work_id) for work_id in work_ids}
+    selected: list[dict[str, Any]] = []
+    for edge in consensus.get("edges", ()):
+        if int(edge["a_work_id"]) not in visible or int(edge["b_work_id"]) not in visible:
+            continue
+        if int(edge["consensus_count"]) < int(min_count):
+            continue
+        selected.append(
+            {
+                "a_work_id": int(edge["a_work_id"]),
+                "b_work_id": int(edge["b_work_id"]),
+                "consensus_count": int(edge["consensus_count"]),
+                "spaces": tuple(edge.get("spaces") or ()),
+            }
+        )
+    total = len(selected)
+    limit = DEFAULT_MUTUAL_EDGE_LIMIT if max_edges is None else int(max_edges)
+    if limit < 1:
+        raise NebulaError(f"边数上限必须 >= 1，收到 {limit}")
+    return {
+        "min_count": int(min_count),
+        "edges": selected[:limit],
+        "n_total": total,
+        "truncated": total > limit,
+        "max_edges": limit,
+    }
+
+
+def consensus_neighbors(
+    consensus: Mapping[str, Any],
+    work_id: int,
+    *,
+    min_count: int = 2,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """某部作品在共识图里的跨空间近邻摘要行（按共识强度降序）。"""
+
+    target = int(work_id)
+    rows: list[dict[str, Any]] = []
+    for edge in consensus.get("edges", ()):
+        first = int(edge["a_work_id"])
+        second = int(edge["b_work_id"])
+        if first == target:
+            other = second
+        elif second == target:
+            other = first
+        else:
+            continue
+        count = int(edge["consensus_count"])
+        if count < int(min_count):
+            continue
+        rows.append(
+            {
+                "work_id": other,
+                "consensus_count": count,
+                "spaces": tuple(edge.get("spaces") or ()),
+            }
+        )
+    rows.sort(key=lambda row: (-row["consensus_count"], row["work_id"]))
+    return rows[: max(1, int(limit))]
+
+
+def diagnostics_artifacts(config: Config) -> dict[str, Any]:
+    """低维投影诊断产物（PCA/UMAP 邻域保持率）路径，用于界面辅助说明。"""
+
+    logs = Path(config.paths.logs)
+    html_dir = logs / DIAGNOSTICS_HTML_DIR_NAME
+    json_path = logs / DIAGNOSTICS_JSON_NAME
+    csv_path = logs / DIAGNOSTICS_CSV_NAME
+    return {
+        "html_dir": str(html_dir) if html_dir.is_dir() else None,
+        "json": str(json_path) if json_path.is_file() else None,
+        "csv": str(csv_path) if csv_path.is_file() else None,
+        "available": bool(
+            html_dir.is_dir() or json_path.is_file() or csv_path.is_file()
+        ),
+    }

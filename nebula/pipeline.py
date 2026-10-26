@@ -3,7 +3,8 @@
 支持两种采样模式（Pipeline(config, sampling_mode=...) 可覆盖 config.sampling.mode）：
 
 legacy（v0.3，默认）：
-1. 解析来源：本地文件直接使用（永不删除）；Bilibili 作品先取元数据再下载到 temp。
+1. 解析来源：本地文件直接使用（永不删除）；Bilibili 作品优先复用 sources 持久缓存，
+   未命中时先取元数据再下载到 sources（temp 仅作下载暂存）。
 2. ffprobe 读取时长与音视频流信息，按 nebula.sampling.plan_clips 生成均匀片段（<=N 段）。
 3. ffmpeg 截取音画同步片段（无音轨 mp4 + wav），调用 Embedder 得到片段向量。
 4. 逐行归一化 -> 求平均 -> 再归一化得到作品向量，写 data/embeddings 并登记 SQLite。
@@ -19,7 +20,8 @@ full_coverage（v0.4）：
    再删除 .partial 与 temp。失败保留 .partial/temp 供恢复。
 
 两种模式都用“先写文件再登记 DB”；已有当前版本向量的作品直接跳过，换参数生成新版本，
-旧版本文件保留。Bilibili 下载若 temp/work_XXXXXX/download/ 已有可 probe 的源文件则复用。
+旧版本文件保留。Bilibili 源视频持久缓存在 data/sources/<bvid>/<bvid>_p<part>.*
+（优先复用可 probe 的缓存，不删除缓存；temp 只放切片与下载暂存）。
 """
 
 from __future__ import annotations
@@ -51,6 +53,26 @@ from .sampling import ClipPlan, CoverageClip, plan_clips, plan_full_coverage
 from .util import now_utc_iso, slugify
 
 logger = logging.getLogger(__name__)
+
+
+def _load_resolve_bilibili_source() -> Any | None:
+    """延迟导入 t3 的 Bilibili 源缓存 helper；尚未交付时返回 None。
+
+    helper 契约（nebula/download.py）::
+
+        resolve_bilibili_source(config, client, bvid, part, temp_dir, download,
+                                *, timeout_s=600.0, downloader=None) -> Path
+
+    缓存路径 data/sources/<bvid>/<bvid>_p<part>.*：先 probe 复用，下载到 temp
+    暂存后原子移动进 sources，失败清理暂存但不删除已有缓存。
+    """
+
+    try:
+        from .download import resolve_bilibili_source
+    except ImportError:
+        return None
+    return resolve_bilibili_source
+
 
 CLIP_SUFFIX = "__f{frames}_clip{clip_seconds}s_x{clips}_{sr}k"
 FULL_SUFFIX = "__f{frames}_full{clip_seconds}s_ov{overlap}_{sr}k{height}"
@@ -601,7 +623,7 @@ class Pipeline:
         temp_dir: Path,
         timing: dict[str, float],
     ) -> Path:
-        """解析源视频路径（本地直接使用；Bilibili 下载或复用 temp 中已下载文件）。"""
+        """解析源视频路径（本地直接使用；Bilibili 复用/写入 sources 持久缓存）。"""
 
         if work["source"] == "local":
             if not work.get("local_path"):
@@ -1146,29 +1168,37 @@ class Pipeline:
                 logger.warning("无法删除 JSON 临时文件: %s", tmp_path)
 
     def _download_bilibili_work(self, work: dict[str, Any], temp_dir: Path) -> Path:
-        """下载 Bilibili 源视频；崩溃恢复场景下复用 temp 中已可 probe 的文件。"""
+        """获取 Bilibili 源视频：优先复用 sources 持久缓存，否则下载到 sources。
+
+        v0.4.3.1：源文件不再放在 temp（会随作品完成被删除），而是持久缓存在
+        data/sources/<bvid>/<bvid>_p<part>.*。缓存命中时跳过元数据请求与下载；
+        未命中时先更新元数据，再延迟调用 t3 的 resolve_bilibili_source（下载到
+        temp 暂存后原子移入 sources，失败清理暂存但不删已有缓存）。helper 尚未
+        交付时回退到 pipeline 内的同语义实现。
+        """
 
         if not work.get("bvid"):
             raise PipelineError("Bilibili 作品缺少 bvid")
         work_id = int(work["id"])
         self.catalog.begin_attempt(work_id, "downloading")
-        download_dir = temp_dir / "download"
-        reused = self._find_reusable_download(download_dir)
-        if reused is not None:
+        bvid = str(work["bvid"])
+        part = int(work["part"])
+
+        cached = self._find_cached_bilibili_source(bvid, part)
+        if cached is not None:
             logger.info(
-                "work_id=%s 复用 temp 中已下载的源文件，跳过重复下载: %s",
+                "work_id=%s 复用 sources 持久缓存源文件，跳过下载与元数据请求: %s",
                 work_id,
-                reused,
+                cached,
             )
-            return reused
-        from .download import BilibiliClient, download_bilibili
+            return cached
+
+        from .download import BilibiliClient
 
         client = self._bilibili_client
         if client is None:
             client = BilibiliClient(self.config.bilibili)
             self._bilibili_client = client
-        bvid = str(work["bvid"])
-        part = int(work["part"])
         meta = client.fetch_meta(bvid, part=part)
         self.catalog.update_work_metadata(
             work_id,
@@ -1178,26 +1208,36 @@ class Pipeline:
             duration_s=meta.duration_s,
             publish_date=meta.publish_date,
         )
-        download_dir.mkdir(parents=True, exist_ok=True)
-        path = download_bilibili(
-            bvid,
-            part=part,
-            out_dir=download_dir,
-            download=self.config.download,
-        )
-        if not path.is_file():
-            raise PipelineError(f"下载后找不到文件: {path}")
-        return path
 
-    def _find_reusable_download(self, download_dir: Path) -> Path | None:
-        """在 temp/download/ 中查找已存在且可 probe 的源文件（崩溃恢复用）。"""
+        resolve = _load_resolve_bilibili_source()
+        if resolve is not None:
+            path = resolve(
+                self.config, client, bvid, part, temp_dir, self.config.download
+            )
+        else:
+            logger.warning(
+                "nebula.download.resolve_bilibili_source 尚未就绪，"
+                "使用 pipeline 内持久缓存回退（temp 暂存 -> 原子移入 sources）"
+            )
+            path = self._download_bilibili_source_fallback(bvid, part, temp_dir)
+        return self._validate_bilibili_source_path(path, bvid=bvid, part=part)
 
-        if not download_dir.is_dir():
+    def _find_cached_bilibili_source(self, bvid: str, part: int) -> Path | None:
+        """在 sources/<bvid>/ 下查找 bvid/part 匹配且可 probe 的持久缓存文件。"""
+
+        bvid_dir = self.config.paths.sources / bvid
+        if not bvid_dir.is_dir():
             return None
-        for candidate in sorted(download_dir.iterdir()):
+        for candidate in sorted(bvid_dir.glob(f"{bvid}_p{int(part)}.*")):
             if not candidate.is_file():
                 continue
-            if candidate.suffix.lower() in (".part", ".tmp", ".ytdl"):
+            if candidate.suffix.lower() in (
+                ".part",
+                ".tmp",
+                ".ytdl",
+                ".download",
+                ".m4s",
+            ):
                 continue
             try:
                 probe_media(
@@ -1206,9 +1246,58 @@ class Pipeline:
                     timeout_s=self.config.media.probe_timeout_seconds,
                 )
             except MediaError:
+                logger.debug("忽略不可 probe 的 sources 缓存文件: %s", candidate)
                 continue
             return candidate
         return None
+
+    def _validate_bilibili_source_path(
+        self, path: Path, *, bvid: str, part: int
+    ) -> Path:
+        """校验 helper/回退返回的源文件存在且位于 sources 持久目录内。"""
+
+        direct = Path(path)
+        if not direct.is_file():
+            raise PipelineError(f"下载后找不到文件（bvid={bvid}, part={part}）: {direct}")
+        resolved = direct.resolve()
+        sources_root = self.config.paths.sources.resolve()
+        try:
+            resolved.relative_to(sources_root)
+        except ValueError as exc:
+            raise PipelineError(
+                f"Bilibili 源文件必须位于 sources 持久目录: {resolved}（sources={sources_root}）"
+            ) from exc
+        return resolved
+
+    def _download_bilibili_source_fallback(
+        self, bvid: str, part: int, temp_dir: Path
+    ) -> Path:
+        """helper 未就绪时的回退：temp 暂存下载后原子移入 sources/<bvid>/。"""
+
+        from .download import download_bilibili
+
+        staging = temp_dir / "download_staging"
+        target_dir = self.config.paths.sources / bvid
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+            path = download_bilibili(
+                bvid,
+                part=part,
+                out_dir=staging,
+                download=self.config.download,
+            )
+            if not path.is_file():
+                raise PipelineError(f"下载后找不到文件: {path}")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / path.name
+            try:
+                os.replace(path, target)
+            except OSError:
+                shutil.move(str(path), str(target))
+            logger.info("Bilibili 源文件已写入持久缓存: %s", target)
+            return target
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
     # ------------------------------------------------------------------ 向量保存
     def _save_vectors(self, work_dir: Path, batch: Any) -> dict[str, dict[str, Any]]:

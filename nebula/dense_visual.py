@@ -1058,8 +1058,9 @@ class VisualBundle:
 
     windows 为 (T,D) float32 窗口池化向量（与 features.dim 同空间）；
     window_times 为 (T,2) 窗口时间 [start_s, end_s]；window_std 为可选
-    (T,D) 窗口内逐维加权标准差。manifest 为原始 JSON 内容（含版本/编码器/
-    预处理/帧数/窗口数/created_at 等），便于调用方原样登记或审计。
+    (T,D) 窗口内逐维加权标准差；window_weights 为可选 (T,) 窗口覆盖权重
+    （1/覆盖计数积分归一，Σ=1，用于作品向量加权聚合）。manifest 为原始
+    JSON 内容（含版本/编码器/预处理/帧数/窗口数/权重/created_at 等）。
     """
 
     features: DenseVisualFeatures
@@ -1067,6 +1068,7 @@ class VisualBundle:
     window_std: np.ndarray | None = None
     window_times: tuple[tuple[float, float], ...] | None = None
     manifest: dict[str, Any] = field(default_factory=dict)
+    window_weights: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.features, DenseVisualFeatures):
@@ -1099,11 +1101,21 @@ class VisualBundle:
                 if np.any(std < 0.0):
                     raise DenseVisualError("窗口标准差不能为负")
                 object.__setattr__(self, "window_std", std)
+            if self.window_weights is not None:
+                object.__setattr__(
+                    self,
+                    "window_weights",
+                    _normalize_window_weights(
+                        self.window_weights, expected=array.shape[0]
+                    ),
+                )
         else:
             if self.window_std is not None:
                 raise DenseVisualError("提供 window_std 时必须同时提供 windows")
             if self.window_times is not None:
                 raise DenseVisualError("提供 window_times 时必须同时提供 windows")
+            if self.window_weights is not None:
+                raise DenseVisualError("提供 window_weights 时必须同时提供 windows")
 
 
 def _as_float32_matrix(
@@ -1129,6 +1141,27 @@ def _as_float32_matrix(
     if not np.all(np.isfinite(matrix)):
         raise DenseVisualError(f"{what}含 NaN/Inf")
     return np.ascontiguousarray(matrix, dtype=np.float32)
+
+
+def _normalize_window_weights(value: Any, *, expected: int) -> np.ndarray:
+    """校验并规范化窗口覆盖权重（一维、有限、非负、和为 1 的份额且 sum>0）。"""
+
+    if isinstance(value, (str, bytes)):
+        raise DenseVisualError("window_weights 必须是数字序列")
+    array = np.asarray(value, dtype=np.float64)
+    if array.ndim != 1:
+        raise DenseVisualError(f"window_weights 必须是一维数组，收到 {array.shape}")
+    if int(array.shape[0]) != int(expected):
+        raise DenseVisualError(
+            f"window_weights 长度 {array.shape[0]} 与窗口数 {expected} 不一致"
+        )
+    if not np.all(np.isfinite(array)):
+        raise DenseVisualError("window_weights 含 NaN/Inf")
+    if np.any(array < 0.0):
+        raise DenseVisualError("window_weights 不能为负")
+    if float(array.sum()) <= 0.0:
+        raise DenseVisualError("window_weights 之和必须大于 0")
+    return np.ascontiguousarray(array, dtype=np.float64)
 
 
 def _normalize_window_times(
@@ -1195,10 +1228,12 @@ def _manifest_payload(
     windows: np.ndarray | None = None,
     window_std: np.ndarray | None = None,
     window_times: Sequence[tuple[float, float]] | None = None,
+    window_weights: np.ndarray | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """组装 bundle manifest（必需键：version/encoder/revision/fps/size/preprocess/
-    duration/n_frames/dim/n_windows/window_times/created_at）。"""
+    duration/n_frames/dim/n_windows/window_times/created_at；v0.4.3.1 增加
+    window_weights，旧 bundle 无该键时读取为 None）。"""
 
     created_at = features.created_at or now_utc_iso()
     payload: dict[str, Any] = {
@@ -1214,6 +1249,9 @@ def _manifest_payload(
         "n_windows": 0 if windows is None else int(windows.shape[0]),
         "window_times": (
             [] if window_times is None else [[float(start), float(end)] for start, end in window_times]
+        ),
+        "window_weights": (
+            None if window_weights is None else [float(value) for value in window_weights]
         ),
         "created_at": created_at,
         "dtype": "float16",
@@ -1239,6 +1277,7 @@ def save_bundle(
     windows: Any = None,
     window_std: Any = None,
     window_times: Any = None,
+    window_weights: Any = None,
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Path]:
     """原子保存密集视觉 bundle：帧级 npz + 窗口级 npy + manifest。
@@ -1246,11 +1285,14 @@ def save_bundle(
     - dense_visual.npz：per_frame float16 + fps/duration/n_frames/dim/version；
     - windows.npy：窗口级池化向量 (T,D) float32（提供 windows 时）；
     - window_std.npy：窗口内标准差 (T,D) float32（可选）；
-    - manifest.json：版本/编码器/预处理/帧数/窗口数/窗口时间/created_at 等。
+    - manifest.json：版本/编码器/预处理/帧数/窗口数/窗口时间/窗口覆盖权重/
+      created_at 等。
 
-    windows 与 window_times 必须同时提供；window_std 依赖 windows；
-    所有文件先写同目录临时文件再 os.replace，manifest 最后写（完成标志）。
-    返回实际写出的 {"npz": Path, "windows"? , "window_std"?, "manifest": Path}。
+    windows 与 window_times 必须同时提供；window_std/window_weights 依赖 windows。
+    window_weights 若提供，必须是长度 T、有限、非负、sum>0 的覆盖权重（通常来自
+    nebula.sampling.coverage_weights）。所有文件先写同目录临时文件再 os.replace，
+    manifest 最后写（完成标志）。返回实际写出的
+    {"npz": Path, "windows"?, "window_std"?, "manifest": Path}。
     """
 
     data = _validate_features_for_save(features)
@@ -1263,8 +1305,11 @@ def save_bundle(
     windows_array: np.ndarray | None = None
     std_array: np.ndarray | None = None
     times: tuple[tuple[float, float], ...] | None = None
+    weights_array: np.ndarray | None = None
     if window_std is not None and windows is None:
         raise DenseVisualError("提供 window_std 时必须同时提供 windows")
+    if window_weights is not None and windows is None:
+        raise DenseVisualError("提供 window_weights 时必须同时提供 windows")
     if windows is not None:
         if window_times is None:
             raise DenseVisualError("提供 windows 时必须提供 window_times")
@@ -1288,6 +1333,10 @@ def save_bundle(
             )
             if np.any(std_array < 0.0):
                 raise DenseVisualError("窗口标准差不能为负")
+        if window_weights is not None:
+            weights_array = _normalize_window_weights(
+                window_weights, expected=windows_array.shape[0]
+            )
     elif window_times is not None:
         raise DenseVisualError("提供 window_times 时必须同时提供 windows")
 
@@ -1337,6 +1386,7 @@ def save_bundle(
             windows=windows_array,
             window_std=std_array,
             window_times=times,
+            window_weights=weights_array,
             extra=extra_payload,
         ),
         ensure_ascii=False,
@@ -1397,11 +1447,41 @@ def _resolve_manifest_path(target: Path) -> Path:
     return primary
 
 
+def _resolve_bundle_version(manifest: Mapping[str, Any], npz_version: str) -> str:
+    """解析 bundle 版本，兼容 v0.4.3 旧数据的逻辑/slug 两种表示。
+
+    生产 v0.4.3 帧 bundle 中，npz 可能保存逻辑版本
+    "openai/clip-vit-base-patch16@<sha>__fps8_s224_letterbox"，而 manifest
+    （以及 DB/目录）保存 slug 形式 "openai-clip-vit-base-patch16-<sha>..."。
+    二者 slugify 后等价，属于同一版本；v0.4.3.1 起新写 bundle 两者严格一致。
+    兼容时按 manifest 版本返回（与 DB/目录身份一致）；其它不一致仍然报错。
+    """
+
+    raw = manifest.get("version")
+    if not isinstance(raw, str) or not raw.strip():
+        raise DenseVisualError(f"manifest.version 为空或非字符串: {raw!r}")
+    manifest_version = raw.strip()
+    if manifest_version == npz_version:
+        return npz_version
+    if slugify(manifest_version) == slugify(npz_version):
+        logger.warning(
+            "兼容旧版视觉 bundle 版本表示：manifest.version=%r, npz.version=%r"
+            "（仅 slug 等价），按 manifest 版本读取",
+            manifest_version,
+            npz_version,
+        )
+        return manifest_version
+    raise DenseVisualError(
+        f"manifest 与 npz 版本不一致: {manifest_version!r} != {npz_version!r}"
+    )
+
+
 def load_bundle(out_dir: str | Path) -> VisualBundle | None:
     """读取密集视觉 bundle（帧级 + 可选窗口级）。
 
     目录/文件缺失返回 None；结构损坏、manifest 与 npz 不一致、窗口文件缺失或
     形状不符时抛 DenseVisualError。per_frame 以 float32 返回（写入为 float16）。
+    v0.4.3 旧数据的逻辑/slug 版本等价表示会被兼容（见 _resolve_bundle_version）。
     """
 
     target = Path(out_dir)
@@ -1431,10 +1511,12 @@ def load_bundle(out_dir: str | Path) -> VisualBundle | None:
         )
     if not (math.isfinite(fps) and fps > 0 and math.isfinite(duration_s) and duration_s > 0):
         raise DenseVisualError(f"npz 中的 fps/duration 非法: fps={fps} duration={duration_s}")
-    if str(manifest.get("version")) != version:
-        raise DenseVisualError(
-            f"manifest 与 npz 版本不一致: {manifest.get('version')!r} != {version!r}"
-        )
+    try:
+        features_version = _resolve_bundle_version(manifest, version)
+    except DenseVisualError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise DenseVisualError(f"manifest.version 非法: {exc}") from exc
     if int(manifest.get("n_frames", -1)) != n_frames:
         raise DenseVisualError("manifest 与 npz 的 n_frames 不一致")
     if int(manifest.get("dim", -1)) != dim:
@@ -1456,7 +1538,7 @@ def load_bundle(out_dir: str | Path) -> VisualBundle | None:
             duration_s=duration_s,
             n_frames=n_frames,
             dim=dim,
-            version=version,
+            version=features_version,
             decode_s=float(manifest.get("decode_s", 0.0)),
             encode_s=float(manifest.get("encode_s", 0.0)),
             model_load_s=float(manifest.get("model_load_s", 0.0)),
@@ -1482,6 +1564,7 @@ def load_bundle(out_dir: str | Path) -> VisualBundle | None:
     windows_array: np.ndarray | None = None
     std_array: np.ndarray | None = None
     times: tuple[tuple[float, float], ...] | None = None
+    weights_array: np.ndarray | None = None
     files = manifest.get("files") or {}
     if not isinstance(files, Mapping):
         raise DenseVisualError("manifest.files 必须是对象")
@@ -1527,6 +1610,13 @@ def load_bundle(out_dir: str | Path) -> VisualBundle | None:
             )
             if np.any(std_array < 0.0):
                 raise DenseVisualError("窗口标准差不能为负")
+        raw_weights = manifest.get("window_weights")
+        if raw_weights is not None:
+            weights_array = _normalize_window_weights(
+                raw_weights, expected=n_windows
+            )
+    elif manifest.get("window_weights") is not None:
+        raise DenseVisualError("manifest 含 window_weights 但没有窗口向量")
 
     return VisualBundle(
         features=features,
@@ -1534,6 +1624,7 @@ def load_bundle(out_dir: str | Path) -> VisualBundle | None:
         window_std=std_array,
         window_times=times,
         manifest=manifest,
+        window_weights=weights_array,
     )
 
 

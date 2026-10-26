@@ -15,8 +15,10 @@ import numpy as np
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from nebula.appdata import mutual_neighbor_edges
 from nebula.config import Config
 from nebula.db import Catalog
+from nebula.similarity import load_similarity_index
 
 
 # --------------------------------------------------------------------------- 合成数据
@@ -1100,3 +1102,233 @@ def test_app_all_spaces_including_visual(
     assert any("Dense Visual·DINOv2" in caption for caption in captions)
     assert any("视觉版本 visual-dino-v1" in caption for caption in captions)
     assert any("视觉表征空间不含事件时间轴" in caption for caption in captions)
+
+
+
+# --------------------------------------------------------------------------- v0.4.4 邻域连线
+def _seed_three_spaces(
+    catalog: Catalog, config: Config
+) -> tuple[list[int], int]:
+    """Legacy / Full Mean / Dense Visual 三空间 + 各自地图（默认落 Full Mean）。"""
+
+    work_ids = _seed_app_data(catalog, config)  # map_v001 legacy
+    _add_vectors(catalog, config, work_ids)
+    full_rep = _add_derived_representation(
+        catalog, config, work_ids, sequence_version="full-seq-v1", seed=201
+    )
+    _add_map_version(
+        catalog,
+        config,
+        work_ids,
+        "map_v002",
+        representation_id=full_rep,
+        embedding_version="full-seq-v1",
+        note="Full Mean 地图",
+    )
+    visual_rep = _add_visual_representation(
+        catalog,
+        config,
+        work_ids,
+        name="dense_visual_clip_v1",
+        sequence_version="visual-clip-v1",
+        seed=202,
+    )
+    _add_map_version(
+        catalog,
+        config,
+        work_ids,
+        "map_v003",
+        representation_id=visual_rep,
+        embedding_version="visual-clip-v1",
+        note="视觉 CLIP 地图",
+    )
+    return work_ids, full_rep
+
+
+def _expected_mutual_edges(
+    catalog: Catalog, config: Config, rep_id: int, work_ids: list[int], k: int = 5
+) -> list[dict]:
+    index = load_similarity_index(catalog, config, representation_id=rep_id)
+    try:
+        return mutual_neighbor_edges(index, work_ids, k=k)["edges"]
+    finally:
+        index.close()
+
+
+def _chart_trace(spec: dict, name: str) -> dict | None:
+    for trace in spec.get("data", []):
+        if trace.get("name") == name:
+            return trace
+    return None
+
+
+def test_app_mutual_edges_default_off_and_overlay(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids, full_rep = _seed_three_spaces(catalog, config)
+    expected = _expected_mutual_edges(catalog, config, full_rep, work_ids)
+    assert expected, "合成数据应有互为近邻边"
+
+    app_test = _run_app(monkeypatch, repo_root, config)
+    assert not app_test.exception
+    assert app_test.checkbox(key="show_mutual_edges").value is False
+    names = [trace.get("name") for trace in _chart_spec(app_test)["data"]]
+    assert "高维互为近邻" not in names
+    assert len(app_test.get("plotly_chart")) == 1
+
+    app_test.checkbox(key="show_mutual_edges").set_value(True).run()
+    assert not app_test.exception
+    assert app_test.checkbox(key="show_mutual_edges").value is True
+    assert app_test.selectbox(key="mutual_edges_k").value == 5
+    spec = _chart_spec(app_test)
+    trace = _chart_trace(spec, "高维互为近邻")
+    assert trace is not None, [entry.get("name") for entry in spec["data"]]
+    assert trace["mode"] == "lines"
+    assert len(_decode_array(trace["x"])) == 3 * len(expected)
+    assert len(_decode_array(trace["y"])) == 3 * len(expected)
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("高维互为近邻边" in caption for caption in captions)
+    assert any("k=5" in caption for caption in captions)
+    assert len(app_test.get("plotly_chart")) == 1
+
+
+def test_app_mutual_edges_truncation_caption(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids, full_rep = _seed_three_spaces(catalog, config)
+    expected = _expected_mutual_edges(catalog, config, full_rep, work_ids)
+    assert len(expected) > 2
+    monkeypatch.setattr("nebula.appdata.DEFAULT_MUTUAL_EDGE_LIMIT", 2)
+
+    app_test = _run_app(monkeypatch, repo_root, config)
+    app_test.checkbox(key="show_mutual_edges").set_value(True).run()
+    assert not app_test.exception
+    spec = _chart_spec(app_test)
+    trace = _chart_trace(spec, "高维互为近邻")
+    assert trace is not None
+    assert len(_decode_array(trace["x"])) == 2 * 3  # 只画前 2 条边
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("边数过多" in caption for caption in captions)
+    assert any("仅显示前 2 条" in caption for caption in captions)
+    assert any("已截断" in caption for caption in captions)
+
+
+def test_app_mutual_edges_3d(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids, full_rep = _seed_three_spaces(catalog, config)
+    expected = _expected_mutual_edges(catalog, config, full_rep, work_ids)
+
+    app_test = _run_app(monkeypatch, repo_root, config)
+    app_test.radio(key="projection").set_value("3d").run()
+    assert not app_test.exception
+    app_test.checkbox(key="show_mutual_edges").set_value(True).run()
+    assert not app_test.exception
+    spec = _chart_spec(app_test)
+    trace = _chart_trace(spec, "高维互为近邻")
+    assert trace is not None
+    assert trace["type"] == "scatter3d"
+    assert trace["mode"] == "lines"
+    assert len(_decode_array(trace["z"])) == 3 * len(expected)
+    assert len(app_test.get("plotly_chart")) == 1
+    # 3D 原有的选中作品连线开关仍默认关闭且不影响
+    assert app_test.checkbox(key="show_lines_3d").value is False
+
+
+def test_app_mutual_edges_missing_consensus_fallback(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _seed_three_spaces(catalog, config)
+    app_test = _run_app(monkeypatch, repo_root, config)
+    app_test.checkbox(key="show_mutual_edges").set_value(True).run()
+    assert not app_test.exception
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("未找到跨模型共识边文件" in caption for caption in captions)
+    # 文件缺失时没有“仅显示共识边”开关，普通互邻仍绘制
+    assert "show_consensus_only" not in [element.key for element in app_test.checkbox]
+    assert _chart_trace(_chart_spec(app_test), "高维互为近邻") is not None
+
+
+def test_app_consensus_edges_overlay(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids, full_rep = _seed_three_spaces(catalog, config)
+    config.paths.logs.mkdir(parents=True, exist_ok=True)
+    consensus_payload = {
+        "edges": [
+            {
+                "work_pair": [work_ids[0], work_ids[1]],
+                "consensus_count": 3,
+                "spaces": ["full_mean_v1", "dense_visual_clip_v1", "temporal_stats_v1"],
+            },
+            {
+                "work_pair": [work_ids[0], work_ids[2]],
+                "consensus_count": 2,
+                "spaces": ["full_mean_v1", "dense_visual_clip_v1"],
+            },
+            {
+                "work_pair": [work_ids[1], work_ids[2]],
+                "consensus_count": 1,
+                "spaces": ["full_mean_v1"],
+            },
+        ]
+    }
+    (config.paths.logs / "neighbor_consensus.json").write_text(
+        json.dumps(consensus_payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+    app_test = _run_app(monkeypatch, repo_root, config)
+    app_test.checkbox(key="show_mutual_edges").set_value(True).run()
+    assert not app_test.exception
+    assert app_test.checkbox(key="show_consensus_only").value is False
+    app_test.checkbox(key="show_consensus_only").set_value(True).run()
+    assert not app_test.exception
+    assert app_test.selectbox(key="consensus_min_count").value == 2
+    spec = _chart_spec(app_test)
+    assert "高维互为近邻" not in [trace.get("name") for trace in spec["data"]]
+    consensus_trace = _chart_trace(spec, "跨模型共识边")
+    assert consensus_trace is not None
+    assert consensus_trace["mode"] == "lines"
+    assert len(_decode_array(consensus_trace["x"])) == 2 * 3  # 阈值 >=2 共 2 条
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("跨模型共识边 2 条" in caption for caption in captions)
+
+    # 提到 >=3 后只剩 1 条
+    app_test.selectbox(key="consensus_min_count").set_value(3).run()
+    assert not app_test.exception
+    consensus_trace = _chart_trace(_chart_spec(app_test), "跨模型共识边")
+    assert consensus_trace is not None
+    assert len(_decode_array(consensus_trace["x"])) == 1 * 3
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("跨模型共识边 1 条" in caption for caption in captions)
+    # 详情面板的共识摘要（markdown 行）
+    markdowns = [str(element.value) for element in app_test.markdown]
+    assert any("共识 3 个空间" in markdown for markdown in markdowns), markdowns[-3:]
+    assert any("work_pair" not in markdown for markdown in markdowns)
+    assert len(app_test.get("plotly_chart")) == 1
+
+
+def test_app_diagnostics_hint(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _seed_app_data(catalog, config)
+    app_test = _run_app(monkeypatch, repo_root, config)
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("PCA" in caption and "UMAP" in caption for caption in captions)
+    assert any("未找到诊断产物" in caption for caption in captions)
+
+    # 有诊断产物时列出可用路径，且不改变默认 UMAP/图表数量
+    config.paths.logs.mkdir(parents=True, exist_ok=True)
+    html_dir = config.paths.logs / "dim_diagnostics_v2_html"
+    html_dir.mkdir(parents=True, exist_ok=True)
+    (config.paths.logs / "dim_diagnostics_v2.json").write_text("{}", encoding="utf-8")
+    fresh = _run_app(monkeypatch, repo_root, config)
+    captions = [str(element.value) for element in fresh.caption]
+    assert any("PCA" in caption and "UMAP" in caption for caption in captions)
+    assert any("诊断 HTML 目录" in caption for caption in captions)
+    markdowns = [str(element.value) for element in fresh.markdown]
+    assert any(
+        "dim_diagnostics_v2_html" in markdown and "file://" in markdown
+        for markdown in markdowns
+    )
+    assert len(fresh.get("plotly_chart")) == 1

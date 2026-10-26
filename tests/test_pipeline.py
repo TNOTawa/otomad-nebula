@@ -832,19 +832,25 @@ def test_full_mode_events_integration_records_events_s(config, sample_video, mon
         catalog.close()
 
 
-def test_full_mode_bilibili_reuses_existing_download(config, sample_video, monkeypatch):
+def test_full_mode_bilibili_reuses_persistent_source_cache(
+    config, sample_video, monkeypatch
+):
+    """sources 持久缓存命中时：不创建 BilibiliClient、不下载、处理完成后缓存保留。"""
+
     cfg = _full_config(config)
     catalog = _open_catalog(cfg)
     try:
+        bvid = "BV1xx411c7m1"
         work_id, _created = catalog.upsert_bilibili_work(
-            "BV1xx411c7m1", title="复用下载测试", duration_s=12.0
+            bvid, title="复用下载测试", duration_s=12.0
         )
-        download_dir = cfg.paths.temp / f"work_{work_id:06d}" / "download"
-        download_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(sample_video, download_dir / "cached_source.mp4")
+        sources_dir = cfg.paths.sources / bvid
+        sources_dir.mkdir(parents=True, exist_ok=True)
+        cached_source = sources_dir / f"{bvid}_p1.mp4"
+        shutil.copy2(sample_video, cached_source)
 
         def _no_network(*args, **kwargs):
-            raise AssertionError("已有可复用下载时不应创建 BilibiliClient")
+            raise AssertionError("已有 sources 持久缓存时不应创建 BilibiliClient")
 
         monkeypatch.setattr("nebula.download.BilibiliClient", _no_network)
         pipeline = _full_pipeline(cfg, catalog)
@@ -853,8 +859,164 @@ def test_full_mode_bilibili_reuses_existing_download(config, sample_video, monke
         assert catalog.get_work(work_id)["status"] == "completed"
         version = pipeline.embedding_version
         assert len(catalog.get_clips(work_id, version=version)) == 2
+        # temp 清理不影响 sources 持久缓存
         assert not (cfg.paths.temp / f"work_{work_id:06d}").exists()
+        assert cached_source.is_file()
         pipeline.close()
+    finally:
+        catalog.close()
+
+
+def _patch_fake_bilibili_client(monkeypatch) -> dict[str, int]:
+    """替换 BilibiliClient 为离线 fake，返回统计（创建次数）。"""
+
+    stats = {"created": 0}
+
+    class FakeBilibiliClient:
+        def __init__(self, *args, **kwargs):
+            stats["created"] += 1
+
+        def fetch_meta(self, bvid, *, part=1):
+            return types.SimpleNamespace(
+                title="缓存测试",
+                author_uid="1",
+                author_name="测试UP",
+                duration_s=12.0,
+                publish_date="2024-01-01",
+            )
+
+    monkeypatch.setattr("nebula.download.BilibiliClient", FakeBilibiliClient)
+    return stats
+
+
+def test_bilibili_source_downloaded_once_and_persisted(
+    config, sample_video, monkeypatch
+):
+    """两次处理（两个采样版本）只下载一次；下载写入 sources 持久缓存。"""
+
+    cfg = _full_config(config)
+    catalog = _open_catalog(cfg)
+    try:
+        bvid = "BV1xx411c7m2"
+        work_id, _created = catalog.upsert_bilibili_work(
+            bvid, title="源缓存复用测试", duration_s=12.0
+        )
+        calls: list[tuple[str, int, Path]] = []
+
+        def fake_resolve(
+            config_, client_, bvid_, part_, temp_dir_, download_, **kwargs
+        ):
+            calls.append((bvid_, int(part_), Path(temp_dir_)))
+            target_dir = Path(config_.paths.sources) / bvid_
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / f"{bvid_}_p{int(part_)}.mp4"
+            shutil.copy2(sample_video, target)
+            return target
+
+        monkeypatch.setattr(
+            "nebula.download.resolve_bilibili_source", fake_resolve, raising=False
+        )
+        client_stats = _patch_fake_bilibili_client(monkeypatch)
+        cached_source = cfg.paths.sources / bvid / f"{bvid}_p1.mp4"
+
+        # 第一次处理（legacy 版本）：缓存未命中 -> 取元数据 + 通过 helper 下载
+        legacy = _pipeline(cfg, catalog)
+        stats = legacy.process_pending(source="bilibili")
+        assert stats.completed == 1, [o.message for o in stats.outcomes]
+        legacy.close()
+        assert len(calls) == 1
+        assert client_stats["created"] == 1
+        assert cached_source.is_file()
+        assert not (cfg.paths.temp / f"work_{work_id:06d}").exists()
+
+        # 第二次处理（full_coverage 版本）：sources 缓存命中 -> 不再下载/请求元数据
+        full = _full_pipeline(cfg, catalog)
+        stats2 = full.process_pending(source="bilibili")
+        assert stats2.completed == 1, [o.message for o in stats2.outcomes]
+        full.close()
+        assert len(calls) == 1, "第二次处理必须复用 sources 缓存，不能重复下载"
+        assert client_stats["created"] == 1, "缓存命中不应创建 BilibiliClient"
+        assert cached_source.is_file()
+        assert not (cfg.paths.temp / f"work_{work_id:06d}").exists()
+    finally:
+        catalog.close()
+
+
+def test_bilibili_source_fallback_downloads_once_and_persists(
+    config, sample_video, monkeypatch
+):
+    """helper 尚未交付时的回退：temp 暂存下载 -> 原子移入 sources，第二次复用。"""
+
+    cfg = _full_config(config)
+    catalog = _open_catalog(cfg)
+    try:
+        bvid = "BV1xx411c7m3"
+        work_id, _created = catalog.upsert_bilibili_work(
+            bvid, title="回退缓存测试", duration_s=12.0
+        )
+        monkeypatch.setattr(
+            "nebula.pipeline._load_resolve_bilibili_source", lambda: None
+        )
+        downloads: list[Path] = []
+
+        def fake_download(bvid_, *, part, out_dir, download):
+            out_path = Path(out_dir)
+            downloads.append(out_path)
+            target = out_path / f"{bvid_}_p{int(part)}.mp4"
+            shutil.copy2(sample_video, target)
+            return target
+
+        monkeypatch.setattr("nebula.download.download_bilibili", fake_download)
+        client_stats = _patch_fake_bilibili_client(monkeypatch)
+        cached_source = cfg.paths.sources / bvid / f"{bvid}_p1.mp4"
+
+        legacy = _pipeline(cfg, catalog)
+        stats = legacy.process_pending(source="bilibili")
+        assert stats.completed == 1, [o.message for o in stats.outcomes]
+        legacy.close()
+        assert len(downloads) == 1
+        assert client_stats["created"] == 1
+        assert cached_source.is_file()
+        # 下载暂存目录应随 temp 清理，不残留
+        assert not (cfg.paths.temp / f"work_{work_id:06d}").exists()
+        assert list(cfg.paths.sources.rglob("*.part")) == []
+
+        full = _full_pipeline(cfg, catalog)
+        stats2 = full.process_pending(source="bilibili")
+        assert stats2.completed == 1, [o.message for o in stats2.outcomes]
+        full.close()
+        assert len(downloads) == 1, "第二次处理必须复用 sources 缓存，不能重复下载"
+        assert client_stats["created"] == 1
+        assert cached_source.is_file()
+    finally:
+        catalog.close()
+
+
+def test_bilibili_source_helper_outside_sources_rejected(
+    config, sample_video, monkeypatch
+):
+    """helper 返回非 sources 路径时应失败，避免缓存丢失/写入 temp。"""
+
+    cfg = _full_config(config)
+    catalog = _open_catalog(cfg)
+    try:
+        bvid = "BV1xx411c7m4"
+        catalog.upsert_bilibili_work(bvid, title="越界缓存测试", duration_s=12.0)
+
+        def fake_resolve(
+            config_, client_, bvid_, part_, temp_dir_, download_, **kwargs
+        ):
+            return sample_video  # 不在 config.paths.sources 下
+
+        monkeypatch.setattr(
+            "nebula.download.resolve_bilibili_source", fake_resolve, raising=False
+        )
+        _patch_fake_bilibili_client(monkeypatch)
+        pipeline = _full_pipeline(cfg, catalog)
+        stats = pipeline.process_pending(source="bilibili")
+        pipeline.close()
+        assert stats.failed == 1
+        assert "sources" in (stats.outcomes[0].message or "")
     finally:
         catalog.close()
 

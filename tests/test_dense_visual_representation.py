@@ -113,3 +113,92 @@ def test_build_skips_incomplete_and_duplicates(config, catalog):
     rep = catalog.get_representation(int(summary["representation_id"]))
     rows = catalog.list_representation_vectors(int(rep["id"]), kind="joint")
     assert [int(row["work_id"]) for row in rows] == [w1]
+
+
+def test_build_representation_v2_window_plan_uses_coverage_weights(config, catalog):
+    """v0.4.3.1：窗口计划层 + 显式覆盖权重，而不是等权平均。"""
+
+    _register_visual_version(catalog)
+    plan = "win8s_ov0__coverage-v1"
+    catalog.register_visual_window_plan(
+        plan,
+        clip_seconds=8.0,
+        overlap_seconds=0.0,
+        weight_scheme="coverage-v1",
+        params={"test": True},
+    )
+    w1, _ = catalog.upsert_local_work("v2-a.mp4")
+    w2, _ = catalog.upsert_local_work("v2-b.mp4")
+    windows1 = np.asarray([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=np.float32)
+    windows2 = np.asarray([[0.0, 0.0, 1.0, 0.0]], dtype=np.float32)
+    weight_map = {
+        w1: np.asarray([0.75, 0.25], dtype=np.float32),
+        w2: np.asarray([1.0], dtype=np.float32),
+    }
+    for work_id, windows in ((w1, windows1), (w2, windows2)):
+        work_dir = config.paths.visual_windows / plan / VERSION / f"{work_id:06d}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        np.save(work_dir / "windows.npy", windows)
+        np.save(work_dir / "window_weights.npy", weight_map[work_id])
+        np.save(work_dir / "window_std.npy", np.zeros_like(windows))
+        catalog.upsert_visual_window_sequence(
+            work_id,
+            frame_version=VERSION,
+            window_plan_version=plan,
+            status="completed",
+            windows_path=config.data_relpath(work_dir / "windows.npy"),
+            window_std_path=config.data_relpath(work_dir / "window_std.npy"),
+            window_weights_path=config.data_relpath(work_dir / "window_weights.npy"),
+            n_windows=int(windows.shape[0]),
+            dim=int(windows.shape[1]),
+        )
+    summary = build_representation(
+        catalog, config, visual_version=VERSION, window_plan_version=plan
+    )
+    assert summary["name"] == representations.DENSE_VISUAL_CLIP_V2
+    assert summary["n_built"] == 2
+    rep = catalog.get_representation(int(summary["representation_id"]))
+    assert rep["params_json"].find(plan) >= 0
+    rows = catalog.list_representation_vectors(int(rep["id"]), kind="joint")
+    by_work = {
+        int(row["work_id"]): np.load(config.data_path(str(row["path"]))) for row in rows
+    }
+    expected = aggregate_window_vectors(windows1, weight_map[w1])
+    assert np.allclose(by_work[w1], expected, atol=1e-6)
+    equal = aggregate_window_vectors(windows1, [1.0, 1.0])
+    assert not np.allclose(by_work[w1], equal, atol=1e-4)
+    with pytest.raises(NebulaError):
+        build_representation(catalog, config, visual_version=VERSION, window_plan_version=plan)
+    forced = build_representation(
+        catalog, config, visual_version=VERSION, window_plan_version=plan, force=True
+    )
+    assert forced["n_built"] == 2
+
+
+def test_build_representation_v2_missing_weights_fails_work(config, catalog):
+    _register_visual_version(catalog)
+    plan = "win8s_ov0__coverage-v1"
+    catalog.register_visual_window_plan(
+        plan, clip_seconds=8.0, overlap_seconds=0.0, weight_scheme="coverage-v1"
+    )
+    work_id, _ = catalog.upsert_local_work("v2-missing.mp4")
+    work_dir = config.paths.visual_windows / plan / VERSION / f"{work_id:06d}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    np.save(
+        work_dir / "windows.npy",
+        np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+    )
+    catalog.upsert_visual_window_sequence(
+        work_id,
+        frame_version=VERSION,
+        window_plan_version=plan,
+        status="completed",
+        windows_path=config.data_relpath(work_dir / "windows.npy"),
+        n_windows=1,
+        dim=4,
+    )
+    with pytest.raises(NebulaError, match="没有构建出任何作品"):
+        build_representation(
+            catalog, config, visual_version=VERSION, window_plan_version=plan
+        )
+

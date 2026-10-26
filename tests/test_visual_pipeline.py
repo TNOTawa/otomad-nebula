@@ -1,15 +1,14 @@
-"""v0.4.3 密集视觉批处理流水线（nebula.visual_pipeline）的离线测试。
+"""v0.4.3.1 密集视觉流水线（nebula.visual_pipeline）离线测试。
 
-全部使用 fake 编码器 / fake 提取器 / fake 下载器与合成视频：
+全部使用 fake 编码器 / fake 提取器 / fake 下载器与合成视频，不加载模型、不联网：
 
-- 双编码器各跑一次、canonical 去重、pending 作品不处理；
-- 本地作品复用原文件、Bilibili 作品下载一次并在任务间复用；
-- visual_sequences 断点续跑（interrupted -> 只补缺失任务）、失败保留 temp、全部完成后清理；
-- 30fps 子集选择确定性、短/中/长时长桶覆盖与动态分数偏好；
-- status 摘要（状态计数 / 存储字节）与 clean-temp 清理时机；
-- dry-run 不写 DB、不建文件、不调用编码器。
-
-不加载模型、不访问网络、不占用 GPU。
+- 帧编码层（visual_sequences，仅 frames_path）与窗口计划层（visual_window_sequences，
+  data/visual_windows/<window_plan_version>/<frame_version>/<work_id>/）分离；
+- 双编码器各跑一次、canonical 去重、pending 作品不处理、Bilibili 源缓存只下载一次；
+- coverage-v1 窗口权重（非整 8s 视频）与 equal 方案不同、和为 1；
+- 断点续跑：帧已完成只重建缺失窗口（不重新编码）；窗口计划不同不跳过；
+- 30fps 子集选择确定性、短/中/长时长桶覆盖；
+- status 摘要（帧层 + 窗口层状态/存储）与 clean-temp 清理时机；dry-run 零写入。
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from nebula import sampling as sampling_module
 from nebula.config import Config, VisualEncoderConfig
 from nebula.db import Catalog
 from nebula.dense_visual import (
@@ -32,6 +32,10 @@ from nebula.dense_visual import (
 from nebula.media import probe_media
 from nebula.sampling import plan_full_coverage
 from nebula.visual_pipeline import (
+    WINDOW_MANIFEST_NAME,
+    WINDOW_STD_NAME,
+    WINDOW_WEIGHTS_NAME,
+    WINDOWS_NAME,
     clean_completed_temp_dirs,
     compose_visual_version,
     run_visual_pipeline,
@@ -39,6 +43,8 @@ from nebula.visual_pipeline import (
     select_thirty_fps_works,
     visual_status,
     visual_version_specs,
+    visual_windows_dir,
+    window_plan_root,
 )
 from tests.fixtures.video_factory import build_video_library, media_tools_available
 
@@ -115,7 +121,9 @@ class FakeExtractor:
             duration_s=float(info.duration_s),
             n_frames=n_frames,
             dim=dim,
-            version=compose_visual_version(str(encoder.version), float(fps), int(size), str(preprocess)),
+            version=compose_visual_version(
+                str(encoder.version), float(fps), int(size), str(preprocess)
+            ),
             decode_s=0.1,
             encode_s=0.2,
             model_load_s=float(getattr(encoder, "model_load_s", 0.0)),
@@ -184,7 +192,10 @@ def _visual_config(
         size=size,
         preprocess="letterbox",
         batch_size=4,
-        encoders=tuple(VisualEncoderConfig(model=model, revision=revision) for model, revision in encoders),
+        encoders=tuple(
+            VisualEncoderConfig(model=model, revision=revision)
+            for model, revision in encoders
+        ),
     )
     return dataclasses.replace(config, visual_dense=dense)
 
@@ -212,7 +223,9 @@ def _make_local_work(
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(videos[video_name], target)
     work_id, _ = catalog.upsert_local_work(rel_path)
-    actual_duration = duration_s if duration_s is not None else _duration_of(target, config)
+    actual_duration = (
+        duration_s if duration_s is not None else _duration_of(target, config)
+    )
     catalog.update_work_metadata(work_id, duration_s=float(actual_duration))
     if completed:
         catalog.begin_attempt(work_id, "encoding")
@@ -220,28 +233,65 @@ def _make_local_work(
     return work_id
 
 
-def _make_bilibili_work(
-    catalog: Catalog, duration_s: float = 4.0, bvid: str = BVID
-) -> int:
-    work_id, _ = catalog.upsert_bilibili_work(bvid, part=1, title="fake bili")
+def _make_bilibili_work(catalog: Catalog, duration_s: float = 4.0) -> int:
+    work_id, _ = catalog.upsert_bilibili_work(BVID, part=1, title="fake bili")
     catalog.update_work_metadata(work_id, duration_s=float(duration_s))
     catalog.begin_attempt(work_id, "encoding")
     catalog.complete(work_id)
     return work_id
 
 
-def _sequence(catalog: Catalog, work_id: int, version: str):
+def _frame_sequence(catalog: Catalog, work_id: int, version: str):
     return catalog.get_visual_sequence(work_id, version=version)
 
 
-def _expected_windows(config: Config, duration_s: float) -> int:
+def _window_sequence(catalog: Catalog, work_id: int, frame_version: str, plan_version: str):
+    return catalog.get_visual_window_sequence(
+        work_id, frame_version=frame_version, window_plan_version=plan_version
+    )
+
+
+def _expected_window_count(
+    config: Config,
+    duration_s: float,
+    *,
+    clip_seconds: float | None = None,
+    overlap_seconds: float | None = None,
+) -> int:
     plans = plan_full_coverage(
         duration_s,
-        clip_seconds=config.media.clip_seconds,
-        overlap_seconds=config.sampling.overlap_seconds,
+        clip_seconds=config.media.clip_seconds if clip_seconds is None else clip_seconds,
+        overlap_seconds=(
+            config.sampling.overlap_seconds
+            if overlap_seconds is None
+            else overlap_seconds
+        ),
         min_duration_seconds=config.media.min_duration_seconds,
     )
     return len(plans)
+
+
+def _windows_bundle_dir(
+    config: Config,
+    *,
+    plan_version: str,
+    frame_version: str,
+    work_id: int,
+) -> Path:
+    return visual_windows_dir(config, plan_version, frame_version, work_id)
+
+
+def _load_window_bundle(config: Config, plan_version: str, frame_version: str, work_id: int):
+    bundle_dir = _windows_bundle_dir(
+        config, plan_version=plan_version, frame_version=frame_version, work_id=work_id
+    )
+    windows = np.load(bundle_dir / WINDOWS_NAME, allow_pickle=False)
+    std = np.load(bundle_dir / WINDOW_STD_NAME, allow_pickle=False)
+    weights = np.load(bundle_dir / WINDOW_WEIGHTS_NAME, allow_pickle=False)
+    manifest = json.loads(
+        (bundle_dir / WINDOW_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    return windows, std, weights, manifest
 
 
 # ---------------------------------------------------------------- 版本契约
@@ -260,9 +310,10 @@ def test_visual_version_specs(config: Config) -> None:
     assert [spec.fps for spec in subset] == [4.0, 4.0]
     assert all(spec.preprocess == "letterbox" for spec in specs)
     assert visual_version_specs(cfg, include_subset=False) == main
+    assert cfg.visual_window_plan_version == "win8s_ov0__coverage-v1"
 
 
-# ---------------------------------------------------------------- 主流程
+# ---------------------------------------------------------------- 帧层 + 窗口层
 
 
 def test_run_two_encoders_canonical_only_and_resume(
@@ -277,6 +328,7 @@ def test_run_two_encoders_canonical_only_and_resume(
     catalog.link_works(work_a, duplicate, method="test", confidence=1.0)
     factory = _make_factory()
     extractor = FakeExtractor(cfg)
+    plan_version = cfg.visual_window_plan_version
 
     summary = run_visual_pipeline(
         catalog, cfg, encoder_factory=factory, extractor=extractor
@@ -287,46 +339,74 @@ def test_run_two_encoders_canonical_only_and_resume(
     assert summary.tasks_completed == 4
     assert summary.tasks_failed == 0
     assert summary.tasks_skipped == 0
-    assert summary.downloaded_works == 0
+    assert summary.windows_total == 4
+    assert summary.windows_completed == 4
+    assert summary.windows_failed == 0
+    assert summary.window_plan_version == plan_version
     assert len(extractor.calls) == 4
     assert len(factory.created) == 2
     assert all(encoder.closed == 1 for encoder in factory.created)
-    assert catalog.list_visual_versions()  # 版本已登记
+
+    # 帧版本 / 窗口计划都已登记
     assert [entry["version"] for entry in catalog.list_visual_versions()] == list(
         summary.versions
     )
+    plan_row = catalog.get_visual_window_plan(plan_version)
+    assert plan_row is not None
+    assert plan_row["clip_seconds"] == pytest.approx(float(cfg.media.clip_seconds))
+    assert plan_row["overlap_seconds"] == pytest.approx(float(cfg.sampling.overlap_seconds))
+    assert plan_row["weight_scheme"] == cfg.visual_dense.weight_scheme
 
     for work_id, rel in ((work_a, "a.mp4"), (work_b, "b.mp4")):
-        duration = _duration_of(config.paths.input_local / rel, cfg)
-        expected_windows = _expected_windows(cfg, duration)
-        for version in summary.versions:
-            row = _sequence(catalog, work_id, version)
-            assert row is not None
-            assert row["status"] == "completed"
-            assert row["n_windows"] == expected_windows
-            assert row["n_frames"] == int(round(duration * (4.0 if "__fps4" in version else 2.0)))
-            assert row["dim"] in FAKE_DIMS.values()
-            frames = config.data_path(row["frames_path"])
-            windows = config.data_path(row["windows_path"])
-            assert frames.is_file() and windows.is_file()
-            pooled = np.load(windows, allow_pickle=False)
-            assert pooled.shape == (expected_windows, row["dim"])
-            bundle_dir = config.paths.visual_dense / version / f"{work_id:06d}"
-            window_std = np.load(bundle_dir / "window_std.npy")
-            assert window_std.shape == pooled.shape
-            manifest = json.loads(
-                (bundle_dir / DENSE_VISUAL_MANIFEST_NAME).read_text(encoding="utf-8")
-            )
-            assert manifest["version"] == version
-            assert int(manifest["n_windows"]) == expected_windows
-            window_times = manifest["window_times"]
-            assert len(window_times) == expected_windows
-            assert float(window_times[0][0]) == pytest.approx(0.0)
-            assert float(window_times[-1][1]) == pytest.approx(duration, abs=0.05)
-            assert float(window_times[-1][0]) < float(window_times[-1][1])
+        duration = _duration_of(cfg.paths.input_local / rel, cfg)
+        expected_windows = _expected_window_count(cfg, duration)
+        for frame_version in summary.versions:
+            frame_row = _frame_sequence(catalog, work_id, frame_version)
+            assert frame_row is not None
+            assert frame_row["status"] == "completed"
+            assert frame_row["frames_path"]
+            assert frame_row["windows_path"] is None  # 帧层不再写窗口路径
+            frame_dir = cfg.paths.visual_dense / frame_version / f"{work_id:06d}"
+            assert (frame_dir / "dense_visual.npz").is_file()
+            assert (frame_dir / DENSE_VISUAL_MANIFEST_NAME).is_file()
+            assert not (frame_dir / WINDOWS_NAME).exists()  # 窗口不进帧目录
 
-    assert _sequence(catalog, pending, summary.versions[0]) is None
-    assert _sequence(catalog, duplicate, summary.versions[0]) is None
+            window_row = _window_sequence(catalog, work_id, frame_version, plan_version)
+            assert window_row is not None
+            assert window_row["status"] == "completed"
+            assert window_row["n_windows"] == expected_windows
+            assert window_row["dim"] in FAKE_DIMS.values()
+            bundle_dir = _windows_bundle_dir(
+                cfg,
+                plan_version=plan_version,
+                frame_version=frame_version,
+                work_id=work_id,
+            )
+            windows = np.load(bundle_dir / WINDOWS_NAME)
+            std = np.load(bundle_dir / WINDOW_STD_NAME)
+            weights = np.load(bundle_dir / WINDOW_WEIGHTS_NAME)
+            manifest = json.loads(
+                (bundle_dir / WINDOW_MANIFEST_NAME).read_text(encoding="utf-8")
+            )
+            assert windows.shape == (expected_windows, window_row["dim"])
+            assert std.shape == windows.shape
+            assert weights.shape == (expected_windows,)
+            assert float(weights.sum()) == pytest.approx(1.0, abs=1e-5)
+            assert np.all(weights >= 0)
+            assert manifest["frame_version"] == frame_version
+            assert manifest["window_plan_version"] == plan_version
+            assert manifest["weight_scheme"] == cfg.visual_dense.weight_scheme
+            assert int(manifest["n_windows"]) == expected_windows
+            assert len(manifest["window_times"]) == expected_windows
+            assert float(manifest["window_times"][-1][1]) == pytest.approx(
+                duration, abs=0.05
+            )
+            assert config.data_path(window_row["windows_path"]).is_file()
+            assert config.data_path(window_row["window_std_path"]).is_file()
+            assert config.data_path(window_row["window_weights_path"]).is_file()
+
+    assert _frame_sequence(catalog, pending, summary.versions[0]) is None
+    assert _frame_sequence(catalog, duplicate, summary.versions[0]) is None
 
     calls_after_first = len(extractor.calls)
     second = run_visual_pipeline(
@@ -334,7 +414,193 @@ def test_run_two_encoders_canonical_only_and_resume(
     )
     assert second.tasks_completed == 0
     assert second.tasks_skipped == 4
+    assert second.windows_completed == 0
+    assert second.windows_skipped == 4
     assert len(extractor.calls) == calls_after_first
+
+
+def test_coverage_weights_differ_from_equal_for_non_multiple_8s(
+    config: Config, catalog: Catalog, videos: dict[str, Path]
+) -> None:
+    """17s 视频（非 8s 整倍）coverage-v1 权重必须区别于等权且和为 1。"""
+
+    cfg = _visual_config(config, subset_count=0, encoders=(("fake-a", "rev-a"),))
+    work_id = _make_local_work(catalog, cfg, videos, "odd.mp4", "odd_17s.mp4")
+    run_visual_pipeline(
+        catalog, cfg, encoder_factory=_make_factory(), extractor=FakeExtractor(cfg)
+    )
+    frame_version = visual_version_specs(cfg, include_subset=False)[0].version
+    duration = _duration_of(cfg.paths.input_local / "odd.mp4", cfg)
+    windows = [
+        (float(item.start_s), float(item.end_s))
+        for item in plan_full_coverage(
+            duration,
+            clip_seconds=cfg.media.clip_seconds,
+            overlap_seconds=cfg.sampling.overlap_seconds,
+            min_duration_seconds=cfg.media.min_duration_seconds,
+        )
+    ]
+    _, _, weights, manifest = _load_window_bundle(
+        cfg, cfg.visual_window_plan_version, frame_version, work_id
+    )
+    public_weights = np.asarray(
+        sampling_module.coverage_weights(windows, duration), dtype=np.float32
+    )
+    public_weights = public_weights / public_weights.sum()
+    assert np.allclose(weights, public_weights, atol=1e-6)
+    equal_weights = np.full(len(windows), 1.0 / len(windows), dtype=np.float32)
+    assert float(np.max(np.abs(weights - equal_weights))) > 0.01
+    assert float(weights.sum()) == pytest.approx(1.0, abs=1e-5)
+    assert manifest["weight_sum"] == pytest.approx(1.0, abs=1e-5)
+
+    # 同一帧版本切换 equal 权重方案：只重建窗口层，不重新编码帧
+    cfg_equal = dataclasses.replace(
+        cfg,
+        visual_dense=dataclasses.replace(cfg.visual_dense, weight_scheme="equal"),
+    )
+    factory = _make_factory()
+    extractor = FakeExtractor(cfg_equal)
+    extractor.calls = []
+    result = run_visual_pipeline(
+        catalog, cfg_equal, encoder_factory=factory, extractor=extractor
+    )
+    assert extractor.calls == []
+    assert result.tasks_skipped == 1
+    assert result.windows_completed == 1
+    equal_plan_version = cfg_equal.visual_window_plan_version
+    _, _, equal_weights, _ = _load_window_bundle(
+        cfg_equal, equal_plan_version, frame_version, work_id
+    )
+    assert np.allclose(
+        equal_weights, np.full(len(windows), 1.0 / len(windows)), atol=1e-6
+    )
+    # 旧计划行仍独立存在
+    old_row = _window_sequence(
+        catalog, work_id, frame_version, cfg.visual_window_plan_version
+    )
+    assert old_row is not None and old_row["status"] == "completed"
+    new_row = _window_sequence(catalog, work_id, frame_version, equal_plan_version)
+    assert new_row is not None and new_row["status"] == "completed"
+
+
+def test_resume_rebuilds_missing_windows_without_reencoding(
+    config: Config, catalog: Catalog, videos: dict[str, Path]
+) -> None:
+    cfg = _visual_config(config, subset_count=0, encoders=(("fake-a", "rev-a"),))
+    work_id = _make_local_work(catalog, cfg, videos, "rebuild.mp4", "short_4s.mp4")
+    factory = _make_factory()
+    extractor = FakeExtractor(cfg)
+    run_visual_pipeline(catalog, cfg, encoder_factory=factory, extractor=extractor)
+    frame_version = visual_version_specs(cfg, include_subset=False)[0].version
+    plan_version = cfg.visual_window_plan_version
+    calls_after = len(extractor.calls)
+    frame_dir = cfg.paths.visual_dense / frame_version / f"{work_id:06d}"
+    frame_npz = frame_dir / "dense_visual.npz"
+    mtime_before = frame_npz.stat().st_mtime_ns
+
+    bundle_dir = _windows_bundle_dir(
+        cfg, plan_version=plan_version, frame_version=frame_version, work_id=work_id
+    )
+    shutil.rmtree(bundle_dir)
+    catalog.upsert_visual_window_sequence(
+        work_id,
+        frame_version=frame_version,
+        window_plan_version=plan_version,
+        status="failed",
+        error="模拟窗口文件丢失",
+    )
+
+    summary = run_visual_pipeline(
+        catalog, cfg, encoder_factory=factory, extractor=extractor
+    )
+    assert summary.tasks_skipped == 1
+    assert summary.tasks_completed == 0
+    assert summary.windows_completed == 1
+    assert len(extractor.calls) == calls_after  # 帧不重复编码
+    assert frame_npz.stat().st_mtime_ns == mtime_before
+    row = _window_sequence(catalog, work_id, frame_version, plan_version)
+    assert row is not None and row["status"] == "completed"
+    assert config.data_path(row["windows_path"]).is_file()
+
+
+def test_window_plan_isolation_in_pipeline(
+    config: Config, catalog: Catalog, videos: dict[str, Path]
+) -> None:
+    cfg = _visual_config(config, subset_count=0, encoders=(("fake-a", "rev-a"),))
+    work_id = _make_local_work(catalog, cfg, videos, "plan.mp4", "mid_12s.mp4")
+    factory = _make_factory()
+    extractor = FakeExtractor(cfg)
+    first = run_visual_pipeline(
+        catalog, cfg, encoder_factory=factory, extractor=extractor
+    )
+    frame_version = visual_version_specs(cfg, include_subset=False)[0].version
+    plan_a = cfg.visual_window_plan_version
+    calls_after_python = len(extractor.calls)
+    row_a = _window_sequence(catalog, work_id, frame_version, plan_a)
+    assert row_a is not None and row_a["status"] == "completed"
+    n_a = int(row_a["n_windows"])
+
+    cfg_b = dataclasses.replace(
+        cfg, media=dataclasses.replace(cfg.media, clip_seconds=5.0)
+    )
+    assert cfg_b.visual_window_plan_version == "win5s_ov0__coverage-v1"
+    plan_b = cfg_b.visual_window_plan_version
+    second = run_visual_pipeline(
+        catalog, cfg_b, encoder_factory=factory, extractor=extractor
+    )
+    assert len(extractor.calls) == calls_after_python  # 帧未重新编码
+    assert second.tasks_skipped == 1
+    assert second.windows_completed == 1
+    row_b = _window_sequence(catalog, work_id, frame_version, plan_b)
+    assert row_b is not None and row_b["status"] == "completed"
+    assert int(row_b["n_windows"]) != n_a
+    row_a_after = _window_sequence(catalog, work_id, frame_version, plan_a)
+    assert row_a_after is not None and row_a_after["status"] == "completed"
+    assert plan_a in {row["version"] for row in catalog.list_visual_window_plans()}
+    assert plan_b in {row["version"] for row in catalog.list_visual_window_plans()}
+    assert first.window_plan_version == plan_a
+
+
+def test_bilibili_source_cache_download_once(
+    config: Config, catalog: Catalog, videos: dict[str, Path]
+) -> None:
+    cfg = _visual_config(config, subset_count=0)
+    work_id = _make_bilibili_work(catalog, duration_s=4.0)
+    downloader = _make_downloader(videos["short_4s.mp4"])
+    cache_dir = cfg.paths.sources / BVID
+    assert not cache_dir.exists() or not any(cache_dir.iterdir())
+    plan_version = cfg.visual_window_plan_version
+
+    first = run_visual_pipeline(
+        catalog,
+        cfg,
+        encoder_factory=_make_factory(),
+        extractor=FakeExtractor(cfg),
+        downloader=downloader,
+    )
+    assert first.tasks_completed == 2
+    assert first.downloaded_works == 1
+    assert len(downloader.calls) == 1
+    cached_files = sorted(cache_dir.glob(f"{BVID}_p1.*"))
+    assert len(cached_files) == 1
+    cached = cached_files[0]
+    assert cached.stat().st_size > 0
+    assert not (cfg.paths.temp / f"work_{work_id:06d}").exists()
+
+    second = run_visual_pipeline(
+        catalog,
+        cfg,
+        encoder_factory=_make_factory(),
+        extractor=FakeExtractor(cfg),
+        downloader=downloader,
+    )
+    assert second.tasks_skipped == 2
+    assert second.downloaded_works == 0
+    assert len(downloader.calls) == 1  # 缓存命中，不再下载
+    assert cached.is_file()  # 缓存保留
+    for frame_version in visual_version_specs(cfg, include_subset=False):
+        row = _window_sequence(catalog, work_id, frame_version.version, plan_version)
+        assert row is not None and row["status"] == "completed"
 
 
 def test_resume_after_encoder_failure_and_temp_cleanup(
@@ -359,12 +625,14 @@ def test_resume_after_encoder_failure_and_temp_cleanup(
     assert first.tasks_failed == 1
     assert first.downloaded_works == 1
     assert first.cleaned_temp_dirs == 0
-    assert len(downloader.calls) == 1  # 每部作品只下载一次
+    assert first.windows_completed == 1  # 成功帧任务对应窗口层
+    assert len(downloader.calls) == 1
     temp_root = cfg.paths.temp / f"work_{work_id:06d}"
-    assert temp_root.is_dir()  # 有失败任务时保留 temp
+    assert temp_root.is_dir()  # 有失败帧任务时保留 temp
     versions = visual_version_specs(cfg, include_subset=False)
     statuses = sorted(
-        str(_sequence(catalog, work_id, spec.version)["status"]) for spec in versions
+        str(_frame_sequence(catalog, work_id, spec.version)["status"])
+        for spec in versions
     )
     assert statuses == ["completed", "failed"]
 
@@ -381,53 +649,22 @@ def test_resume_after_encoder_failure_and_temp_cleanup(
     assert second.tasks_failed == 0
     assert second.downloaded_works == 0
     assert second.cleaned_temp_dirs == 1
-    assert len(downloader.calls) == 1  # 第二次复用 temp 源文件，未重复下载
-    assert not temp_root.exists()  # 全部任务完成后清理
+    assert second.windows_completed == 1
+    assert second.windows_skipped == 1
+    assert len(downloader.calls) == 1  # 复用 data/sources 缓存
+    assert not temp_root.exists()
+
+    plan_version = cfg.visual_window_plan_version
     for spec in versions:
-        row = _sequence(catalog, work_id, spec.version)
-        assert row["status"] == "completed"
-        assert row["decode_s"] == pytest.approx(0.1)
-        assert row["encode_s"] == pytest.approx(0.2)
+        frame_row = _frame_sequence(catalog, work_id, spec.version)
+        assert frame_row["status"] == "completed"
+        assert frame_row["decode_s"] == pytest.approx(0.1)
+        assert frame_row["encode_s"] == pytest.approx(0.2)
+        window_row = _window_sequence(catalog, work_id, spec.version, plan_version)
+        assert window_row is not None and window_row["status"] == "completed"
 
 
-def test_resume_interrupted_in_progress_sequence(
-    config: Config, catalog: Catalog, videos: dict[str, Path]
-) -> None:
-    """中断后 visual_sequences 停在 in_progress：续跑必须重做该任务。"""
-
-    cfg = _visual_config(config, subset_count=0)
-    work_id = _make_local_work(catalog, cfg, videos, "resume_inprogress.mp4", "short_4s.mp4")
-    spec = visual_version_specs(cfg, include_subset=False)[0]
-    catalog.register_visual_version(
-        spec.version,
-        model_id=spec.model,
-        revision=spec.revision,
-        preprocessing=spec.preprocess,
-        fps=spec.fps,
-        size=spec.size,
-        dim=8,
-        params={
-            "encoder_version": spec.encoder_version,
-            "encoder_dim": 8,
-            "preprocess": spec.preprocess,
-            "batch_size": int(cfg.visual_dense.batch_size),
-            "subset": False,
-            "source": "nebula.visual_pipeline",
-        },
-    )
-    catalog.upsert_visual_sequence(work_id, version=spec.version, status="in_progress", n_frames=3)
-    extractor = FakeExtractor(cfg)
-
-    summary = run_visual_pipeline(
-        catalog, cfg, encoder_factory=_make_factory(), extractor=extractor
-    )
-
-    assert summary.tasks_completed == 2
-    assert summary.tasks_skipped == 0
-    row = _sequence(catalog, work_id, spec.version)
-    assert row["status"] == "completed"
-    assert row["n_frames"] == int(round(_duration_of(config.paths.input_local / "resume_inprogress.mp4", cfg) * spec.fps))
-    assert len(extractor.calls) == 2
+# ---------------------------------------------------------------- 子集 / 选择
 
 
 def test_subset_tasks_and_include_subset_flag(
@@ -441,28 +678,43 @@ def test_subset_tasks_and_include_subset_flag(
     ]
     expected_subset = select_thirty_fps_works(catalog, cfg, 2)
     assert len(expected_subset) == 2
+    plan_version = cfg.visual_window_plan_version
 
     factory = _make_factory()
     extractor = FakeExtractor(cfg)
     summary = run_visual_pipeline(
         catalog, cfg, encoder_factory=factory, extractor=extractor
     )
-    main_versions = [spec.version for spec in visual_version_specs(cfg, include_subset=False)]
+    main_versions = [
+        spec.version for spec in visual_version_specs(cfg, include_subset=False)
+    ]
     subset_versions = [
-        spec.version for spec in visual_version_specs(cfg, include_subset=True) if spec.subset
+        spec.version
+        for spec in visual_version_specs(cfg, include_subset=True)
+        if spec.subset
     ]
     assert len(main_versions) == 2 and len(subset_versions) == 2
-    assert summary.tasks_total == len(work_ids) * 2 + len(expected_subset) * 2
-    assert summary.tasks_completed == summary.tasks_total
+    frame_tasks = len(work_ids) * 2 + len(expected_subset) * 2
+    assert summary.tasks_total == frame_tasks
+    assert summary.tasks_completed == frame_tasks
+    assert summary.windows_completed == frame_tasks
     assert summary.subset_works == 2
     for work_id in work_ids:
-        main_status = [_sequence(catalog, work_id, version) for version in main_versions]
-        assert all(row is not None and row["status"] == "completed" for row in main_status)
-        subset_status = [_sequence(catalog, work_id, version) for version in subset_versions]
-        if work_id in expected_subset:
-            assert all(row is not None and row["status"] == "completed" for row in subset_status)
-        else:
-            assert all(row is None for row in subset_status)
+        for version in main_versions:
+            assert _frame_sequence(catalog, work_id, version)["status"] == "completed"
+            assert (
+                _window_sequence(catalog, work_id, version, plan_version)["status"]
+                == "completed"
+            )
+        for version in subset_versions:
+            frame_row = _frame_sequence(catalog, work_id, version)
+            window_row = _window_sequence(catalog, work_id, version, plan_version)
+            if work_id in expected_subset:
+                assert frame_row is not None and frame_row["status"] == "completed"
+                assert window_row is not None and window_row["status"] == "completed"
+            else:
+                assert frame_row is None
+                assert window_row is None
 
     calls_after_first = len(extractor.calls)
     second = run_visual_pipeline(
@@ -474,10 +726,8 @@ def test_subset_tasks_and_include_subset_flag(
     )
     assert second.tasks_completed == 0
     assert second.tasks_skipped == len(work_ids) * 2
+    assert second.windows_skipped == len(work_ids) * 2
     assert len(extractor.calls) == calls_after_first
-
-
-# ---------------------------------------------------------------- 30fps 子集选择
 
 
 def _write_full_sequence_files(
@@ -505,7 +755,7 @@ def _write_full_sequence_files(
 
 
 def test_select_thirty_fps_works_deterministic_buckets_and_dynamics(
-    config: Config, catalog: Catalog,
+    config: Config, catalog: Catalog
 ) -> None:
     cfg = _visual_config(config, subset_count=9)
     durations = [30.0, 60.0, 90.0, 120.0, 180.0, 240.0, 300.0, 420.0, 600.0]
@@ -514,8 +764,7 @@ def test_select_thirty_fps_works_deterministic_buckets_and_dynamics(
         work_id, _ = catalog.upsert_local_work(f"select_{index}.mp4")
         catalog.begin_attempt(work_id, "encoding")
         catalog.complete(work_id)
-        # 只有每桶里最长动态的作品写入动态序列；其余静态
-        dynamic = index in (0, 5, 8)  # 30s(短) / 240s(中) / 600s(长)
+        dynamic = index in (0, 5, 8)
         _write_full_sequence_files(
             cfg, catalog, work_id, dynamic=dynamic, duration_s=duration
         )
@@ -525,12 +774,10 @@ def test_select_thirty_fps_works_deterministic_buckets_and_dynamics(
     second = select_thirty_fps_works(catalog, cfg, 3)
     assert first == second == sorted([work_ids[0], work_ids[5], work_ids[8]])
 
-    all_ids = select_thirty_fps_works(catalog, cfg, 9)
-    assert all_ids == sorted(work_ids)
+    assert select_thirty_fps_works(catalog, cfg, 9) == sorted(work_ids)
     assert select_thirty_fps_works(catalog, cfg, 0) == []
     assert select_thirty_fps_works(catalog, cfg, 20) == sorted(work_ids)
 
-    # 短/中/长桶各至少一部：用实现的确定性桶边界复核
     selected = [durations[work_ids.index(work_id)] for work_id in first]
     ordered = sorted(durations)
     low, high = ordered[len(ordered) // 3], ordered[(2 * len(ordered)) // 3]
@@ -539,6 +786,21 @@ def test_select_thirty_fps_works_deterministic_buckets_and_dynamics(
         for value in selected
     ]
     assert sorted(buckets) == ["long", "medium", "short"]
+
+
+def test_select_canonical_completed_works_excludes_duplicates_and_pending(
+    config: Config, catalog: Catalog, videos: dict[str, Path]
+) -> None:
+    cfg = _visual_config(config, subset_count=0)
+    canonical = _make_local_work(catalog, cfg, videos, "canonical.mp4", "short_4s.mp4")
+    duplicate = _make_local_work(catalog, cfg, videos, "duplicate.mp4", "short_4s.mp4")
+    catalog.link_works(canonical, duplicate, method="test", confidence=1.0)
+    pending = catalog.upsert_local_work("pending_only.mp4")[0]
+    catalog.update_work_metadata(pending, duration_s=4.0)
+
+    works = select_canonical_completed_works(catalog)
+    ids = {int(work["id"]) for work in works}
+    assert ids == {canonical}
 
 
 # ---------------------------------------------------------------- dry-run / status / 清理
@@ -563,12 +825,18 @@ def test_dry_run_does_not_write_or_call_encoders(
 
     assert summary.dry_run is True
     assert summary.tasks_total == 4
+    assert summary.windows_total == 4
     assert summary.tasks_completed == 0
+    assert summary.windows_completed == 0
+    assert summary.window_plan_version == cfg.visual_window_plan_version
     assert extractor.calls == []
     assert factory.created == []
     assert catalog.list_visual_versions() == []
+    assert catalog.list_visual_window_plans() == []
     assert catalog.list_visual_sequences() == []
+    assert catalog.list_visual_window_sequences() == []
     assert not any(cfg.paths.visual_dense.iterdir())
+    assert not any(window_plan_root(cfg).iterdir())
 
 
 def test_status_and_clean_temp(
@@ -577,7 +845,9 @@ def test_status_and_clean_temp(
     cfg = _visual_config(config, subset_count=0)
     work_a = _make_local_work(catalog, cfg, videos, "status_a.mp4", "short_4s.mp4")
     work_b = _make_local_work(catalog, cfg, videos, "status_b.mp4", "mid_12s.mp4")
-    run_visual_pipeline(catalog, cfg, encoder_factory=_make_factory(), extractor=FakeExtractor(cfg))
+    run_visual_pipeline(
+        catalog, cfg, encoder_factory=_make_factory(), extractor=FakeExtractor(cfg)
+    )
 
     payload = visual_status(catalog, cfg)
     assert payload["expected_works"] == 2
@@ -589,8 +859,15 @@ def test_status_and_clean_temp(
         assert version["n_registered"] == 2
         assert version["storage_bytes"] > 0
         assert version["missing_files"] == 0
+    assert len(payload["window_plans"]) == 1
+    window_plan = payload["window_plans"][0]
+    assert window_plan["version"] == cfg.visual_window_plan_version
+    assert window_plan["status_counts"]["completed"] == 4  # 2 作品 x 2 帧版本
+    assert window_plan["n_registered"] == 4
+    assert window_plan["storage_bytes"] > 0
+    assert window_plan["missing_files"] == 0
+    assert payload["window_total_storage_bytes"] > 0
 
-    # 已完成作品的 temp 可清理；未完成作品的 temp 必须保留
     completed_temp = cfg.paths.temp / f"work_{work_a:06d}" / "download"
     completed_temp.mkdir(parents=True, exist_ok=True)
     (completed_temp / "stale.mp4").write_bytes(b"x" * 1024)
@@ -606,21 +883,57 @@ def test_status_and_clean_temp(
     assert result["freed_bytes"] >= 1024
     assert not completed_temp.parent.exists()
     assert pending_temp.parent.is_dir()
-
-    # 已处理完成的 work_b 没有 temp 目录 -> 不应影响结果
     assert not (cfg.paths.temp / f"work_{work_b:06d}").exists()
 
 
-def test_select_canonical_completed_works_excludes_duplicates_and_pending(
+def test_resume_interrupted_in_progress_sequence(
     config: Config, catalog: Catalog, videos: dict[str, Path]
 ) -> None:
-    cfg = _visual_config(config, subset_count=0)
-    canonical = _make_local_work(catalog, cfg, videos, "canonical.mp4", "short_4s.mp4")
-    duplicate = _make_local_work(catalog, cfg, videos, "duplicate.mp4", "short_4s.mp4")
-    catalog.link_works(canonical, duplicate, method="test", confidence=1.0)
-    pending = catalog.upsert_local_work("pending_only.mp4")[0]
-    catalog.update_work_metadata(pending, duration_s=4.0)
+    """帧层停在 in_progress：续跑重做帧任务并补窗口层。"""
 
-    works = select_canonical_completed_works(catalog)
-    ids = {int(work["id"]) for work in works}
-    assert ids == {canonical}
+    cfg = _visual_config(config, subset_count=0, encoders=(("fake-a", "rev-a"),))
+    work_id = _make_local_work(
+        catalog, cfg, videos, "resume_inprogress.mp4", "short_4s.mp4"
+    )
+    spec = visual_version_specs(cfg, include_subset=False)[0]
+    catalog.register_visual_version(
+        spec.version,
+        model_id=spec.model,
+        revision=spec.revision,
+        preprocessing=spec.preprocess,
+        fps=spec.fps,
+        size=spec.size,
+        dim=8,
+        params={
+            "encoder_version": spec.encoder_version,
+            "encoder_dim": 8,
+            "preprocess": spec.preprocess,
+            "batch_size": int(cfg.visual_dense.batch_size),
+            "subset": False,
+            "source": "nebula.visual_pipeline",
+        },
+    )
+    catalog.upsert_visual_sequence(
+        work_id, version=spec.version, status="in_progress", n_frames=3
+    )
+    extractor = FakeExtractor(cfg)
+
+    summary = run_visual_pipeline(
+        catalog, cfg, encoder_factory=_make_factory(), extractor=extractor
+    )
+
+    assert summary.tasks_completed == 1
+    assert summary.windows_completed == 1
+    frame_row = _frame_sequence(catalog, work_id, spec.version)
+    assert frame_row["status"] == "completed"
+    assert frame_row["n_frames"] == int(
+        round(
+            _duration_of(cfg.paths.input_local / "resume_inprogress.mp4", cfg)
+            * spec.fps
+        )
+    )
+    window_row = _window_sequence(
+        catalog, work_id, spec.version, cfg.visual_window_plan_version
+    )
+    assert window_row is not None and window_row["status"] == "completed"
+    assert len(extractor.calls) == 1

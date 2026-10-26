@@ -8,6 +8,10 @@
 
     python tools/build_dense_visual_representation.py --all-main
     python tools/build_dense_visual_representation.py --visual-version <version> --name dense_visual_clip_v1 --force
+    python tools/build_dense_visual_representation.py --v2 --force
+    python tools/build_dense_visual_representation.py --window-plan win8s_ov0__coverage-v1 --frame-version <frame_version>
+
+v1 为等权/旧 manifest 权重历史行为；v2 从 v0.4.3.1 窗口计划层读取显式覆盖权重。
 """
 
 from __future__ import annotations
@@ -37,7 +41,11 @@ VISUAL_REP_NAMES: dict[str, str] = {
     "clip": representations.DENSE_VISUAL_CLIP_V1,
     "dinov2": representations.DENSE_VISUAL_DINO_V1,
 }
-"""编码器标记 -> 表征名。"""
+VISUAL_REP_NAMES_V2: dict[str, str] = {
+    "clip": representations.DENSE_VISUAL_CLIP_V2,
+    "dinov2": representations.DENSE_VISUAL_DINO_V2,
+}
+"""编码器标记 -> 表征名（v1=等权历史；v2=窗口计划 + 覆盖权重）。"""
 
 
 def aggregate_window_vectors(
@@ -84,6 +92,14 @@ def _manifest_weights(work_dir: Path, n_windows: int) -> np.ndarray | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    explicit = payload.get("window_weights")
+    if isinstance(explicit, list) and len(explicit) == n_windows:
+        try:
+            values = [float(item) for item in explicit]
+        except (TypeError, ValueError):
+            values = []
+        if values and all(np.isfinite(value) and value >= 0 for value in values) and sum(values) > 0:
+            return np.asarray(values, dtype=np.float64)
     times = payload.get("window_times")
     if not isinstance(times, list) or len(times) != n_windows:
         return None
@@ -125,6 +141,16 @@ def _resolve_main_versions(config: Config) -> list[str]:
     return versions
 
 
+def _load_weight_file(path: Path, n_windows: int) -> np.ndarray:
+    array = np.load(path, allow_pickle=False)
+    weights = np.asarray(array, dtype=np.float64).reshape(-1)
+    if weights.shape != (n_windows,):
+        raise NebulaError(f"窗口权重数量 {weights.shape[0]} != 窗口数 {n_windows}: {path}")
+    if not np.all(np.isfinite(weights)) or float(weights.sum()) <= 0:
+        raise NebulaError(f"窗口权重非法: {path}")
+    return weights
+
+
 def build_representation(
     catalog: Catalog,
     config: Config,
@@ -133,8 +159,14 @@ def build_representation(
     name: str | None = None,
     force: bool = False,
     limit: int | None = None,
+    window_plan_version: str | None = None,
 ) -> dict[str, Any]:
-    """构建一个视觉表征；返回统计摘要。"""
+    """构建一个视觉表征；返回统计摘要。
+
+    window_plan_version 为空时走 v1 历史路径（visual_sequences 内置窗口 + 等权/旧 manifest
+    权重）；给出时走 v0.4.3.1 的窗口计划层：从 visual_window_sequences 读取窗口与显式
+    覆盖权重，默认登记 dense_visual_*_v2。
+    """
 
     version_row = catalog.get_visual_version(visual_version)
     if version_row is None:
@@ -142,19 +174,46 @@ def build_representation(
             f"视觉版本未登记: {visual_version}（先运行 tools/visual_pipeline.py run）"
         )
     encoder_tag = _encoder_tag(visual_version, str(version_row["model_id"]))
-    rep_name = name or VISUAL_REP_NAMES[encoder_tag]
-    params = {
-        "aggregation": "window-weighted-mean-l2",
-        "source": "visual_dense_windows",
-        "visual_version": visual_version,
-        "encoder": version_row["model_id"],
-        "revision": version_row["revision"],
-        "fps": float(version_row["fps"]),
-        "size": int(version_row["size"]),
-        "preprocess": str(version_row["preprocessing"]),
-        "window_seconds": float(config.media.clip_seconds),
-        "version": "dense_visual_v1",
-    }
+    if window_plan_version:
+        plan_row = catalog.get_visual_window_plan(window_plan_version)
+        if plan_row is None:
+            raise NebulaError(
+                f"窗口计划未登记: {window_plan_version}（先运行 tools/build_visual_windows.py）"
+            )
+        rep_name = name or VISUAL_REP_NAMES_V2[encoder_tag]
+        if rep_name not in VISUAL_REP_NAMES_V2.values():
+            raise NebulaError(
+                f"窗口计划模式请使用 v2 表征名（{sorted(VISUAL_REP_NAMES_V2.values())}），收到 {rep_name}"
+            )
+        params = {
+            "aggregation": "coverage-weighted-window-mean-l2",
+            "source": "visual_window_sequences",
+            "visual_version": visual_version,
+            "window_plan_version": window_plan_version,
+            "weight_scheme": str(plan_row["weight_scheme"]),
+            "clip_seconds": float(plan_row["clip_seconds"]),
+            "overlap_seconds": float(plan_row["overlap_seconds"]),
+            "encoder": version_row["model_id"],
+            "revision": version_row["revision"],
+            "fps": float(version_row["fps"]),
+            "size": int(version_row["size"]),
+            "preprocess": str(version_row["preprocessing"]),
+            "version": "dense_visual_v2",
+        }
+    else:
+        rep_name = name or VISUAL_REP_NAMES[encoder_tag]
+        params = {
+            "aggregation": "window-weighted-mean-l2",
+            "source": "visual_dense_windows",
+            "visual_version": visual_version,
+            "encoder": version_row["model_id"],
+            "revision": version_row["revision"],
+            "fps": float(version_row["fps"]),
+            "size": int(version_row["size"]),
+            "preprocess": str(version_row["preprocessing"]),
+            "window_seconds": float(config.media.clip_seconds),
+            "version": "dense_visual_v1",
+        }
     existing = catalog.get_representation(name=rep_name, sequence_version=visual_version)
     if existing is not None:
         if not force:
@@ -175,11 +234,22 @@ def build_representation(
             note="密集视觉窗口向量加权平均（不重编码）",
         )
     catalog.set_representation_status(rep_id, "building")
-    rows = [
-        row
-        for row in catalog.list_visual_sequences(version=visual_version, status="completed")
-        if row.get("windows_path")
-    ]
+    if window_plan_version:
+        rows = [
+            row
+            for row in catalog.list_visual_window_sequences(
+                frame_version=visual_version,
+                window_plan_version=window_plan_version,
+                status="completed",
+            )
+            if row.get("windows_path")
+        ]
+    else:
+        rows = [
+            row
+            for row in catalog.list_visual_sequences(version=visual_version, status="completed")
+            if row.get("windows_path")
+        ]
     duplicates = catalog.get_duplicate_work_ids()
     rows = [row for row in rows if int(row["work_id"]) not in duplicates]
     rows.sort(key=lambda row: int(row["work_id"]))
@@ -197,10 +267,18 @@ def build_representation(
             continue
         try:
             windows = np.load(windows_path, allow_pickle=False)
-            weights = _manifest_weights(
-                config.paths.visual_dense / visual_version / f"{work_id:06d}",
-                int(windows.shape[0]),
-            )
+            if window_plan_version:
+                weights_path = row.get("window_weights_path")
+                if not weights_path:
+                    raise NebulaError("窗口记录缺少 window_weights_path")
+                weights = _load_weight_file(
+                    config.data_path(str(weights_path)), int(windows.shape[0])
+                )
+            else:
+                weights = _manifest_weights(
+                    config.paths.visual_dense / visual_version / f"{work_id:06d}",
+                    int(windows.shape[0]),
+                )
             vector = aggregate_window_vectors(windows, weights)
             representations.save_representation_vectors(
                 catalog, config, {"id": rep_id, "name": rep_name, "sequence_version": visual_version},
@@ -232,14 +310,25 @@ def build_representation(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="构建 CLIP-only / DINOv2-only 密集视觉表征")
     parser.add_argument("--config", default=None, help="配置文件路径（默认 ./config.yaml）")
-    parser.add_argument("--visual-version", default=None, help="视觉序列版本；省略时按配置解析主版本")
+    parser.add_argument("--visual-version", default=None, help="视觉序列/帧编码版本；省略时按配置解析主版本")
     parser.add_argument(
         "--name",
         default=None,
-        choices=sorted(VISUAL_REP_NAMES.values()),
-        help="表征名；省略时按编码器自动选择",
+        choices=sorted(set(VISUAL_REP_NAMES.values()) | set(VISUAL_REP_NAMES_V2.values())),
+        help="表征名；省略时按编码器与模式自动选择（v1 或 v2）",
     )
-    parser.add_argument("--all-main", action="store_true", help="为配置中的全部主版本各构建一个表征")
+    parser.add_argument("--all-main", action="store_true", help="为配置中的全部主帧版本各构建一个表征")
+    parser.add_argument(
+        "--window-plan",
+        default=None,
+        help="窗口计划版本（v0.4.3.1）；给出时从 visual_window_sequences 读取显式覆盖权重并登记 v2 表征",
+    )
+    parser.add_argument(
+        "--v2",
+        action="store_true",
+        help="使用 config.visual_window_plan_version 构建覆盖权重 v2 表征（等价于 --window-plan <默认值> --all-main）",
+    )
+    parser.add_argument("--frame-version", default=None, help="v2 模式下的帧编码版本（默认全部主版本）")
     parser.add_argument("--force", action="store_true", help="清空并重建同版本表征")
     parser.add_argument("--limit", type=int, default=None, help="最多构建多少部（调试）")
     args = parser.parse_args(argv)
@@ -248,11 +337,24 @@ def main(argv: list[str] | None = None) -> int:
     catalog = Catalog(config.paths.db_path)
     catalog.initialize()
     try:
-        versions = (
-            _resolve_main_versions(config)
-            if args.all_main or args.visual_version is None
-            else [str(args.visual_version)]
+        window_plan = args.window_plan or (
+            config.visual_window_plan_version if args.v2 else None
         )
+        if window_plan:
+            if args.frame_version:
+                versions = [str(args.frame_version)]
+            elif args.all_main or args.v2 or args.visual_version is None:
+                versions = _resolve_main_versions(config)
+            else:
+                versions = [str(args.visual_version)]
+            if args.name and args.name not in set(VISUAL_REP_NAMES_V2.values()):
+                raise NebulaError("窗口计划模式请使用 v2 表征名（dense_visual_clip_v2 / dense_visual_dino_v2）")
+        else:
+            versions = (
+                _resolve_main_versions(config)
+                if args.all_main or args.visual_version is None
+                else [str(args.visual_version)]
+            )
         summaries = []
         for version in versions:
             summaries.append(
@@ -263,6 +365,7 @@ def main(argv: list[str] | None = None) -> int:
                     name=args.name,
                     force=bool(args.force),
                     limit=args.limit,
+                    window_plan_version=window_plan,
                 )
             )
     finally:
@@ -272,7 +375,8 @@ def main(argv: list[str] | None = None) -> int:
             f"  {summary['name']}@{summary['sequence_version']}: "
             f"{summary['n_built']} 部，dim={summary['dim']}，跳过 {summary['n_skipped']}"
         )
-    print(f"完成：{len(summaries)} 个密集视觉表征")
+    print(f"完成：{len(summaries)} 个密集视觉表征"
+          + (f"（窗口计划 {window_plan}）" if window_plan else ""))
     return 0
 
 

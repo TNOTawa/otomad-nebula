@@ -6,7 +6,13 @@ import numpy as np
 import pytest
 
 from nebula.errors import SamplingError
-from nebula.sampling import ClipPlan, CoverageClip, plan_clips, plan_full_coverage
+from nebula.sampling import (
+    ClipPlan,
+    CoverageClip,
+    coverage_weights,
+    plan_clips,
+    plan_full_coverage,
+)
 
 
 def test_long_video_five_non_overlapping_clips():
@@ -246,6 +252,102 @@ def test_coverage_deterministic():
 def test_coverage_does_not_change_plan_clips():
     assert plan_clips(12.0) == (ClipPlan(index=0, start_s=2.0, duration_s=8.0),)
     assert len(plan_clips(40.0)) == 5
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v0.4.3.1 coverage_weights：公开的 1/覆盖计数积分权重（与 plan_full_coverage 一致）
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_coverage_weights_hand_calculated_non_overlapping():
+    assert coverage_weights([(0.0, 8.0)], 8.0) == (1.0,)
+    assert coverage_weights([(0.0, 8.0), (8.0, 16.0)], 16.0) == (0.5, 0.5)
+    assert coverage_weights(
+        [(0.0, 4.0), (4.0, 8.0), (8.0, 12.0)], 12.0
+    ) == pytest.approx((1 / 3, 1 / 3, 1 / 3), abs=1e-9)
+
+
+def test_coverage_weights_hand_calculated_overlap():
+    # 窗口 [(0,8),(6,14),(12,20)] / duration=20：
+    # [0,6)->w0(6), [6,8)->各1, [8,12)->w1(4), [12,14)->各1, [14,20)->w2(6)
+    # 积分 (7,6,7) -> 权重 (0.35,0.30,0.35)
+    weights = coverage_weights([(0.0, 8.0), (6.0, 14.0), (12.0, 20.0)], 20.0)
+    assert weights == pytest.approx((0.35, 0.30, 0.35), abs=1e-9)
+    assert sum(weights) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_coverage_weights_13s_non_integer_window_count():
+    plans = plan_full_coverage(13.0)
+    windows = [(plan.start_s, plan.end_s) for plan in plans]
+    assert windows == [(0.0, 8.0), (5.0, 13.0)]
+    # [0,5)->w0(5), [5,8)->各1.5, [8,13)->w1(5) => 积分各 6.5 => 0.5/0.5
+    weights = coverage_weights(windows, 13.0)
+    assert weights == pytest.approx((0.5, 0.5), abs=1e-9)
+    assert sum(weights) == pytest.approx(1.0, abs=1e-9)
+    assert tuple(weights) == tuple(plan.weight for plan in plans)
+
+
+def test_coverage_weights_101_4s_non_integer():
+    duration = 101.4
+    plans = plan_full_coverage(duration)
+    windows = [(plan.start_s, plan.end_s) for plan in plans]
+    assert len(plans) == 13  # ceil((101.4-8)/8)+1
+    assert windows[0][0] == 0.0
+    assert plans[-1].end_s == pytest.approx(duration, abs=1e-6)
+    weights = coverage_weights(windows, duration)
+    assert len(weights) == len(plans)
+    assert sum(weights) == pytest.approx(1.0, abs=1e-6)
+    assert all(weight > 0.0 for weight in weights)
+    assert tuple(weights) == tuple(plan.weight for plan in plans)
+
+
+@pytest.mark.parametrize(
+    "duration", [8.0, 8.5, 9.0, 12.0, 13.0, 15.99, 16.1, 40.0, 101.4, 180.0]
+)
+def test_coverage_weights_match_plan_full_coverage(duration: float):
+    plans = plan_full_coverage(duration)
+    windows = [(plan.start_s, plan.end_s) for plan in plans]
+    weights = coverage_weights(windows, duration)
+    assert len(weights) == len(plans)
+    assert tuple(weights) == tuple(plan.weight for plan in plans)
+    assert sum(weights) == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("overlap", [0.5, 1.0, 2.0])
+def test_coverage_weights_match_plan_with_overlap(overlap: float):
+    duration = 37.21
+    plans = plan_full_coverage(duration, overlap_seconds=overlap)
+    windows = [(plan.start_s, plan.end_s) for plan in plans]
+    weights = coverage_weights(windows, duration)
+    assert tuple(weights) == tuple(plan.weight for plan in plans)
+    assert sum(weights) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_coverage_weights_rejects_bad_windows():
+    with pytest.raises(SamplingError, match="不能为空"):
+        coverage_weights([], 8.0)
+    # 开头/中间/结尾存在未覆盖间隙
+    for windows in (
+        [(1.0, 4.0), (4.0, 8.0)],
+        [(0.0, 4.0), (5.0, 8.0)],
+        [(0.0, 4.0)],
+    ):
+        with pytest.raises(SamplingError, match="未覆盖"):
+            coverage_weights(windows, 8.0)
+    # 越界 / 非法窗口 / 非法时长
+    with pytest.raises(SamplingError, match="超出视频时长"):
+        coverage_weights([(0.0, 9.0)], 8.0)
+    with pytest.raises(SamplingError):
+        coverage_weights([(4.0, 4.0)], 8.0)
+    with pytest.raises(SamplingError):
+        coverage_weights([(-1.0, 3.0), (3.0, 8.0)], 8.0)
+    with pytest.raises(SamplingError):
+        coverage_weights([(0.0,)], 8.0)  # type: ignore[list-item]
+    with pytest.raises(SamplingError, match="时长"):
+        coverage_weights([(0.0, 8.0)], 0.0)
+    with pytest.raises(SamplingError):
+        coverage_weights([(0.0, 8.0)], float("nan"))
+
 
 
 @pytest.mark.parametrize(

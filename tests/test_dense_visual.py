@@ -51,7 +51,7 @@ from nebula.dense_visual import (
     visual_version_slug,
 )
 from nebula.errors import NebulaError
-from nebula.sampling import plan_full_coverage
+from nebula.sampling import coverage_weights, plan_full_coverage
 from tests.fixtures.video_factory import build_video_library, media_tools_available
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -890,11 +890,13 @@ def test_save_load_bundle_roundtrip(tmp_path: Path, videos: dict[str, Path]):
         "dim",
         "n_windows",
         "window_times",
+        "window_weights",
         "created_at",
     ):
         assert key in manifest, key
     assert manifest["n_windows"] == 2
     assert manifest["window_times"] == [[0.0, 3.0], [3.0, 6.0]]
+    assert manifest["window_weights"] is None  # 未传权重时保持旧行为
     assert manifest["preprocess"] == "stretch"
     assert manifest["extra"] == {"work_id": 12}
 
@@ -914,6 +916,7 @@ def test_save_load_bundle_roundtrip(tmp_path: Path, videos: dict[str, Path]):
     assert np.allclose(bundle.windows, pooled, atol=1e-6)
     assert np.allclose(bundle.window_std, std, atol=1e-6)
     assert bundle.window_times == ((0.0, 3.0), (3.0, 6.0))
+    assert bundle.window_weights is None
     assert np.allclose(np.linalg.norm(bundle.windows, axis=1), 1.0, atol=1e-5)
     leftovers = [path.name for path in target.iterdir() if ".tmp" in path.name]
     assert leftovers == []
@@ -932,8 +935,10 @@ def test_save_bundle_feature_only(tmp_path: Path, videos: dict[str, Path]):
     assert bundle.windows is None
     assert bundle.window_std is None
     assert bundle.window_times is None
+    assert bundle.window_weights is None
     assert bundle.manifest["n_windows"] == 0
     assert bundle.manifest["window_times"] == []
+    assert bundle.manifest["window_weights"] is None
 
 
 def test_save_bundle_accepts_plain_lists(tmp_path: Path, videos: dict[str, Path]):
@@ -992,6 +997,183 @@ def test_save_bundle_validation_errors(tmp_path: Path, videos: dict[str, Path]):
         save_bundle(tmp_path / "h", features, extra={"bad": object()})  # type: ignore[dict-item]
 
 
+def test_save_load_bundle_window_weights_roundtrip(
+    tmp_path: Path, videos: dict[str, Path]
+):
+    features, pooled, std, window_pairs = _bundle_inputs(videos)
+    weights = coverage_weights(window_pairs, features.duration_s)
+    assert len(weights) == pooled.shape[0]
+    assert sum(weights) == pytest.approx(1.0, abs=1e-6)
+    target = tmp_path / "weights"
+    saved = save_bundle(
+        target,
+        features,
+        windows=pooled,
+        window_std=std,
+        window_times=window_pairs,
+        window_weights=weights,
+    )
+    manifest = json.loads(saved["manifest"].read_text(encoding="utf-8"))
+    assert manifest["window_weights"] == pytest.approx(list(weights), abs=1e-12)
+
+    bundle = load_bundle(target)
+    assert isinstance(bundle, VisualBundle)
+    assert bundle.window_weights is not None
+    assert bundle.window_weights.dtype == np.float64
+    assert bundle.window_weights.shape == (pooled.shape[0],)
+    assert np.allclose(bundle.window_weights, weights, atol=1e-12)
+    assert float(bundle.window_weights.sum()) == pytest.approx(1.0, abs=1e-6)
+
+    # 允许 list 输入且与窗口一一对应
+    save_bundle(
+        tmp_path / "weights-list",
+        features,
+        windows=pooled.tolist(),
+        window_times=[list(pair) for pair in window_pairs],
+        window_weights=list(weights),
+    )
+    listed = load_bundle(tmp_path / "weights-list")
+    assert listed is not None and listed.window_weights is not None
+    assert np.allclose(listed.window_weights, weights, atol=1e-12)
+
+
+def test_save_bundle_window_weights_validation(
+    tmp_path: Path, videos: dict[str, Path]
+):
+    features, pooled, _std, window_pairs = _bundle_inputs(videos)
+    with pytest.raises(DenseVisualError, match="window_weights"):
+        save_bundle(
+            tmp_path / "a", features, window_weights=[0.5, 0.5]
+        )
+    with pytest.raises(DenseVisualError, match="长度"):
+        save_bundle(
+            tmp_path / "b",
+            features,
+            windows=pooled,
+            window_times=window_pairs,
+            window_weights=[1.0],
+        )
+    with pytest.raises(DenseVisualError, match="负"):
+        save_bundle(
+            tmp_path / "c",
+            features,
+            windows=pooled,
+            window_times=window_pairs,
+            window_weights=[1.5, -0.5],
+        )
+    with pytest.raises(DenseVisualError, match="NaN"):
+        save_bundle(
+            tmp_path / "d",
+            features,
+            windows=pooled,
+            window_times=window_pairs,
+            window_weights=[0.5, float("nan")],
+        )
+    with pytest.raises(DenseVisualError, match="之和"):
+        save_bundle(
+            tmp_path / "e",
+            features,
+            windows=pooled,
+            window_times=window_pairs,
+            window_weights=[0.0, 0.0],
+        )
+    with pytest.raises(DenseVisualError, match="一维"):
+        save_bundle(
+            tmp_path / "f",
+            features,
+            windows=pooled,
+            window_times=window_pairs,
+            window_weights=np.asarray([[0.5, 0.5]], dtype=np.float64),
+        )
+
+
+def test_load_bundle_legacy_manifest_without_weights(
+    tmp_path: Path, videos: dict[str, Path]
+):
+    features, pooled, _std, window_pairs = _bundle_inputs(videos)
+    weights = coverage_weights(window_pairs, features.duration_s)
+    target = tmp_path / "legacy-no-weights"
+    saved = save_bundle(
+        target,
+        features,
+        windows=pooled,
+        window_times=window_pairs,
+        window_weights=weights,
+    )
+    manifest = json.loads(saved["manifest"].read_text(encoding="utf-8"))
+    manifest.pop("window_weights")  # 模拟 v0.4.3 旧 bundle（无该字段）
+    saved["manifest"].write_text(json.dumps(manifest), encoding="utf-8")
+    bundle = load_bundle(target)
+    assert bundle is not None
+    assert bundle.window_weights is None
+    assert bundle.windows is not None
+
+
+def test_load_bundle_accepts_legacy_logical_vs_slug_version(
+    tmp_path: Path, videos: dict[str, Path]
+):
+    """v0.4.3 旧数据：npz 存逻辑版本、manifest 存 slug 版本时应可读取。"""
+
+    logical_version = (
+        "openai/clip-vit-base-patch16@57c216476eefef5ab752ec549e440a49ae4ae5f3"
+        "__fps2_s16_letterbox"
+    )
+    features = _make_features(
+        _unit([[1, 0], [0, 1]]),
+        fps=1.0,
+        duration_s=2.0,
+        version=logical_version,
+        preprocess="letterbox",
+    )
+    windows = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    window_pairs = [(0.0, 1.0), (1.0, 2.0)]
+    target = tmp_path / "legacy-version"
+    saved = save_bundle(
+        target,
+        features,
+        windows=windows,
+        window_times=window_pairs,
+    )
+    manifest = json.loads(saved["manifest"].read_text(encoding="utf-8"))
+    slug_version = visual_version_slug(logical_version)
+    manifest["version"] = slug_version
+    saved["manifest"].write_text(json.dumps(manifest), encoding="utf-8")
+
+    bundle = load_bundle(target)
+    assert bundle is not None
+    # 兼容读取时采用 manifest（DB/目录）版本身份
+    assert bundle.features.version == slug_version
+    assert bundle.manifest["version"] == slug_version
+    assert bundle.windows is not None
+    loaded = load_features(target)
+    assert loaded is not None and loaded.version == slug_version
+
+    # 非 slug 等价的版本仍然报错
+    manifest["version"] = "totally-different-version"
+    saved["manifest"].write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(DenseVisualError, match="版本不一致"):
+        load_bundle(target)
+
+
+def test_load_bundle_corrupt_window_weights_raises(
+    tmp_path: Path, videos: dict[str, Path]
+):
+    features, pooled, _std, window_pairs = _bundle_inputs(videos)
+    target = tmp_path / "bad-weights"
+    saved = save_bundle(
+        target,
+        features,
+        windows=pooled,
+        window_times=window_pairs,
+        window_weights=[0.5, 0.5],
+    )
+    manifest = json.loads(saved["manifest"].read_text(encoding="utf-8"))
+    manifest["window_weights"] = [1.0]  # 长度与 n_windows 不一致
+    saved["manifest"].write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(DenseVisualError, match="window_weights"):
+        load_bundle(target)
+
+
 def test_load_bundle_legacy_manifest_fallback(tmp_path: Path, videos: dict[str, Path]):
     features = _extract_small_features(videos)
     target = tmp_path / "legacy"
@@ -1046,6 +1228,15 @@ def test_visual_bundle_validation():
         VisualBundle(features=features, window_times=((0.0, 1.0),))
     with pytest.raises(DenseVisualError, match="window_std"):
         VisualBundle(features=features, window_std=windows)
+    with pytest.raises(DenseVisualError, match="window_weights"):
+        VisualBundle(features=features, window_weights=np.asarray([1.0]))
+    with pytest.raises(DenseVisualError, match="长度"):
+        VisualBundle(
+            features=features,
+            windows=windows,
+            window_times=[(0.0, 1.0)],
+            window_weights=np.asarray([1.0, 0.0]),
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
