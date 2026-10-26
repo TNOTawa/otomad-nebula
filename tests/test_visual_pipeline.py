@@ -28,6 +28,8 @@ from nebula.dense_visual import (
     DENSE_VISUAL_MANIFEST_NAME,
     DenseVisualError,
     DenseVisualFeatures,
+    compress_version,
+    visual_version_slug,
 )
 from nebula.media import probe_media
 from nebula.sampling import plan_full_coverage
@@ -937,3 +939,12 @@ def test_resume_interrupted_in_progress_sequence(
     )
     assert window_row is not None and window_row["status"] == "completed"
     assert len(extractor.calls) == 1
+
+
+def test_compose_visual_version_is_filesystem_slug():
+    version = compose_visual_version("fake/model@rev-123", 8.0, 224, "letterbox")
+    assert "/" not in version and "@" not in version
+    assert version == visual_version_slug(
+        compress_version("fake/model@rev-123", 8.0, 224, "letterbox")
+    )
+

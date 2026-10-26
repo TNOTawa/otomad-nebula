@@ -73,6 +73,8 @@ CLI_CHECKS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("tools/explore_relations.py", ()),
     ("tools/audio_dense.py", ()),
     ("tools/train_v05beta.py", ()),
+    ("tools/build_v05_protocol.py", ()),
+    ("tools/train_v05_local.py", ()),
 )
 """必须能以 --help 成功运行的 CLI 入口（脚本, 子命令参数）。"""
 

@@ -177,11 +177,14 @@ def compose_visual_version(
     """按 dense_visual.compress_version 规则生成帧编码版本号（兼容 t1 新旧签名）。"""
 
     try:
-        return str(
+        raw = str(
             dense_visual.compress_version(encoder_version, fps, size, preprocess)  # type: ignore[call-arg]
         )
     except TypeError:
-        return str(dense_visual.compress_version(encoder_version, fps, size))
+        raw = str(dense_visual.compress_version(encoder_version, fps, size))
+    # DB/data 目录契约使用文件系统安全的 slug；model_id/revision 原值保存在
+    # visual_versions 行与 manifest 的 encoder/revision 字段中。
+    return str(dense_visual.visual_version_slug(raw))
 
 
 def encoder_version_for(model: str, revision: str) -> str:

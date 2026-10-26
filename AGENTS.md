@@ -54,7 +54,7 @@ v0.4.3.1 权重修复 `docs/reports/v0431-window-weights-and-versioning.md`；
 v0.4.4 共识 `docs/reports/v044-consensus-fusion.md`；
 v0.5-alpha 设计 `docs/plans/v0.5-alpha-temporal-model.md`、验证报告
 `docs/reports/v05-alpha-validation.md`（负结果）；本轮 v0.4.5/v0.5-beta 交付
-`docs/reports/v045-v05beta-delivery.md`、音频 pilot `docs/reports/v05beta-audio-pilot.md`；
+`docs/reports/v045-v05beta-delivery.md`、音频 pilot `docs/reports/v05beta-audio-pilot.md`；v0.5-beta v2 协议/局部时序/扩展 `docs/reports/v05beta-v2-protocol-local.md`；
 执行计划见 `音MAD星云计划 · 完整执行方案.md`。
 - **Build/setup:** Python 3.10 + `.venv`（uv）。`uv venv .venv`；`uv pip install -e ".[ml,dev]"`（ffmpeg/ffprobe 需在 PATH）；配置 `config.yaml`。
 - **Fast relevant tests:** `.\\.venv\\Scripts\\python.exe -m pytest tests -q`；`ruff check nebula tests`。

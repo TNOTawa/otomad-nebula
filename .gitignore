@@ -26,6 +26,8 @@ data/models/*
 !data/models/.gitkeep
 data/audio_dense/*
 !data/audio_dense/.gitkeep
+data/v05_protocol/*
+!data/v05_protocol/.gitkeep
 data/maps/*
 !data/maps/.gitkeep
 input/local/*

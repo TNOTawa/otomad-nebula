@@ -913,6 +913,23 @@ visual↔audio InfoNCE、相对时间 order、whitening/duration 去偏、更多
   `data/models/v05_beta_{42,43,44}/checkpoint.pt`、`logs/v05_beta_{42,43,44}_metrics.json`、
   `logs/v05_beta_summary.json`；详见 `docs/reports/v045-v05beta-delivery.md`。
 
+### v0.5-beta v2：协议修正、局部时序消融与数据扩展
+
+- 协议 v2：固定 K=6（1 正+5 负，**双向** ±1/2/4/8/16 bins）、K=32 retrieval、近重复候选进入独立
+  periodic 集；旧“Recall@5=93%”明确标注为 K≤6 下无信息量。真实 107 部/62,613 anchors，
+  test 3,681 anchors/12 部。旧 checkpoint 在新协议下仅比 simple_sync 高 0.4–0.5pp（17.9% vs 17.55%），
+  不能宣称显著优于简单基线；K=32 retrieval 旧模型 4.6–4.9% vs chance 3.125%。
+- 局部帧级时序模型：直接读已有 CLIP 8fps + MERT 75Hz 帧特征，3s 上下文/相对时间/边界 mask，
+  temporal 与 cross-attention 两档 128d、单一 InfoNCE；因 CPU 数据抽取成本，采用固定子集
+  （train 441/val 42/test 112/retrieval 112，12 test 部）做最小消融。temporal 3 seeds
+  test Top-1 **26.79±0.73%**、cross **25.00±0.73%**，高于同子集 simple_sync 16.07%/frozen 18.75%，
+  但 old beta 子集均值约 26.2%，且 **audio_zero 反而更高**（28.6–30.4%），说明模型尚未可靠利用音频。
+  **未通过停止条件**：不训练全曲编码器、不注册 DB/地图。
+- 数据扩展：解析 2022–2024 选票页得 1,858 个新 BV；先导入 12 部（work 123–134）成为独立
+  held-out，已完成 PE-AV/事件、CLIP/DINOv2、MERT 特征，不参与训练/调参/表征/地图。
+- 修复 `visual_pipeline.compose_visual_version` 未 slug 化 bug；详见
+  `docs/reports/v05beta-v2-protocol-local.md`。
+
 ### 界面使用
 
 - v0.4.4 新增“显示高维互为近邻连线”（默认关；只画 mutual，超过边数上限截断提示）与
