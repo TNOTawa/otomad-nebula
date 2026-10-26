@@ -128,10 +128,14 @@
   **delta**：vs random **+0.03108**、vs frozen projection **+0.02779**、vs simple_sync **+0.00912**；
 - 消融（seed 42）：normal 0.296557 / audio_zero 0.272916 / visual_zero 0.272916 /
   audio_replacement 0.268768 / time_shift 0.280796 —— 双模态置零/替换/时间偏移均掉点；
-- 结论：**weak positive / not passed**。方向一致（高于随机/冻结/简单同步、双模态消融均掉点、
+- **视觉编码器对照**：同协议只用 DINOv2 视觉塔（3 seeds，v05_beta_dino）test Top-1
+  **0.257156 ± 0.003501**，vs random +0.02184、vs frozen +0.02649、vs simple_sync
+  **−0.00220**；DINOv2 路径未复现弱正信号，说明当前结果依赖视觉编码器，不能归因于
+  “任意视觉特征”，也不能据此断言模型学到了稳健音画对应；
+- 结论：**weak positive / not passed**。方向一致（CLIP 塔高于随机/冻结/简单同步、双模态消融均掉点、
   无坍缩），但相对 simple_sync 仅 **+0.91pp**、bootstrap CI 宽、best epoch 仅 1–6，
   证据不足以宣布学会可靠局部音画对应；**不注册 DB/地图、不进入全曲编码、不改 alpha 负结论**；
-  下一轮需扩大 test/作品覆盖、固定更强基线、DINOv2 消融与跨作品负例；
+  下一轮需扩大 test/作品覆盖、固定更强基线、跨作品负例与时间戳级对齐；
 - 产物：`data/models/v05_beta_{42,43,44}/checkpoint.pt`、`logs/v05_beta_{42,43,44}_metrics.json`、
   `logs/v05_beta_summary.json`、候选清单 `logs/v05_beta_candidates_manifest.json`；
 - t4 复核：v05_beta_v1 manifest 无截断；summary 与 3 seeds metrics 逐一核对一致
