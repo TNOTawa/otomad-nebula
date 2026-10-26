@@ -246,6 +246,7 @@ def _representation_info(rep: Mapping[str, Any]) -> dict[str, Any]:
         "label": representation_label(str(rep["name"])),
         "sequence_version": str(rep["sequence_version"]),
         "kind": str(rep["kind"]),
+        "source_kind": str(rep.get("source_kind") or "pe_av"),
     }
 
 
@@ -1149,9 +1150,11 @@ def _cmd_list(cfg: Config) -> int:
         rep_label = (
             representation_label(str(rep["name"])) if rep is not None else "未登记（旧地图）"
         )
+        source_kind = str(row.get("source_kind") or "pe_av")
+        version_label = "视觉版本" if source_kind == "visual" else "序列版本"
         print(
             f"  {row['version']}  {int(row.get('n_works') or 0)} 部  "
-            f"表征={rep_label}  序列版本={row['embedding_version']}  状态={row['status']}  "
+            f"表征={rep_label}  {version_label}={row['embedding_version']}  状态={row['status']}  "
             f"n_neighbors={neighbors}  筛选={_describe_filter_spec(filter_spec)}  "
             f"创建于 {row['created_at']}{note}"
         )

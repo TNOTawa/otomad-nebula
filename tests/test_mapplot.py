@@ -26,7 +26,11 @@ from nebula.mapplot import (
     main,
     transform_new,
 )
-from nebula.representations import LEGACY_NAME
+from nebula.representations import (
+    DENSE_VISUAL_CLIP_V1,
+    DENSE_VISUAL_DINO_V1,
+    LEGACY_NAME,
+)
 
 VECTOR_DIM = 8
 WORK_COUNT = 8
@@ -678,17 +682,24 @@ def _register_derived_representation(
     work_ids: list[int],
     seed: int = 11,
     dim: int = 8,
+    register_embedding: bool = True,
+    source_kind: str = "pe_av",
 ) -> int:
-    """登记一个 synthetic 派生表征（joint 向量），返回 representation_id。"""
+    """登记一个 synthetic 派生表征（joint 向量），返回 representation_id。
+
+    register_embedding=False 用于 visual 表征：视觉序列版本不登记 PE-AV embedding version。
+    """
 
     from nebula import representations
 
-    _ensure_embedding_version(catalog, config, sequence_version)
+    if register_embedding:
+        _ensure_embedding_version(catalog, config, sequence_version)
     rep_id = catalog.register_representation(
         name,
         sequence_version=sequence_version,
         kind=kind,
         params={"synthetic": True, "dim": dim},
+        source_kind=source_kind,
     )
     rep = catalog.get_representation(rep_id)
     assert rep is not None
@@ -954,3 +965,351 @@ def test_default_representation_follows_sampling_mode(config: Config, catalog: C
     legacy_default = build_map(catalog, legacy_config, note="legacy 模式默认")
     assert legacy_default.representation_name == representations.LEGACY_NAME
     assert legacy_default.embedding_version == config.legacy_embedding_version
+
+
+# --------------------------------------------------------------------------- v0.4.3 视觉表征
+def _register_visual_representation(
+    catalog: Catalog,
+    config: Config,
+    *,
+    name: str,
+    sequence_version: str,
+    work_ids: list[int],
+    seed: int = 41,
+    dim: int = 8,
+) -> int:
+    """登记 visual_versions + 仅 joint 向量的 visual 表征（不登记 PE-AV version）。"""
+
+    is_dino = "dino" in name
+    catalog.register_visual_version(
+        sequence_version,
+        model_id=("facebook/dinov2-small" if is_dino else "openai/clip-vit-base-patch32"),
+        revision=(
+            "ed25f3a31f01632728cabb09d1542f84ab7b0056"
+            if is_dino
+            else "57c216476eefef5ab752ec549e440a49ae4ae5f3"
+        ),
+        preprocessing="letterbox",
+        fps=8.0,
+        size=224,
+        dim=dim,
+    )
+    return _register_derived_representation(
+        catalog,
+        config,
+        name=name,
+        sequence_version=sequence_version,
+        kind="visual",
+        work_ids=work_ids,
+        seed=seed,
+        dim=dim,
+        register_embedding=False,
+        source_kind="visual",
+    )
+
+
+def test_build_map_visual_representation(config: Config, catalog: Catalog):
+    from nebula import representations
+
+    groups = _seed_mixed_works(catalog, config)
+    rep_id = _register_visual_representation(
+        catalog,
+        config,
+        name=DENSE_VISUAL_CLIP_V1,
+        sequence_version="dense-visual-clip-v1",
+        work_ids=groups["all"],
+        seed=41,
+    )
+    result = build_map(
+        catalog,
+        config,
+        representation=DENSE_VISUAL_CLIP_V1,
+        sequence_version="dense-visual-clip-v1",
+        note="视觉 CLIP 地图",
+    )
+    assert result.representation_id == rep_id
+    assert result.representation_name == DENSE_VISUAL_CLIP_V1
+    assert result.embedding_version == "dense-visual-clip-v1"
+    assert result.n_works == len(groups["all"])
+    frame = _read_coords(result)
+    assert set(frame["work_id"].tolist()) == set(groups["all"])
+
+    map_row = catalog.get_map(result.version)
+    assert map_row["representation_id"] == rep_id
+    assert map_row["embedding_version"] == "dense-visual-clip-v1"
+    assert map_row["source_kind"] == "visual"
+    params = json.loads(map_row["params_json"])
+    assert params["representation"]["name"] == DENSE_VISUAL_CLIP_V1
+    assert params["representation"]["kind"] == "visual"
+    assert params["representation"]["source_kind"] == "visual"
+    assert "Dense Visual" in params["representation"]["label"]
+    meta = json.loads(
+        (result.coords_path.parent / "meta.json").read_text(encoding="utf-8")
+    )
+    assert meta["representation"]["kind"] == "visual"
+    assert meta["representation"]["source_kind"] == "visual"
+    assert meta["representation"]["sequence_version"] == "dense-visual-clip-v1"
+    assert representations.REPRESENTATION_LABELS[DENSE_VISUAL_CLIP_V1] in json.dumps(
+        params, ensure_ascii=False
+    )
+    assert [row["version"] for row in catalog.list_maps(representation_id=rep_id)] == [
+        result.version
+    ]
+    assert catalog.latest_map(representation_id=rep_id)["version"] == result.version
+
+
+def test_build_map_visual_two_spaces_isolated(config: Config, catalog: Catalog):
+    groups = _seed_mixed_works(catalog, config)
+    clip_id = _register_visual_representation(
+        catalog,
+        config,
+        name=DENSE_VISUAL_CLIP_V1,
+        sequence_version="dense-visual-clip-v1",
+        work_ids=groups["all"],
+        seed=51,
+    )
+    dino_id = _register_visual_representation(
+        catalog,
+        config,
+        name=DENSE_VISUAL_DINO_V1,
+        sequence_version="dense-visual-dino-v1",
+        work_ids=groups["all"],
+        seed=52,
+    )
+    clip_map = build_map(
+        catalog,
+        config,
+        representation=DENSE_VISUAL_CLIP_V1,
+        sequence_version="dense-visual-clip-v1",
+    )
+    dino_map = build_map(
+        catalog,
+        config,
+        representation=DENSE_VISUAL_DINO_V1,
+        sequence_version="dense-visual-dino-v1",
+    )
+    assert clip_map.representation_id == clip_id
+    assert dino_map.representation_id == dino_id
+    assert clip_map.version != dino_map.version
+    clip_row = catalog.get_map(clip_map.version)
+    dino_row = catalog.get_map(dino_map.version)
+    assert clip_row["representation_id"] == clip_id
+    assert dino_row["representation_id"] == dino_id
+    assert clip_row["embedding_version"] == "dense-visual-clip-v1"
+    assert dino_row["embedding_version"] == "dense-visual-dino-v1"
+    assert clip_row["source_kind"] == "visual"
+    assert dino_row["source_kind"] == "visual"
+    clip_frame = _read_coords(clip_map).set_index("work_id").sort_index()
+    dino_frame = _read_coords(dino_map).set_index("work_id").sort_index()
+    assert set(clip_frame.index) == set(dino_frame.index)
+    assert not np.allclose(
+        clip_frame[["x2", "y2", "x3", "y3", "z3"]].to_numpy(dtype=float),
+        dino_frame[["x2", "y2", "x3", "y3", "z3"]].to_numpy(dtype=float),
+    ), "不同视觉表征空间的坐标不应相同"
+
+
+def test_build_map_visual_filter_and_include_duplicates(
+    config: Config, catalog: Catalog
+):
+    groups = _seed_mixed_works(catalog, config)
+    _register_visual_representation(
+        catalog,
+        config,
+        name=DENSE_VISUAL_CLIP_V1,
+        sequence_version="dense-visual-clip-v1",
+        work_ids=groups["all"],
+        seed=61,
+    )
+    result = build_map(
+        catalog,
+        config,
+        representation=DENSE_VISUAL_CLIP_V1,
+        sequence_version="dense-visual-clip-v1",
+        filter_spec={"dataset": "bilibili"},
+    )
+    frame = _read_coords(result)
+    assert set(frame["work_id"].tolist()) == set(groups["bilibili"])
+    with pytest.raises(MapError, match="include_duplicates"):
+        build_map(
+            catalog,
+            config,
+            representation=DENSE_VISUAL_CLIP_V1,
+            sequence_version="dense-visual-clip-v1",
+            filter_spec={"include_duplicates": True},
+        )
+    with pytest.raises(MapError, match="没有 joint 向量"):
+        _register_visual_representation(
+            catalog,
+            config,
+            name=DENSE_VISUAL_DINO_V1,
+            sequence_version="dense-visual-dino-empty",
+            work_ids=[],
+        )
+        build_map(
+            catalog,
+            config,
+            representation=DENSE_VISUAL_DINO_V1,
+            sequence_version="dense-visual-dino-empty",
+        )
+
+
+def test_build_map_variants_visual(config: Config, catalog: Catalog):
+    from nebula import representations
+
+    groups = _seed_mixed_works(catalog, config)
+    rep_id = _register_visual_representation(
+        catalog,
+        config,
+        name=DENSE_VISUAL_CLIP_V1,
+        sequence_version="dense-visual-clip-v1",
+        work_ids=groups["all"],
+        seed=71,
+    )
+    results = build_map_variants(
+        catalog,
+        config,
+        n_neighbors_list=(3, 5),
+        representation=DENSE_VISUAL_CLIP_V1,
+        sequence_version="dense-visual-clip-v1",
+    )
+    assert len(results) == 2
+    for result in results:
+        assert result.representation_id == rep_id
+        assert result.representation_name == DENSE_VISUAL_CLIP_V1
+        map_row = catalog.get_map(result.version)
+        assert map_row["representation_id"] == rep_id
+        assert map_row["embedding_version"] == "dense-visual-clip-v1"
+        assert map_row["source_kind"] == "visual"
+        params = json.loads(map_row["params_json"])
+        assert params["representation"]["kind"] == "visual"
+        assert params["representation"]["source_kind"] == "visual"
+        assert representations.REPRESENTATION_LABELS[DENSE_VISUAL_CLIP_V1]
+    assert [
+        json.loads(catalog.get_map(result.version)["params_json"])["n_neighbors"]
+        for result in results
+    ] == [3, 5]
+
+
+def test_transform_new_visual_representation(config: Config, catalog: Catalog):
+    from nebula import representations
+
+    groups = _seed_mixed_works(catalog, config)
+    subset = groups["all"][:5]
+    rep_id = _register_visual_representation(
+        catalog,
+        config,
+        name=DENSE_VISUAL_CLIP_V1,
+        sequence_version="dense-visual-clip-v1",
+        work_ids=subset,
+        seed=81,
+    )
+    result = build_map(
+        catalog,
+        config,
+        representation=DENSE_VISUAL_CLIP_V1,
+        sequence_version="dense-visual-clip-v1",
+    )
+    old_frame = _read_coords(result).set_index("work_id")
+    new_work_id, _ = catalog.upsert_local_work(
+        "clips/新视觉作品.mp4", title="新视觉作品"
+    )
+    rep = catalog.get_representation(rep_id)
+    assert rep is not None
+    representations.save_representation_vectors(
+        catalog,
+        config,
+        rep,
+        new_work_id,
+        {"joint": np.asarray([1.0] + [0.0] * 7, dtype=np.float32)},
+    )
+    assert transform_new(catalog, config, map_version=result.version) == 1
+    new_frame = _read_coords(result).set_index("work_id")
+    assert new_work_id in new_frame.index
+    for work_id in old_frame.index:
+        for column in ("x2", "y2", "x3", "y3", "z3"):
+            assert new_frame.loc[work_id, column] == old_frame.loc[work_id, column]
+    map_row = catalog.get_map(result.version)
+    assert map_row["representation_id"] == rep_id
+    assert map_row["source_kind"] == "visual"
+
+
+def test_cli_visual_representation(config: Config, catalog: Catalog, capsys):
+    from nebula import representations
+
+    groups = _seed_mixed_works(catalog, config)
+    rep_id = _register_visual_representation(
+        catalog,
+        config,
+        name=DENSE_VISUAL_CLIP_V1,
+        sequence_version="dense-visual-clip-v1",
+        work_ids=groups["all"],
+        seed=91,
+    )
+    code = main(
+        [
+            "build",
+            "--config",
+            str(config.path),
+            "--representation",
+            "dense_visual_clip_v1",
+            "--sequence-version",
+            "dense-visual-clip-v1",
+            "--note",
+            "视觉 CLI",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    label = representations.REPRESENTATION_LABELS[DENSE_VISUAL_CLIP_V1]
+    assert label in out
+    assert "Dense Visual" in out
+    map_row = catalog.latest_map(representation_id=rep_id)
+    assert map_row is not None
+    assert map_row["embedding_version"] == "dense-visual-clip-v1"
+    assert map_row["source_kind"] == "visual"
+    rep_row = catalog.get_representation(int(map_row["representation_id"]))
+    assert rep_row["kind"] == "visual"
+    assert rep_row["source_kind"] == "visual"
+
+    assert main(["list", "--config", str(config.path)]) == 0
+    out = capsys.readouterr().out
+    assert label in out
+    assert "视觉版本=dense-visual-clip-v1" in out
+    assert "序列版本=dense-visual-clip-v1" not in out
+
+    assert (
+        main(
+            [
+                "build",
+                "--config",
+                str(config.path),
+                "--representation",
+                "dense_visual_clip_v1",
+                "--sequence-version",
+                "dense-visual-clip-v1",
+                "--include-duplicates",
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "include_duplicates" in captured.err
+
+    assert (
+        main(
+            [
+                "variants",
+                "--config",
+                str(config.path),
+                "--representation",
+                "dense_visual_clip_v1",
+                "--sequence-version",
+                "dense-visual-clip-v1",
+                "--n-neighbors",
+                "3",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "星云变体" in out

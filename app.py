@@ -842,6 +842,9 @@ def _render_timeline_panel(
             "曲线来自高频音画事件扫描并归一到 0..1；竖线为片段窗口起点。"
             "事件通道补充节奏/运动/突变信息，不代表逐帧语义理解。"
         )
+        if str(map_info.get("representation_source_kind") or "pe_av") == "visual":
+            st.caption("视觉表征空间不含事件时间轴（事件层属于 PE-AV 全片序列）。")
+            return
         if not sequence_version:
             st.caption("缺少序列版本信息，无法读取事件时间轴。")
             return
@@ -958,7 +961,10 @@ def _render_sidebar_map_settings(
             index=default_space_index,
             format_func=lambda index: spaces[index]["label"],
             key="representation_space",
-            help="Legacy / Full Mean / Temporal Stats 等表征空间；不同空间的坐标不可直接比较",
+            help=(
+                "Legacy / Full Mean / Temporal Stats / Dense Visual（CLIP、DINOv2）"
+                "等表征空间；不同空间的坐标不可直接比较"
+            ),
         )
         selected_space = spaces[int(space_index)]
         versions = list(selected_space["versions"])
@@ -1155,15 +1161,18 @@ def main() -> None:
         rep_options = []
     spaces = _build_representation_spaces(maps, rep_options)
 
-    # 默认打开“最新 ready 且无筛选的星云”，并自动定位它所属的表征空间；
-    # 用户可在侧栏切换到 Full Mean / Temporal Stats 等其他空间。
-    unfiltered_versions = [
-        str(row["version"])
-        for row in maps
-        if str(row.get("status")) == "ready" and not row.get("filter_json")
+    # 默认打开“最新 ready 且无筛选的 PE-AV 空间星云”（Dense Visual 为对照实验，
+    # 不抢占默认视图），并自动定位它所属的表征空间；用户可在侧栏切换其它空间。
+    ready_maps = [row for row in maps if str(row.get("status")) == "ready"]
+    unfiltered = [row for row in ready_maps if not row.get("filter_json")]
+    peav_unfiltered = [
+        row for row in unfiltered if str(row.get("source_kind") or "pe_av") == "pe_av"
     ]
+    default_pool = peav_unfiltered or unfiltered or ready_maps
     default_version = (
-        unfiltered_versions[-1] if unfiltered_versions else versions[-1]
+        str(default_pool[-1]["version"])
+        if default_pool
+        else versions[-1]
     )
     default_space_index = next(
         (
@@ -1205,8 +1214,13 @@ def main() -> None:
         _db_mtime_ns(cfg.paths.db_path),
     )
     index = similarity_state.index
+    version_kind_text = (
+        "视觉版本"
+        if str(map_info.get("representation_source_kind") or "pe_av") == "visual"
+        else "序列"
+    )
     st.sidebar.caption(
-        f"当前表征：{representation_label} · 序列 {embedding_version}"
+        f"当前表征：{representation_label} · {version_kind_text} {embedding_version}"
     )
     if index is not None:
         st.sidebar.caption(
@@ -1297,7 +1311,7 @@ def main() -> None:
     st.caption(
         f"星云版本 {version} · 表征 {representation_label} · "
         f"构建筛选 {_describe_filter_spec(map_info.get('filter_spec'))} · "
-        f"序列版本 {embedding_version} · 作品数 {map_info.get('n_works')} · "
+        f"{version_kind_text}版本 {embedding_version} · 作品数 {map_info.get('n_works')} · "
         f"创建于 {map_info.get('created_at')}"
     )
 

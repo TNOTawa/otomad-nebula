@@ -540,10 +540,10 @@ def test_bilibili_work_key_dedupes_by_bvid_and_part(catalog: Catalog) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def test_schema_v3_tables_and_columns(catalog: Catalog) -> None:
-    """v3 schema：v2 表/列保留，并新增表征/序列表与 v0.4 列；版本号必须为 3。"""
+def test_schema_v4_tables_and_columns(catalog: Catalog) -> None:
+    """v4 schema：保留 v2/v3 表列，并新增密集视觉表与 source_kind；版本号必须为 4。"""
 
-    assert SCHEMA_VERSION == "3"
+    assert SCHEMA_VERSION == "4"
     tables = {
         str(row[0])
         for row in catalog.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -555,11 +555,50 @@ def test_schema_v3_tables_and_columns(catalog: Catalog) -> None:
         "representations",
         "representation_vectors",
         "sequence_states",
+        "visual_versions",
+        "visual_sequences",
     } <= tables
     map_columns = {
         str(row[1]) for row in catalog.conn.execute("PRAGMA table_info(map_runs)").fetchall()
     }
-    assert {"filter_json", "representation_id"} <= map_columns
+    assert {"filter_json", "representation_id", "source_kind"} <= map_columns
+    representation_columns = {
+        str(row[1])
+        for row in catalog.conn.execute("PRAGMA table_info(representations)").fetchall()
+    }
+    assert {"sequence_version", "kind", "source_kind"} <= representation_columns
+    visual_version_columns = {
+        str(row[1])
+        for row in catalog.conn.execute("PRAGMA table_info(visual_versions)").fetchall()
+    }
+    assert {
+        "version",
+        "model_id",
+        "revision",
+        "preprocessing",
+        "fps",
+        "size",
+        "dim",
+        "params_json",
+    } <= visual_version_columns
+    visual_sequence_columns = {
+        str(row[1])
+        for row in catalog.conn.execute("PRAGMA table_info(visual_sequences)").fetchall()
+    }
+    assert {
+        "work_id",
+        "version",
+        "status",
+        "frames_path",
+        "windows_path",
+        "n_frames",
+        "n_windows",
+        "dim",
+        "decode_s",
+        "encode_s",
+        "model_load_s",
+        "total_s",
+    } <= visual_sequence_columns
     link_columns = {
         str(row[1]) for row in catalog.conn.execute("PRAGMA table_info(work_links)").fetchall()
     }
@@ -1065,6 +1104,335 @@ def test_compare_spaces_tool_import_boundary(repo_root: Path) -> None:
         tool,
         ("torch", "transformers", "umap", "streamlit", "plotly", "pandas", "nebula.embed"),
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v0.4.3：密集视觉版本 / 序列 / 视觉表征地图
+# ──────────────────────────────────────────────────────────────────────────────
+
+_VISUAL_CLIP_MODEL = "openai/clip-vit-base-patch16"
+_VISUAL_CLIP_REV = "57c216476eefef5ab752ec549e440a49ae4ae5f3"
+_VISUAL_DINO_MODEL = "facebook/dinov2-small"
+_VISUAL_DINO_REV = "ed25f3a31f01632728cabb09d1542f84ab7b0056"
+
+
+def _visual_version(
+    model: str,
+    revision: str,
+    *,
+    fps: float = 8.0,
+    size: int = 224,
+    preprocess: str = "letterbox",
+) -> str:
+    """按契约构造视觉版本号：encoder@revision__fps{fps}_s{size}_{preprocess}。"""
+
+    return f"{model}@{revision}__fps{fps:g}_s{size}_{preprocess}"
+
+
+def _register_visual_version(
+    catalog: Catalog,
+    version: str,
+    *,
+    model: str = _VISUAL_CLIP_MODEL,
+    revision: str = _VISUAL_CLIP_REV,
+    preprocess: str = "letterbox",
+    fps: float = 8.0,
+    size: int = 224,
+    dim: int = 512,
+) -> None:
+    catalog.register_visual_version(
+        version,
+        model_id=model,
+        revision=revision,
+        preprocessing=preprocess,
+        fps=fps,
+        size=size,
+        dim=dim,
+        params={"test": "v0.4.3-invariants"},
+    )
+
+
+def test_visual_version_identity_and_parameter_conflicts(catalog: Catalog) -> None:
+    """视觉版本身份含 encoder/revision/fps/size/preprocess；同版本参数冲突必须报错。"""
+
+    version = _visual_version(_VISUAL_CLIP_MODEL, _VISUAL_CLIP_REV)
+    assert _VISUAL_CLIP_REV in version and "letterbox" in version and "fps8" in version
+    _register_visual_version(catalog, version)
+    row = catalog.get_visual_version(version)
+    assert row is not None
+    assert row["model_id"] == _VISUAL_CLIP_MODEL
+    assert row["revision"] == _VISUAL_CLIP_REV
+    assert row["preprocessing"] == "letterbox"
+    assert float(row["fps"]) == pytest.approx(8.0)
+    assert int(row["size"]) == 224
+    assert int(row["dim"]) == 512
+    versions = {item["version"] for item in catalog.list_visual_versions()}
+    assert version in versions
+
+    # 幂等：同版本同参数重复登记不报错、不重复行
+    _register_visual_version(catalog, version)
+    assert len(catalog.list_visual_versions()) == 1
+
+    # 同版本任一身份参数变化都必须报错（防止静默覆盖）
+    with pytest.raises(DatabaseError):
+        _register_visual_version(catalog, version, revision="deadbeef" + _VISUAL_CLIP_REV)
+    with pytest.raises(DatabaseError):
+        _register_visual_version(catalog, version, fps=30.0)
+    with pytest.raises(DatabaseError):
+        _register_visual_version(catalog, version, size=336)
+    with pytest.raises(DatabaseError):
+        _register_visual_version(catalog, version, preprocess="stretch")
+
+    bad_version = _visual_version(_VISUAL_DINO_MODEL, _VISUAL_DINO_REV, preprocess="crop")
+    with pytest.raises(DatabaseError):
+        _register_visual_version(
+            catalog,
+            bad_version,
+            model=_VISUAL_DINO_MODEL,
+            revision=_VISUAL_DINO_REV,
+            preprocess="crop",
+            dim=384,
+        )
+    with pytest.raises(DatabaseError):
+        catalog.register_visual_version(
+            "",
+            model_id=_VISUAL_DINO_MODEL,
+            revision=_VISUAL_DINO_REV,
+            preprocessing="letterbox",
+            fps=8.0,
+            size=224,
+        )
+    with pytest.raises(DatabaseError):
+        catalog.register_visual_version(
+            "x",
+            model_id=_VISUAL_DINO_MODEL,
+            revision="",
+            preprocessing="letterbox",
+            fps=8.0,
+            size=224,
+        )
+    with pytest.raises(DatabaseError):
+        catalog.register_visual_version(
+            "y",
+            model_id=_VISUAL_DINO_MODEL,
+            revision=_VISUAL_DINO_REV,
+            preprocessing="letterbox",
+            fps=0.0,
+            size=224,
+        )
+
+
+def test_visual_sequence_status_and_primary_key(catalog: Catalog) -> None:
+    """visual_sequences：(work_id, version) 主键、状态机、计时非负与断点字段。"""
+
+    version = _visual_version(_VISUAL_CLIP_MODEL, _VISUAL_CLIP_REV)
+    _register_visual_version(catalog, version)
+    first = _v04_local_work(catalog, "visual-seq-1")
+    second = _v04_local_work(catalog, "visual-seq-2")
+
+    catalog.upsert_visual_sequence(first, version=version)
+    row = catalog.get_visual_sequence(first, version=version)
+    assert row is not None
+    assert row["status"] == "pending"
+    assert row["n_frames"] is None and row["n_windows"] is None
+    summary = catalog.visual_status_summary(version)
+    assert summary["pending"] == 1
+    assert summary["completed"] == 0
+
+    catalog.upsert_visual_sequence(
+        first,
+        version=version,
+        status="in_progress",
+        frames_path="visual_dense/x/000001/frames.npy",
+        windows_path="visual_dense/x/000001/windows.npy",
+        n_frames=100,
+        n_windows=13,
+        dim=512,
+        decode_s=1.5,
+        encode_s=2.5,
+        model_load_s=0.5,
+        total_s=4.5,
+    )
+    progressed = catalog.get_visual_sequence(first, version=version)
+    assert progressed is not None
+    assert progressed["status"] == "in_progress"
+    assert int(progressed["n_frames"]) == 100
+    assert int(progressed["n_windows"]) == 13
+    assert float(progressed["total_s"]) == pytest.approx(4.5)
+
+    catalog.upsert_visual_sequence(
+        first,
+        version=version,
+        status="completed",
+        frames_path="visual_dense/x/000001/frames.npy",
+        windows_path="visual_dense/x/000001/windows.npy",
+        n_frames=100,
+        n_windows=13,
+        dim=512,
+    )
+    completed = catalog.get_visual_sequence(first, version=version)
+    assert completed is not None and completed["status"] == "completed"
+    # 同一 (work_id, version) 始终是一行
+    assert len(catalog.list_visual_sequences(version=version, status="completed")) == 1
+    assert len(catalog.list_visual_sequences(version=version)) == 1
+
+    catalog.upsert_visual_sequence(second, version=version, status="completed", n_windows=2, dim=4)
+    summary = catalog.visual_status_summary(version)
+    assert summary["completed"] == 2 and summary["pending"] == 0
+
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_sequence(first, version=version, status="done")
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_sequence(first, version=version, total_s=-0.1)
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_sequence(first, version="missing_visual_version")
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_sequence(999999, version=version)
+
+
+def test_visual_representation_and_map_binding(catalog: Catalog) -> None:
+    """kind=visual 表征绑定 visual_versions；视觉地图 source_kind=visual 且版本一致。"""
+
+    version = _visual_version(_VISUAL_CLIP_MODEL, _VISUAL_CLIP_REV)
+    other_version = _visual_version(
+        _VISUAL_DINO_MODEL, _VISUAL_DINO_REV, preprocess="stretch"
+    )
+    _register_visual_version(catalog, version, dim=512)
+    _register_visual_version(
+        catalog,
+        other_version,
+        model=_VISUAL_DINO_MODEL,
+        revision=_VISUAL_DINO_REV,
+        preprocess="stretch",
+        dim=384,
+    )
+    work_id = _v04_local_work(catalog, "visual-map-work")
+
+    # 视觉版本不进入 PE-AV embedding_versions，二者命名空间独立
+    assert catalog.get_embedding_version(version) is None
+
+    rep_id = catalog.register_representation(
+        "dense_visual_clip_v1",
+        sequence_version=version,
+        kind="visual",
+        source_kind="visual",
+        params={"test": "visual-map", "dim": 512},
+    )
+    rep = catalog.get_representation(rep_id)
+    assert rep is not None
+    assert rep["kind"] == "visual"
+    assert rep["source_kind"] == "visual"
+    catalog.set_representation_status(rep_id, "ready", dim=512)
+
+    catalog.create_map_run(
+        "map_v100",
+        embedding_version=version,
+        params={"note": "visual map"},
+        coords=[(work_id, 1.0, 2.0, 3.0, 4.0, 5.0)],
+        representation_id=rep_id,
+    )
+    map_row = catalog.get_map("map_v100")
+    assert map_row is not None
+    assert map_row["source_kind"] == "visual"
+    assert int(map_row["representation_id"]) == rep_id
+    assert map_row["embedding_version"] == version
+
+    # 未登记视觉版本 / 用默认 pe_av 来源登记视觉版本都必须报错
+    with pytest.raises(DatabaseError):
+        catalog.register_representation(
+            "bad_visual_rep",
+            sequence_version="missing_visual_version",
+            kind="visual",
+            source_kind="visual",
+            params={},
+        )
+    with pytest.raises(DatabaseError):
+        catalog.register_representation(
+            "bad_visual_source",
+            sequence_version=version,
+            kind="visual",
+            params={},
+        )
+    # 地图的视觉版本与表征不一致必须拒绝
+    with pytest.raises(DatabaseError):
+        catalog.create_map_run(
+            "map_v101",
+            embedding_version=other_version,
+            params={},
+            coords=[(work_id, 0.0, 0.0, 0.0, 0.0, 0.0)],
+            representation_id=rep_id,
+        )
+
+
+def test_visual_versions_matrices_are_isolated(config: Config) -> None:
+    """不同视觉版本/编码器的表征矩阵彼此隔离，不混入同一矩阵。"""
+
+    catalog = Catalog(config.paths.db_path)
+    try:
+        catalog.initialize()
+        work_id = _v04_local_work(catalog, "visual-matrix-work")
+        # 表征向量目录直接使用 version 字符串，测试用短编码器标签避免 Windows 路径过长；
+        # 命名契约（encoder@revision__fps/size/preprocess）与真实 pipeline 一致。
+        clip_model = "clip-vit-b16"
+        dino_model = "dinov2-small"
+        clip_version = _visual_version(clip_model, _VISUAL_CLIP_REV)
+        dino_version = _visual_version(dino_model, _VISUAL_DINO_REV)
+        _register_visual_version(
+            catalog, clip_version, model=clip_model, revision=_VISUAL_CLIP_REV, dim=4
+        )
+        _register_visual_version(
+            catalog,
+            dino_version,
+            model=dino_model,
+            revision=_VISUAL_DINO_REV,
+            dim=3,
+        )
+        clip_rep_id = catalog.register_representation(
+            "dense_visual_clip_v1",
+            sequence_version=clip_version,
+            kind="visual",
+            source_kind="visual",
+            params={"dim": 4},
+        )
+        dino_rep_id = catalog.register_representation(
+            "dense_visual_dino_v1",
+            sequence_version=dino_version,
+            kind="visual",
+            source_kind="visual",
+            params={"dim": 3},
+        )
+        clip_rep = catalog.get_representation(clip_rep_id)
+        dino_rep = catalog.get_representation(dino_rep_id)
+        assert clip_rep is not None and dino_rep is not None
+        save_representation_vectors(
+            catalog, config, clip_rep, work_id, {"joint": np.asarray([1.0, 0.0, 0.0, 0.0])}
+        )
+        save_representation_vectors(
+            catalog, config, dino_rep, work_id, {"joint": np.asarray([0.0, 1.0, 0.0])}
+        )
+        catalog.set_representation_status(clip_rep_id, "ready", dim=4)
+        catalog.set_representation_status(dino_rep_id, "ready", dim=3)
+
+        clip_ids, clip_matrix = load_representation_matrix(
+            catalog, config, catalog.get_representation(clip_rep_id)
+        )
+        dino_ids, dino_matrix = load_representation_matrix(
+            catalog, config, catalog.get_representation(dino_rep_id)
+        )
+        assert list(clip_ids) == list(dino_ids) == [work_id]
+        assert clip_matrix.shape == (1, 4)
+        assert dino_matrix.shape == (1, 3)
+        assert clip_matrix[0].tolist() == pytest.approx([1.0, 0.0, 0.0, 0.0])
+        assert dino_matrix[0].tolist() == pytest.approx([0.0, 1.0, 0.0])
+        # 两个视觉版本各自解析到自己的表征
+        assert resolve_representation(
+            catalog, config, name="dense_visual_clip_v1", sequence_version=clip_version
+        )["id"] == clip_rep_id
+        assert resolve_representation(
+            catalog, config, name="dense_visual_dino_v1", sequence_version=dino_version
+        )["id"] == dino_rep_id
+    finally:
+        catalog.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────

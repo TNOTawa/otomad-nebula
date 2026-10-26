@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import hashlib
 import os
 import sys
 from dataclasses import dataclass
@@ -512,7 +513,16 @@ def compare_spaces(
 def _report_basename(space_a: Space, space_b: Space) -> str:
     name = f"{slugify(space_a.name)}_vs_{slugify(space_b.name)}"
     sequences = slugify(f"{space_a.sequence_version}_{space_b.sequence_version}")
-    return f"space_compare_{name}__{sequences}"
+    candidate = f"space_compare_{name}__{sequences}"
+    if len(candidate) > 150:
+        # 两个视觉版本都是长 slug 时，文件名会超过 Windows 路径上限；
+        # 截断序列部分并用 sha1 前缀保持唯一性。
+        import hashlib
+
+        digest = hashlib.sha1(sequences.encode("utf-8")).hexdigest()[:12]
+        sequences = f"{sequences[:70].rstrip('-_')}__{digest}"
+        candidate = f"space_compare_{name}__{sequences}"
+    return candidate
 
 
 def write_reports(

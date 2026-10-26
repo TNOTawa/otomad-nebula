@@ -656,15 +656,19 @@ def _register_representation(
     name: str = "full_mean_v1",
     sequence_version: str = "full-seq-v1",
     kind: str = "full_mean",
+    source_kind: str = "pe_av",
+    register_embedding: bool = True,
 ) -> int:
     from nebula import representations
 
-    _ensure_embedding_version(catalog, config, sequence_version)
+    if register_embedding:
+        _ensure_embedding_version(catalog, config, sequence_version)
     rep_id = catalog.register_representation(
         name,
         sequence_version=sequence_version,
         kind=kind,
         params={"synthetic": True},
+        source_kind=source_kind,
     )
     rep = catalog.get_representation(rep_id)
     assert rep is not None
@@ -868,3 +872,188 @@ def test_representation_mode_cache_reads_each_file_once(
         assert len(reads) == 3
     finally:
         index.close()
+
+
+
+# --------------------------------------------------------------------------- v0.4.3 视觉表征
+def _register_visual_representation(
+    catalog: Catalog,
+    config: Config,
+    *,
+    name: str,
+    sequence_version: str,
+    work_vectors: dict[int, dict[str, np.ndarray]],
+    dim: int = 8,
+) -> int:
+    """先登记 visual_versions，再登记 source_kind=visual 的表征与 joint 向量。"""
+
+    is_dino = "dino" in name
+    catalog.register_visual_version(
+        sequence_version,
+        model_id=(
+            "facebook/dinov2-small" if is_dino else "openai/clip-vit-base-patch16"
+        ),
+        revision=(
+            "ed25f3a31f01632728cabb09d1542f84ab7b0056"
+            if is_dino
+            else "57c216476eefef5ab752ec549e440a49ae4ae5f3"
+        ),
+        preprocessing="letterbox",
+        fps=8.0,
+        size=224,
+        dim=dim,
+    )
+    return _register_representation(
+        catalog,
+        config,
+        work_vectors=work_vectors,
+        name=name,
+        sequence_version=sequence_version,
+        kind="visual",
+        source_kind="visual",
+        register_embedding=False,
+    )
+
+
+def test_visual_representation_work_vectors(config: Config, catalog: Catalog):
+    ids = {
+        number: _add_work(catalog, config, number, kinds=("work_joint",))
+        for number in (1, 2, 3)
+    }
+    rep_id = _register_visual_representation(
+        catalog,
+        config,
+        name="dense_visual_clip_v1",
+        sequence_version="visual-clip-v1",
+        work_vectors={
+            ids[1]: {"joint": _unit([1.0, 0.0, 0.0, 0.0, 0.0])},
+            ids[2]: {"joint": _unit([0.0, 1.0, 0.0, 0.0, 0.0])},
+        },
+        dim=5,
+    )
+    index = load_similarity_index(catalog, config, representation_id=rep_id)
+    try:
+        assert index.representation_id == rep_id
+        assert index.representation_name == "dense_visual_clip_v1"
+        assert index.representation_source_kind == "visual"
+        assert index.sequence_version == "visual-clip-v1"
+        assert index.version == "visual-clip-v1"
+        assert index.work_ids == tuple(sorted([ids[1], ids[2]]))
+        assert ids[3] not in index.work_ids
+        assert index.available_kinds == ("work_joint",)
+        assert index.matrix("work_joint").shape == (2, 5)
+        assert index.similarity(ids[1], ids[2]) == pytest.approx(0.0, abs=1e-6)
+        assert index.neighbors(ids[1], kind="work_joint", k=1)[0].work_id == ids[2]
+        # 视觉序列通常没有 PE-AV clip_*：片段级优雅降级
+        assert index.available_clip_kinds == ()
+        with pytest.raises(NebulaError):
+            index.clip_matrix(ids[1])
+        with pytest.raises(NebulaError):
+            index.best_clip_pairs(ids[1], ids[2])
+    finally:
+        index.close()
+
+
+def test_visual_representation_clip_level_uses_sequence_version(
+    config: Config, catalog: Catalog
+):
+    """人工登记视觉版本同名字段的 clip_* 数据时，片段级仍按 rep.sequence_version 读取。"""
+
+    ids = {
+        number: _add_work(catalog, config, number, kinds=("work_joint",))
+        for number in (1, 2)
+    }
+    rep_id = _register_visual_representation(
+        catalog,
+        config,
+        name="dense_visual_dino_v1",
+        sequence_version="visual-dino-clips",
+        work_vectors={
+            ids[1]: {"joint": _unit([1.0, 0.0, 0.0, 0.0])},
+            ids[2]: {"joint": _unit([0.0, 1.0, 0.0, 0.0])},
+        },
+        dim=4,
+    )
+    # 人工模拟“视觉版本恰好也有 clip 向量”的片段级数据（真实视觉层默认没有）
+    for work_id in ids.values():
+        clips = np.vstack(
+            [
+                _unit([1.0, 0.0, 0.0, 0.0]),
+                _unit([0.0, 1.0, 0.0, 0.0]),
+                _unit([1.0, 1.0, 0.0, 0.0]),
+            ]
+        ).astype(np.float32)
+        _add_clip_vectors(
+            catalog,
+            config,
+            work_id,
+            version="visual-dino-clips",
+            matrices={"clip_joint": clips},
+        )
+    index = load_similarity_index(catalog, config, representation_id=rep_id)
+    try:
+        assert index.representation_source_kind == "visual"
+        assert index.available_kinds == ("work_joint",)
+        assert "clip_joint" in index.available_clip_kinds
+        assert index.clip_matrix(ids[1]).shape == (3, 4)
+        assert [item["start_s"] for item in index.clip_times(ids[1])] == [0.0, 10.0, 20.0]
+        assert index.has_clip_vector(ids[2], "clip_joint") is True
+        pairs = index.best_clip_pairs(ids[1], ids[2], "clip_joint", k=2)
+        assert len(pairs) == 2
+    finally:
+        index.close()
+
+
+def test_two_visual_representations_are_isolated(
+    config: Config, catalog: Catalog
+):
+    ids = {
+        number: _add_work(catalog, config, number, kinds=("work_joint",))
+        for number in (1, 2)
+    }
+    clip_id = _register_visual_representation(
+        catalog,
+        config,
+        name="dense_visual_clip_v1",
+        sequence_version="visual-clip-iso",
+        work_vectors={
+            ids[1]: {"joint": _unit([1.0, 0.0, 0.0, 0.0])},
+            ids[2]: {"joint": _unit([0.0, 1.0, 0.0, 0.0])},
+        },
+        dim=4,
+    )
+    dino_id = _register_visual_representation(
+        catalog,
+        config,
+        name="dense_visual_dino_v1",
+        sequence_version="visual-dino-iso",
+        work_vectors={
+            ids[1]: {"joint": _unit([0.0, 1.0, 0.0, 0.0])},
+            ids[2]: {"joint": _unit([0.0, 0.0, 1.0, 0.0])},
+        },
+        dim=4,
+    )
+    clip_index = load_similarity_index(catalog, config, representation_id=clip_id)
+    dino_index = load_similarity_index(catalog, config, representation_id=dino_id)
+    try:
+        assert clip_index.sequence_version == "visual-clip-iso"
+        assert dino_index.sequence_version == "visual-dino-iso"
+        assert clip_index.similarity(ids[1], ids[2]) == pytest.approx(0.0, abs=1e-6)
+        assert dino_index.similarity(ids[1], ids[2]) == pytest.approx(0.0, abs=1e-6)
+        clip_matrix = clip_index.matrix("work_joint")
+        dino_matrix = dino_index.matrix("work_joint")
+        np.testing.assert_allclose(
+            clip_matrix, np.eye(2, 4, dtype=np.float32), atol=1e-6
+        )
+        np.testing.assert_allclose(
+            dino_matrix,
+            np.asarray([[0, 1, 0, 0], [0, 0, 1, 0]], dtype=np.float32),
+            atol=1e-6,
+        )
+        assert not np.allclose(clip_matrix, dino_matrix), "两个视觉表征矩阵不应混用"
+        # 片段级均为空（各自 sequence_version 下没有 clip_*）
+        assert clip_index.available_clip_kinds == ()
+        assert dino_index.available_clip_kinds == ()
+    finally:
+        clip_index.close()
+        dino_index.close()

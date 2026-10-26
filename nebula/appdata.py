@@ -350,6 +350,33 @@ def _linked_local_file(
     return ""
 
 
+def select_default_map(cat: Catalog) -> dict[str, Any] | None:
+    """选择默认星云：优先最新 ready 且无筛选的 PE-AV 表征地图。
+
+    v0.4.3 的 Dense Visual 空间是对照实验，不应抢占默认视图；用户仍可在侧栏
+    显式切换。筛选地图不参与默认选择（与既有行为一致）。
+    """
+
+    maps = [m for m in cat.list_maps() if str(m.get("status")) == "ready"]
+    if not maps:
+        return cat.latest_map()
+
+    def _source_kind(row: Mapping[str, Any]) -> str:
+        rep_id = row.get("representation_id")
+        if rep_id is None:
+            return "pe_av"
+        rep = cat.get_representation(int(rep_id))
+        return str(rep.get("source_kind")) if rep else "pe_av"
+
+    unfiltered = [m for m in maps if not m.get("filter_json")]
+    preferred = [m for m in unfiltered if _source_kind(m) == "pe_av"]
+    pool = preferred or unfiltered or maps
+    return max(
+        pool,
+        key=lambda m: (str(m.get("created_at") or ""), str(m.get("version") or "")),
+    )
+
+
 def load_nebula_frame(
     cat: Catalog,
     cfg: Config,
@@ -364,7 +391,7 @@ def load_nebula_frame(
     """
 
     if map_version is None:
-        map_row = cat.latest_map()
+        map_row = select_default_map(cat)
         if map_row is None:
             raise MapError("还没有可用的星云版本，请先运行：map.py build")
     else:
@@ -471,6 +498,7 @@ def _map_representation_info(
                 "representation_label": representations.representation_label(str(rep["name"])),
                 "representation_sequence_version": str(rep["sequence_version"]),
                 "representation_kind": str(rep["kind"]),
+                "representation_source_kind": str(rep.get("source_kind") or "pe_av"),
             }
     sequence_version = str(map_row.get("embedding_version") or "")
     return {
@@ -481,6 +509,7 @@ def _map_representation_info(
         ),
         "representation_sequence_version": sequence_version,
         "representation_kind": "legacy",
+        "representation_source_kind": "pe_av",
     }
 
 
@@ -539,6 +568,7 @@ def load_representation_options(
         sequence_version: str | None,
         matches: list[Mapping[str, Any]],
         registered_flag: bool,
+        source_kind: str = "pe_av",
     ) -> None:
         options.append(
             {
@@ -546,6 +576,7 @@ def load_representation_options(
                 "representation_name": name,
                 "label": representations.representation_label(name),
                 "kind": kind,
+                "source_kind": source_kind,
                 "sequence_version": sequence_version,
                 "map_version": _latest_unfiltered_map_version(matches),
                 "n_maps": len(matches),
@@ -575,6 +606,7 @@ def load_representation_options(
             sequence_version=sequence_version,
             matches=matches,
             registered_flag=True,
+            source_kind=str(rep.get("source_kind") or "pe_av"),
         )
 
     # 没有任何已登记 legacy 表征、但存在旧地图时，合成一个 legacy 空间
@@ -617,20 +649,28 @@ def load_representation_options(
         matches = [
             row for row in orphan_maps if int(row["representation_id"]) == rep_id
         ]
+        orphan_rep = catalog.get_representation(rep_id)
         append_option(
             representation_id=rep_id,
             name=f"representation_{rep_id}",
-            kind=None,
+            kind=None if orphan_rep is None else str(orphan_rep["kind"]),
             sequence_version=str(matches[0].get("embedding_version")),
             matches=matches,
             registered_flag=False,
+            source_kind=(
+                "pe_av"
+                if orphan_rep is None
+                else str(orphan_rep.get("source_kind") or "pe_av")
+            ),
         )
 
     priority = {
         representations.LEGACY_NAME: 0,
         representations.FULL_MEAN_V1: 1,
         representations.TEMPORAL_STATS_V1: 2,
-        representations.TRANSFORMER_V1: 3,
+        representations.DENSE_VISUAL_CLIP_V1: 3,
+        representations.DENSE_VISUAL_DINO_V1: 4,
+        representations.TRANSFORMER_V1: 5,
     }
     options.sort(
         key=lambda option: (

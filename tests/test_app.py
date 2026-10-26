@@ -732,17 +732,21 @@ def _add_derived_representation(
     kind: str = "full_mean",
     seed: int = 31,
     dim: int = 8,
+    source_kind: str = "pe_av",
+    register_embedding: bool = True,
 ) -> int:
     """登记一个只含 joint 向量的 synthetic 派生表征，返回 id。"""
 
     from nebula import representations
 
-    _ensure_embedding_version(catalog, config, sequence_version)
+    if register_embedding:
+        _ensure_embedding_version(catalog, config, sequence_version)
     rep_id = catalog.register_representation(
         name,
         sequence_version=sequence_version,
         kind=kind,
         params={"synthetic": True},
+        source_kind=source_kind,
     )
     rep = catalog.get_representation(rep_id)
     assert rep is not None
@@ -915,3 +919,184 @@ def test_app_timeline_chart_count_guard(
     assert any("画面" in name for name in names)
     captions = [str(element.value) for element in app_test.caption]
     assert any("覆盖 100.0%" in caption for caption in captions)
+
+
+
+# --------------------------------------------------------------------------- v0.4.3 视觉表征空间
+def _add_visual_representation(
+    catalog: Catalog,
+    config: Config,
+    work_ids: list[int],
+    *,
+    name: str,
+    sequence_version: str,
+    seed: int = 91,
+    dim: int = 8,
+) -> int:
+    """登记 visual_versions + source_kind=visual 的 joint 表征并写向量。"""
+
+    is_dino = "dino" in name
+    catalog.register_visual_version(
+        sequence_version,
+        model_id=(
+            "facebook/dinov2-small" if is_dino else "openai/clip-vit-base-patch16"
+        ),
+        revision=(
+            "ed25f3a31f01632728cabb09d1542f84ab7b0056"
+            if is_dino
+            else "57c216476eefef5ab752ec549e440a49ae4ae5f3"
+        ),
+        preprocessing="letterbox",
+        fps=8.0,
+        size=224,
+        dim=dim,
+    )
+    return _add_derived_representation(
+        catalog,
+        config,
+        work_ids,
+        name=name,
+        sequence_version=sequence_version,
+        kind="visual",
+        seed=seed,
+        dim=dim,
+        source_kind="visual",
+        register_embedding=False,
+    )
+
+
+def test_app_all_spaces_including_visual(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids = _seed_app_data(catalog, config)  # map_v001：legacy / 6 部
+    _add_vectors(catalog, config, work_ids)  # legacy 空间有 3 类作品向量
+    full_rep = _add_derived_representation(
+        catalog, config, work_ids, sequence_version="full-seq-v1", seed=92
+    )
+    _add_map_version(
+        catalog,
+        config,
+        work_ids,
+        "map_v002",
+        representation_id=full_rep,
+        embedding_version="full-seq-v1",
+        note="Full Mean 地图",
+    )
+    temporal_rep = _add_derived_representation(
+        catalog,
+        config,
+        work_ids,
+        name="temporal_stats_v1",
+        sequence_version="temporal-seq-v1",
+        kind="temporal_stats",
+        seed=93,
+    )
+    _add_map_version(
+        catalog,
+        config,
+        work_ids,
+        "map_v003",
+        representation_id=temporal_rep,
+        embedding_version="temporal-seq-v1",
+        note="Temporal 地图",
+    )
+    clip_rep = _add_visual_representation(
+        catalog,
+        config,
+        work_ids,
+        name="dense_visual_clip_v1",
+        sequence_version="visual-clip-v1",
+        seed=94,
+    )
+    _add_map_version(
+        catalog,
+        config,
+        work_ids,
+        "map_v004",
+        representation_id=clip_rep,
+        embedding_version="visual-clip-v1",
+        note="视觉 CLIP 地图",
+    )
+    dino_rep = _add_visual_representation(
+        catalog,
+        config,
+        work_ids,
+        name="dense_visual_dino_v1",
+        sequence_version="visual-dino-v1",
+        seed=95,
+    )
+    _add_map_version(
+        catalog,
+        config,
+        work_ids,
+        "map_v005",
+        representation_id=dino_rep,
+        embedding_version="visual-dino-v1",
+        note="视觉 DINOv2 地图",
+    )
+
+    app_test = _run_app(monkeypatch, repo_root, config)
+    assert not app_test.exception
+    assert not app_test.error
+    labels = [str(label) for label in app_test.selectbox(key="representation_space").options]
+    assert labels == [
+        "Legacy（旧 5 片段平均）",
+        "Full Mean（全片平均）",
+        "Temporal Stats（时间结构）",
+        "Dense Visual·CLIP（密集视觉语义）",
+        "Dense Visual·DINOv2（密集视觉结构）",
+    ]
+    # 默认优先最新无筛选的 PE-AV 空间（Temporal Stats -> map_v003），视觉空间为对照
+    assert app_test.selectbox(key="representation_space").value == 2
+    assert app_test.selectbox(key="map_version").value == "map_v003"
+    assert len(_decode_array(_chart_spec(app_test)["data"][0]["x"])) == len(work_ids)
+    assert len(app_test.dataframe) == 1
+    assert len(app_test.get("plotly_chart")) >= 1
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("Temporal Stats" in caption for caption in captions)
+
+    expected = [
+        (
+            0,
+            "map_v001",
+            "Legacy（旧 5 片段平均）",
+            3,
+            f"序列版本 {config.embedding_version}",
+        ),
+        (1, "map_v002", "Full Mean（全片平均）", 1, "序列版本 full-seq-v1"),
+        (2, "map_v003", "Temporal Stats（时间结构）", 1, "序列版本 temporal-seq-v1"),
+        (
+            3,
+            "map_v004",
+            "Dense Visual·CLIP（密集视觉语义）",
+            1,
+            "视觉版本 visual-clip-v1",
+        ),
+    ]
+    for space_index, map_version, label, n_tables, version_text in expected:
+        app_test.selectbox(key="representation_space").set_value(space_index).run()
+        assert not app_test.exception
+        assert not app_test.error
+        assert app_test.selectbox(key="map_version").value == map_version
+        assert len(_decode_array(_chart_spec(app_test)["data"][0]["x"])) == len(work_ids)
+        assert len(app_test.dataframe) == n_tables
+        captions = [str(element.value) for element in app_test.caption]
+        assert any(label in caption for caption in captions), (label, captions[-3:])
+        assert any(
+            version_text in caption for caption in captions
+        ), (space_index, version_text, captions[-3:])
+        if space_index == 0:
+            assert any("序列 peav" in caption for caption in captions)
+
+    # 手动切到 DINOv2 视觉空间：版本措辞/时间轴提示/近邻表降级均正常
+    app_test.selectbox(key="representation_space").set_value(4).run()
+    assert not app_test.exception
+    assert not app_test.error
+    assert app_test.selectbox(key="map_version").value == "map_v005"
+    assert len(app_test.dataframe) == 1
+    assert len(app_test.get("plotly_chart")) == 1
+    assert "show_clip_panel" not in [element.key for element in app_test.checkbox]
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("Dense Visual·DINOv2" in caption for caption in captions)
+    assert any("视觉版本 visual-dino-v1" in caption for caption in captions)
+    assert any("视觉表征空间不含事件时间轴" in caption for caption in captions)

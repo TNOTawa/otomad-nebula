@@ -136,7 +136,9 @@ class SimilarityIndex:
             无表征模式（representation_id=None）下的序列版本，默认 config.embedding_version。
         representation_id:
             v0.4 表征 id。给定时作品级向量来自 nebula.representations（legacy 表征内部
-            仍读 embeddings），片段级仍读该表征 sequence_version 的 clip_* 向量。
+            仍读 embeddings；视觉表征读 representation_vectors），片段级仍读该表征
+            sequence_version 的 clip_* 向量；视觉序列通常没有 clip_*，此时
+            available_clip_kinds 为空并优雅降级。
         """
 
         self._config = config
@@ -150,10 +152,14 @@ class SimilarityIndex:
             if rep is None:
                 raise NebulaError(f"表征不存在: {self.representation_id}")
             self.representation_name: str | None = str(rep["name"])
+            self.representation_source_kind: str = str(
+                rep.get("source_kind") or "pe_av"
+            )
             self.sequence_version = str(rep["sequence_version"])
             self.version = self.sequence_version
         else:
             self.representation_name = None
+            self.representation_source_kind = "pe_av"
             self.version = str(version or config.embedding_version)
             self.sequence_version = self.version
 

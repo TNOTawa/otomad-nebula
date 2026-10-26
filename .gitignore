@@ -12,6 +12,10 @@ data/catalog.sqlite
 data/catalog.sqlite-*
 data/embeddings/*
 !data/embeddings/.gitkeep
+data/representations/*
+!data/representations/.gitkeep
+data/visual_dense/*
+!data/visual_dense/.gitkeep
 data/maps/*
 !data/maps/.gitkeep
 input/local/*

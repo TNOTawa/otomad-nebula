@@ -48,12 +48,12 @@
 
 - **Project:** otomad-nebula（音MAD星云计划）
 - **Purpose:** 用 PE-AV 多模态模型提取音MAD作品联合向量，持久化为可扩充的高维向量数据库，并用 UMAP 生成可交互 2D/3D 星云（外部元数据仅用于染色/筛选）。v0.4 的准确命名是**「全片覆盖与多尺度音画特征表征系统」**，不是「逐帧音MAD语义理解系统」：PE-AV 每 8s 仅 16 帧（≈2fps）稀疏语义，事件层是 30fps（96×54 灰度）/100Hz 统计；Temporal Stats 是人工分组/权重统计基线，**不是训练模型**；完整覆盖 ≠ 逐帧语义理解。
-- **Main entry point:** 方案文档要求的四个入口：`ingest.py`（导入/身份关联）、`pipeline.py`（下载/切片/编码/清理/计时；v0.4 用 `--sampling full_coverage` 开启全片覆盖）、`map.py`（UMAP 星云版本/筛选/变体/按表征建图）、`app.py`（Streamlit 可视化：2D/3D、近邻、染色、筛选、表征空间切换）；内部实现在 `nebula/`，新增 `similarity.py`（高维近邻）、`identity.py`（本地/BV 去重）、`stability.py`（片段稳定性）、`avsync.py`（错位实验）、`events.py`（高频事件）、`temporal.py`（Full Mean/Temporal Stats 聚合）、`representations.py`（表征注册/加载）。辅助入口：`tools/build_representation.py`、`tools/compare_spaces.py`、`tools/events_probe.py`。
-- **Architecture map:** `ARCHITECTURE.md`；接口与边界契约见 `docs/CONTRACTS.md` 与 `docs/CONTRACTS_V2.md`（v0.4 见 §10）；v0.4 设计契约 `docs/plans/v0.4-full-coverage-design.md`；全片表征分析 `docs/reports/full-coverage-analysis.md`；执行计划见 `音MAD星云计划 · 完整执行方案.md`。
+- **Main entry point:** 方案文档要求的四个入口：`ingest.py`（导入/身份关联）、`pipeline.py`（下载/切片/编码/清理/计时；v0.4 用 `--sampling full_coverage` 开启全片覆盖）、`map.py`（UMAP 星云版本/筛选/变体/按表征建图）、`app.py`（Streamlit 可视化：2D/3D、近邻、染色、筛选、表征空间切换）；内部实现在 `nebula/`，新增 `similarity.py`（高维近邻）、`identity.py`（本地/BV 去重）、`stability.py`（片段稳定性）、`avsync.py`（错位实验）、`events.py`（高频事件）、`temporal.py`（Full Mean/Temporal Stats 聚合）、`dense_visual.py`（v0.4.3 冻结视觉编码器/窗口池化）、`visual_pipeline.py`（v0.4.3 视觉批处理）、`representations.py`（表征注册/加载）。辅助入口：`tools/build_representation.py`、`tools/compare_spaces.py`、`tools/events_probe.py`、`tools/visual_pipeline.py`、`tools/build_dense_visual_representation.py`、`tools/dense_preprocess_compare.py`、`tools/embedding_diagnostics.py`。
+- **Architecture map:** `ARCHITECTURE.md`；接口与边界契约见 `docs/CONTRACTS.md` 与 `docs/CONTRACTS_V2.md`（v0.4 见 §10，v0.4.3 视觉契约见 §10.3）；v0.4 设计契约 `docs/plans/v0.4-full-coverage-design.md`；v0.4.3 设计 `docs/plans/v0.4.3-dense-visual-semantics.md`；pilot `docs/reports/dense-visual-pilot.md`；全片表征分析 `docs/reports/full-coverage-analysis.md`；视觉全量报告（数字已回填、t4 复核）`docs/reports/visual-dense-full-run.md`；执行计划见 `音MAD星云计划 · 完整执行方案.md`。
 - **Build/setup:** Python 3.10 + `.venv`（uv）。`uv venv .venv`；`uv pip install -e ".[ml,dev]"`（ffmpeg/ffprobe 需在 PATH）；配置 `config.yaml`。
 - **Fast relevant tests:** `.\\.venv\\Scripts\\python.exe -m pytest tests -q`；`ruff check nebula tests`。
 - **Full QA command:** `.\\.venv\\Scripts\\python.exe qa.py`（ruff + pytest + 文档 + CLI + config 五项；`--full` 含 model/network 测试）。
-- **Release/build artifact:** 本地 `streamlit run app.py` 网页；核心资产是 `data/catalog.sqlite` + `data/embeddings/` 高维向量（序列层），聚合后的派生表征在 `data/representations/`，星云版本在 `data/maps/`。
+- **Release/build artifact:** 本地 `streamlit run app.py` 网页；核心资产是 `data/catalog.sqlite` + `data/embeddings/` 高维向量（序列层），聚合后的派生表征在 `data/representations/`，v0.4.3 密集视觉特征在 `data/visual_dense/`，星云版本在 `data/maps/`。
 - **Critical data/compatibility notes:**
   - 外部元数据（年份/作者/排名/时长/发布日期）绝不进入模型编码或 UMAP 降维，只用于展示/染色/筛选。
   - 向量版本由模型版本+采样参数决定（`config.embedding_version`）；换模型/采样参数必须生成新版本，禁止覆盖旧版本。
@@ -70,6 +70,10 @@
   - **v0.4 全片覆盖**：`sampling.mode=full_coverage`（当前默认）无片段数上限、末尾锚定、窗口权重和为 1；编码按 `.partial/batch_*.npz` 原子分批，重启经 `sequence_states` 只补缺失批；超长视频需 `--allow-long`。真实 110 部共 4130 窗口（legacy 536），事件三件套 110/110。Bilibili 下载失败时优先 playurl 回退（v0.4），仍失败才记 failed。
   - **v0.4 空间隔离**：不同 sequence/representation 的向量禁止混入同一 UMAP 或近邻矩阵；`map_runs.representation_id` 必须与地图的 sequence version 一致；旧 `embedding_version` 目录与旧地图只读、不覆盖。
   - **v0.4 事件/时间结构**：`event_scan.npz`/`event_features.npy`/`clip_times.npy` 与窗口一一对应；事件只是节奏/运动补充，不宣称逐帧语义理解；`clip_times` 的 `weight` 用于加权聚合，时间结构不进入坐标以外的任何元数据。
+  - **v0.4.3 视觉命名空间**：逻辑 `visual_version` 形如 `model_id@revision__fps{fps}_s{size}_{preprocess}`（固定 CLIP/DINOv2 revision；默认 8fps/224/letterbox；30fps 仅子集）；**DB `visual_versions.version`、`data/visual_dense/` 目录与 `map_runs.embedding_version` 使用 `visual_version_slug`（slugify："/"、"@"→"-"）**，model_id/revision 原值保留；encoder/revision/fps/size/preprocess 任一变化必须新版本，禁止覆盖；与 PE-AV `sequence_version` 完全独立，禁止混入同一近邻/UMAP 矩阵。
+  - **v0.4.3 视觉层**：`visual_versions`/`visual_sequences`（schema v4，状态 pending/in_progress/completed/failed）记录版本与作品×版本任务；`data/visual_dense/<visual_version>/<work_id>/` 保存帧级 fp16（`dense_visual.npz`）+ 8s 窗口级 `windows.npy`/`window_std.npy` + manifest；只处理 canonical+completed 作品、每部只下载一次、断点续跑、全部任务成功后清理 temp。真实全量：4 个 visual_versions、**252/252 任务 completed**、8fps 每编码器 110 部/260,885 帧/4,130 窗口、30fps 子集每编码器 16 部/140,149 帧/593 窗口、存储 673.9MB。
+  - **v0.4.3 表征/地图**：窗口级视觉向量登记为 `kind=visual` 表征（`dense_visual_clip_v1`(id=4,512d)/`dense_visual_dino_v1`(id=5,384d)，各 110 向量），`source_kind=visual`；地图 `source_kind` 由表征推导，视觉地图 `embedding_version` 存视觉版本 slug；当前 `map_v013`（CLIP-only）/ `map_v014`（DINOv2-only）；默认地图仍优先 PE-AV 无筛选最新 `map_v012`，视觉空间需手动切换（5 空间）。
+  - **v0.4.3 能力边界**：冻结编码器帧级特征 + 固定窗口池化是“特征”而非“逐帧语义理解”；没有训练可学习音画时序模型；30fps 只服务帧级轨迹研究，不默认全量。
 
 ## Completion
 

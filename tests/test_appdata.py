@@ -162,6 +162,7 @@ def _seed_map(
     note: str = "测试星云",
     representation_id: int | None = None,
     embedding_version: str | None = None,
+    filter_spec: dict | None = None,
 ) -> None:
     coords = [
         (
@@ -183,6 +184,7 @@ def _seed_map(
         model_2d_path=f"maps/{version}/map_2d.joblib",
         model_3d_path=f"maps/{version}/map_3d.joblib",
         note=note,
+        filter_spec=filter_spec,
         representation_id=representation_id,
     )
 
@@ -789,15 +791,19 @@ def _create_representation(
     kind: str = "full_mean",
     seed: int = 21,
     dim: int = 8,
+    source_kind: str = "pe_av",
+    register_embedding: bool = True,
 ) -> int:
     from nebula import representations
 
-    _ensure_embedding_version(catalog, config, sequence_version)
+    if register_embedding:
+        _ensure_embedding_version(catalog, config, sequence_version)
     rep_id = catalog.register_representation(
         name,
         sequence_version=sequence_version,
         kind=kind,
         params={"synthetic": True},
+        source_kind=source_kind,
     )
     rep = catalog.get_representation(rep_id)
     assert rep is not None
@@ -960,3 +966,189 @@ def test_load_event_timeline(seeded, monkeypatch):
     assert load_event_timeline(catalog, config, sequence_version, work_id) is None
     with pytest.raises(MapError, match="作品不存在"):
         load_event_timeline(catalog, config, sequence_version, 99999)
+
+
+
+# --------------------------------------------------------------------------- v0.4.3 视觉表征
+def _create_visual_representation(
+    catalog: Catalog,
+    config: Config,
+    work_ids: list[int],
+    *,
+    name: str,
+    sequence_version: str,
+    seed: int = 71,
+    dim: int = 8,
+) -> int:
+    """登记 visual_versions + source_kind=visual 的 joint 表征。"""
+
+    is_dino = "dino" in name
+    catalog.register_visual_version(
+        sequence_version,
+        model_id=(
+            "facebook/dinov2-small" if is_dino else "openai/clip-vit-base-patch16"
+        ),
+        revision=(
+            "ed25f3a31f01632728cabb09d1542f84ab7b0056"
+            if is_dino
+            else "57c216476eefef5ab752ec549e440a49ae4ae5f3"
+        ),
+        preprocessing="letterbox",
+        fps=8.0,
+        size=224,
+        dim=dim,
+    )
+    return _create_representation(
+        catalog,
+        config,
+        work_ids,
+        name=name,
+        sequence_version=sequence_version,
+        kind="visual",
+        seed=seed,
+        dim=dim,
+        source_kind="visual",
+        register_embedding=False,
+    )
+
+
+def test_load_nebula_frame_visual_representation_info(seeded):
+    config, catalog, work_ids = seeded
+    visual_version = "visual-clip-v1"
+    rep_id = _create_visual_representation(
+        catalog,
+        config,
+        work_ids,
+        name="dense_visual_clip_v1",
+        sequence_version=visual_version,
+        seed=72,
+    )
+    _seed_map(
+        catalog,
+        config,
+        work_ids=work_ids,
+        version="map_v002",
+        representation_id=rep_id,
+        embedding_version=visual_version,
+        note="视觉 CLIP 地图",
+    )
+
+    # 视觉地图自身信息：显式指定版本读取
+    map_info, frame = load_nebula_frame(catalog, config, map_version="map_v002")
+    assert map_info["version"] == "map_v002"
+    assert map_info["source_kind"] == "visual"
+    assert map_info["representation_id"] == rep_id
+    assert map_info["representation_name"] == "dense_visual_clip_v1"
+    assert "Dense Visual·CLIP" in map_info["representation_label"]
+    assert map_info["representation_kind"] == "visual"
+    assert map_info["representation_source_kind"] == "visual"
+    assert map_info["representation_sequence_version"] == visual_version
+    assert map_info["embedding_version"] == visual_version
+    assert len(frame) == len(work_ids)
+    # 默认视图优先 PE-AV 空间（seeded fixture 的 map_v001），视觉空间不抢默认
+    default_info, _ = load_nebula_frame(catalog, config)
+    assert default_info["version"] == "map_v001"
+    assert default_info["source_kind"] == "pe_av"
+
+    # 视觉地图与 PE-AV 地图不同：embedding_version 是视觉版本字符串
+    legacy_info, _ = load_nebula_frame(catalog, config, map_version="map_v001")
+    assert legacy_info["source_kind"] == "pe_av"
+    assert legacy_info["representation_source_kind"] == "pe_av"
+    assert legacy_info["embedding_version"] == config.embedding_version
+
+
+def test_load_representation_options_all_spaces_with_visual(seeded):
+    from nebula import representations
+
+    config, catalog, work_ids = seeded
+    full_rep = _create_representation(catalog, config, work_ids, seed=73)
+    temporal_rep = _create_representation(
+        catalog,
+        config,
+        work_ids,
+        name="temporal_stats_v1",
+        sequence_version="temporal-seq-v1",
+        kind="temporal_stats",
+        seed=74,
+    )
+    clip_rep = _create_visual_representation(
+        catalog,
+        config,
+        work_ids,
+        name="dense_visual_clip_v1",
+        sequence_version="visual-clip-v1",
+        seed=75,
+    )
+    dino_rep = _create_visual_representation(
+        catalog,
+        config,
+        work_ids,
+        name="dense_visual_dino_v1",
+        sequence_version="visual-dino-v1",
+        seed=76,
+    )
+    _seed_map(
+        catalog, config, work_ids=work_ids, version="map_v002",
+        representation_id=full_rep, embedding_version="full-seq-v1",
+    )
+    _seed_map(
+        catalog, config, work_ids=work_ids, version="map_v003",
+        representation_id=temporal_rep, embedding_version="temporal-seq-v1",
+    )
+    _seed_map(
+        catalog, config, work_ids=work_ids, version="map_v004",
+        representation_id=clip_rep, embedding_version="visual-clip-v1",
+    )
+    # 视觉 CLIP 的筛选地图不应被选为空间默认地图
+    _seed_map(
+        catalog, config, work_ids=work_ids[:3], version="map_v005",
+        representation_id=clip_rep, embedding_version="visual-clip-v1",
+        filter_spec={"dataset": "local"},
+    )
+    _seed_map(
+        catalog, config, work_ids=work_ids, version="map_v006",
+        representation_id=dino_rep, embedding_version="visual-dino-v1",
+    )
+
+    options = load_representation_options(catalog, config)
+    names = [str(option["representation_name"]) for option in options]
+    assert names == [
+        "legacy_5clip_mean",
+        "full_mean_v1",
+        "temporal_stats_v1",
+        "dense_visual_clip_v1",
+        "dense_visual_dino_v1",
+    ]
+    by_name = {str(option["representation_name"]): option for option in options}
+    clip_option = by_name["dense_visual_clip_v1"]
+    dino_option = by_name["dense_visual_dino_v1"]
+    assert clip_option["kind"] == "visual"
+    assert clip_option["source_kind"] == "visual"
+    assert clip_option["sequence_version"] == "visual-clip-v1"
+    assert clip_option["map_version"] == "map_v004"  # 跳过筛选地图 map_v005
+    assert clip_option["n_maps"] == 2
+    assert "Dense Visual·CLIP" in clip_option["label"]
+    assert dino_option["label"] == representations.REPRESENTATION_LABELS[
+        representations.DENSE_VISUAL_DINO_V1
+    ]
+    assert dino_option["map_version"] == "map_v006"
+    assert dino_option["source_kind"] == "visual"
+    # PE-AV 空间仍为 pe_av
+    assert by_name["full_mean_v1"]["source_kind"] == "pe_av"
+    assert by_name["legacy_5clip_mean"]["source_kind"] == "pe_av"
+
+    maps = {str(row["version"]): row for row in catalog.list_maps()}
+    assert maps["map_v004"]["source_kind"] == "visual"
+    assert maps["map_v006"]["source_kind"] == "visual"
+    assert maps["map_v002"]["source_kind"] == "pe_av"
+    assert map_matches_representation(maps["map_v004"], clip_option) is True
+    assert map_matches_representation(maps["map_v004"], dino_option) is False
+    assert map_matches_representation(maps["map_v002"], clip_option) is False
+
+    # v0.4.3 起默认视图优先最新无筛选的 PE-AV 空间（视觉空间是对照实验，不抢默认）；
+    # 最新无筛选的 PE-AV 地图是 map_v003（Temporal Stats）。
+    map_info, frame = load_nebula_frame(catalog, config)
+    assert map_info["source_kind"] == "pe_av"
+    assert map_info["version"] == "map_v003"
+    assert map_info["representation_name"] == "temporal_stats_v1"
+    assert len(frame) == len(work_ids)

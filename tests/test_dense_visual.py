@@ -23,28 +23,40 @@ import numpy as np
 import pytest
 
 from nebula import dense_visual as dense_module
+from nebula.config import load_config
 from nebula.dense_visual import (
+    DENSE_VISUAL_LEGACY_MANIFEST_NAME,
     DENSE_VISUAL_MANIFEST_NAME,
     DENSE_VISUAL_NPZ_NAME,
+    PREPROCESS_MODES,
+    WINDOW_STD_NPY_NAME,
+    WINDOWS_NPY_NAME,
     DenseVisualError,
     DenseVisualFeatures,
     HFImageEncoder,
+    VisualBundle,
     VisualEncoder,
+    build_video_filter,
     compress_version,
     extract_dense_features,
     iter_frame_batches,
+    load_bundle,
     load_dense_visual,
     load_features,
     pool_windows,
     pool_windows_std,
+    save_bundle,
     save_dense_visual,
     save_features,
+    visual_version_slug,
 )
+from nebula.errors import NebulaError
 from nebula.sampling import plan_full_coverage
 from tests.fixtures.video_factory import build_video_library, media_tools_available
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI_PATH = REPO_ROOT / "tools" / "dense_visual_pilot.py"
+COMPARE_CLI_PATH = REPO_ROOT / "tools" / "dense_preprocess_compare.py"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -97,9 +109,10 @@ def _make_features(
     *,
     fps: float = 1.0,
     duration_s: float | None = None,
-    version: str = "fake__fps1_s4",
+    version: str = "fake__fps1_s4_stretch",
     encoder: str = "fake",
     size: int = 4,
+    preprocess: str = "stretch",
 ) -> DenseVisualFeatures:
     matrix = np.asarray(per_frame, dtype=np.float32)
     if matrix.ndim != 2:
@@ -118,6 +131,7 @@ def _make_features(
         model_load_s=0.0,
         encoder=encoder,
         size=size,
+        preprocess=preprocess,
         created_at="2026-01-01T00:00:00Z",
     )
 
@@ -126,7 +140,9 @@ def _make_features(
 def videos() -> dict[str, Path]:
     if not media_tools_available():
         pytest.skip("缺少 ffmpeg/ffprobe")
-    return build_video_library(names=["mid_12s.mp4", "silent_6s.mp4", "tiny_05s.mp4"])
+    return build_video_library(
+        names=["mid_12s.mp4", "silent_6s.mp4", "tiny_05s.mp4", "short_4s.mp4"]
+    )
 
 
 def _collect_batches(source: Path, **kwargs) -> list[np.ndarray]:
@@ -245,9 +261,10 @@ def test_extract_features_with_fake_encoder(videos: dict[str, Path]):
     assert np.allclose(norms, 1.0, atol=1e-5)
     assert features.fps == pytest.approx(2.0)
     assert features.duration_s == pytest.approx(12.0, abs=0.1)
-    assert features.version == "fake-visual-v1__fps2_s32"
+    assert features.version == "fake-visual-v1__fps2_s32_stretch"
     assert features.version.startswith(encoder.version)
     assert "fps2" in features.version and "s32" in features.version
+    assert features.preprocess == "stretch"
     assert features.decode_s > 0.0
     assert features.encode_s >= 0.0
     assert features.model_load_s == 0.0
@@ -443,10 +460,33 @@ def test_features_validation_rejects_nan_and_bad_timing():
 
 
 def test_compress_version():
-    assert compress_version("clip-x", 8, 224) == "clip-x__fps8_s224"
-    assert compress_version("dinov2", 7.5, 336) == "dinov2__fps7.5_s336"
+    assert compress_version("clip-x", 8, 224) == "clip-x__fps8_s224_stretch"
+    assert (
+        compress_version("dinov2", 7.5, 336, "letterbox")
+        == "dinov2__fps7.5_s336_letterbox"
+    )
+    # CONTRACTS_V2 §10.3：版本号保留 encoder@revision 原始形式
+    raw = compress_version(
+        "openai/clip-vit-base-patch16@57c216476eefef5ab752ec549e440a49ae4ae5f3",
+        8,
+        224,
+        "letterbox",
+    )
+    assert raw == (
+        "openai/clip-vit-base-patch16@57c216476eefef5ab752ec549e440a49ae4ae5f3"
+        "__fps8_s224_letterbox"
+    )
+    # 文件系统安全目录名另行 slug（可选辅助函数）
+    assert visual_version_slug(raw) == (
+        "openai-clip-vit-base-patch16-57c216476eefef5ab752ec549e440a49ae4ae5f3"
+        "__fps8_s224_letterbox"
+    )
     with pytest.raises(DenseVisualError):
         compress_version("", 8, 224)
+    with pytest.raises(DenseVisualError, match="preprocess"):
+        compress_version("clip-x", 8, 224, "crop")
+    with pytest.raises(DenseVisualError, match="version"):
+        visual_version_slug("")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -479,15 +519,21 @@ def test_save_load_roundtrip(tmp_path: Path, videos: dict[str, Path]):
         "revision",
         "fps",
         "size",
+        "preprocess",
         "duration_s",
         "n_frames",
         "dim",
+        "n_windows",
+        "window_times",
         "created_at",
     ):
         assert key in manifest, key
     assert manifest["version"] == features.version
     assert manifest["encoder"] == features.encoder
     assert manifest["dtype"] == "float16"
+    assert manifest["preprocess"] == "stretch"
+    assert manifest["n_windows"] == 0
+    assert manifest["window_times"] == []
 
     loaded = load_features(tmp_path / "out")
     assert loaded is not None
@@ -499,7 +545,10 @@ def test_save_load_roundtrip(tmp_path: Path, videos: dict[str, Path]):
     assert loaded.version == features.version
     assert loaded.encoder == features.encoder
     assert loaded.size == features.size
+    assert loaded.preprocess == "stretch"
     assert np.allclose(loaded.per_frame, features.per_frame, atol=2e-3)
+    bundle = load_bundle(tmp_path / "out")
+    assert bundle is not None and bundle.windows is None and bundle.window_times is None
     assert np.allclose(np.linalg.norm(loaded.per_frame, axis=1), 1.0, atol=2e-3)
     leftovers = [path.name for path in saved["npz"].parent.iterdir() if ".tmp" in path.name]
     assert leftovers == []
@@ -635,7 +684,16 @@ def test_cli_help_runs_offline():
     )
     assert proc.returncode == 0, proc.stderr
     assert "密集视觉" in proc.stdout
-    for flag in ("--encoder", "--local-relpath", "--fps", "--limit", "--out-dir", "--json"):
+    for flag in (
+        "--encoder",
+        "--local-relpath",
+        "--fps",
+        "--preprocess",
+        "--limit",
+        "--out-dir",
+        "--save-bundle",
+        "--json",
+    ):
         assert flag in proc.stdout, flag
 
 
@@ -663,6 +721,20 @@ def test_cli_parser_and_encoder_aliases():
     assert args.limit == 3
     assert args.out_dir == "temp/x"
     assert args.json is True
+    assert args.preprocess is None
+    assert args.save_bundle is False
+    explicit = parser.parse_args(
+        ["--source", "v.mp4", "--preprocess", "letterbox", "--save-bundle"]
+    )
+    assert explicit.preprocess == "letterbox"
+    assert explicit.save_bundle is True
+
+    config = load_config(REPO_ROOT / "config.yaml")
+    model, revision = module.resolve_encoder_spec(config, encoder=None, revision=None)
+    assert model == config.visual_dense.encoders[0].model
+    assert revision == config.visual_dense.encoders[0].revision
+    with pytest.raises(DenseVisualError, match="revision"):
+        module.resolve_encoder_spec(config, encoder="unknown/no-revision", revision=None)
     assert module.resolve_encoder_id("dinov2-small") == "facebook/dinov2-small"
     assert module.resolve_encoder_id("openai/clip-vit-base-patch16") == (
         "openai/clip-vit-base-patch16"
@@ -689,3 +761,413 @@ def test_cli_missing_source_reports_error_offline(tmp_path: Path):
     )
     assert proc.returncode == 1
     assert "不存在" in proc.stderr
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v0.4.3：预处理 filter / letterbox 解码 / 版本
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_build_video_filter_stretch_and_letterbox():
+    assert PREPROCESS_MODES == ("stretch", "letterbox")
+    assert build_video_filter(fps=8, size=224) == "fps=8,scale=224:224,format=rgb24"
+    assert (
+        build_video_filter(fps=8, size=224, preprocess="stretch")
+        == "fps=8,scale=224:224,format=rgb24"
+    )
+    assert build_video_filter(
+        fps=7.5, size=336, preprocess="letterbox"
+    ) == (
+        "fps=7.5,scale=336:336:force_original_aspect_ratio=decrease,"
+        "pad=336:336:(ow-iw)/2:(oh-ih)/2:color=black,format=rgb24"
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"preprocess": "crop"},
+        {"preprocess": ""},
+        {"fps": 0},
+        {"fps": -1},
+        {"size": 1},
+        {"size": 0},
+    ],
+)
+def test_build_video_filter_invalid_params(kwargs: dict):
+    arguments = {"fps": 2, "size": 16, "preprocess": "stretch", **kwargs}
+    with pytest.raises(DenseVisualError):
+        build_video_filter(**arguments)
+
+
+def test_iter_frame_batches_letterbox_black_bars(videos: dict[str, Path]):
+    batch = next(
+        iter(
+            iter_frame_batches(
+                videos["short_4s.mp4"],
+                fps=2,
+                size=64,
+                batch_size=1,
+                preprocess="letterbox",
+            )
+        )
+    )
+    frame = batch[0]
+    assert frame.shape == (64, 64, 3)
+    # 160x120 (4:3) -> 64x48，上下各 8 行黑边
+    assert np.all(frame[:8] == 0)
+    assert np.all(frame[-8:] == 0)
+    assert np.any(frame[8:-8] != 0), "letterbox 中间区域应有画面内容"
+
+    stretched = next(
+        iter(
+            iter_frame_batches(
+                videos["short_4s.mp4"], fps=2, size=64, batch_size=1, preprocess="stretch"
+            )
+        )
+    )
+    assert stretched[0].shape == (64, 64, 3)
+    assert np.any(stretched[0] != 0)
+
+
+def test_extract_features_letterbox_version_and_preprocess(videos: dict[str, Path]):
+    features = extract_dense_features(
+        videos["short_4s.mp4"],
+        FakeVisualEncoder(dim=7),
+        fps=2,
+        size=64,
+        batch_size=2,
+        preprocess="letterbox",
+    )
+    assert features.preprocess == "letterbox"
+    assert features.version.endswith("__fps2_s64_letterbox")
+    assert "fps2" in features.version and "s64" in features.version
+    assert np.allclose(np.linalg.norm(features.per_frame, axis=1), 1.0, atol=1e-5)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v0.4.3：bundle 保存 / 读取（帧级 + 窗口级）
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _bundle_inputs(videos: dict[str, Path]):
+    features = _extract_small_features(videos)
+    window_pairs = [(0.0, 3.0), (3.0, 6.0)]
+    pooled = pool_windows(features, window_pairs)
+    std = pool_windows_std(features, window_pairs)
+    return features, pooled, std, window_pairs
+
+
+def test_save_load_bundle_roundtrip(tmp_path: Path, videos: dict[str, Path]):
+    features, pooled, std, window_pairs = _bundle_inputs(videos)
+    target = tmp_path / "bundle"
+    saved = save_bundle(
+        target,
+        features,
+        windows=pooled,
+        window_std=std,
+        window_times=window_pairs,
+        extra={"work_id": 12},
+    )
+    assert set(saved) == {"npz", "windows", "window_std", "manifest"}
+    assert saved["npz"] == target / DENSE_VISUAL_NPZ_NAME
+    assert saved["windows"] == target / WINDOWS_NPY_NAME
+    assert saved["window_std"] == target / WINDOW_STD_NPY_NAME
+    assert saved["manifest"] == target / DENSE_VISUAL_MANIFEST_NAME
+    for path in saved.values():
+        assert path.is_file()
+
+    manifest = json.loads(saved["manifest"].read_text(encoding="utf-8"))
+    for key in (
+        "version",
+        "encoder",
+        "revision",
+        "fps",
+        "size",
+        "preprocess",
+        "duration_s",
+        "n_frames",
+        "dim",
+        "n_windows",
+        "window_times",
+        "created_at",
+    ):
+        assert key in manifest, key
+    assert manifest["n_windows"] == 2
+    assert manifest["window_times"] == [[0.0, 3.0], [3.0, 6.0]]
+    assert manifest["preprocess"] == "stretch"
+    assert manifest["extra"] == {"work_id": 12}
+
+    windows_array = np.load(saved["windows"], allow_pickle=False)
+    assert windows_array.dtype == np.float32
+    assert windows_array.shape == pooled.shape
+    std_array = np.load(saved["window_std"], allow_pickle=False)
+    assert std_array.dtype == np.float32
+    assert np.all(std_array >= 0.0)
+
+    bundle = load_bundle(target)
+    assert isinstance(bundle, VisualBundle)
+    assert bundle.features.version == features.version
+    assert bundle.manifest["n_windows"] == 2
+    assert bundle.windows is not None and bundle.window_std is not None
+    assert bundle.windows.dtype == np.float32
+    assert np.allclose(bundle.windows, pooled, atol=1e-6)
+    assert np.allclose(bundle.window_std, std, atol=1e-6)
+    assert bundle.window_times == ((0.0, 3.0), (3.0, 6.0))
+    assert np.allclose(np.linalg.norm(bundle.windows, axis=1), 1.0, atol=1e-5)
+    leftovers = [path.name for path in target.iterdir() if ".tmp" in path.name]
+    assert leftovers == []
+
+
+def test_save_bundle_feature_only(tmp_path: Path, videos: dict[str, Path]):
+    features = _extract_small_features(videos)
+    target = tmp_path / "features-only"
+    saved = save_bundle(target, features)
+    assert set(saved) == {"npz", "manifest"}
+    assert not (target / WINDOWS_NPY_NAME).exists()
+    assert not (target / WINDOW_STD_NPY_NAME).exists()
+
+    bundle = load_bundle(target)
+    assert isinstance(bundle, VisualBundle)
+    assert bundle.windows is None
+    assert bundle.window_std is None
+    assert bundle.window_times is None
+    assert bundle.manifest["n_windows"] == 0
+    assert bundle.manifest["window_times"] == []
+
+
+def test_save_bundle_accepts_plain_lists(tmp_path: Path, videos: dict[str, Path]):
+    features, pooled, std, window_pairs = _bundle_inputs(videos)
+    save_bundle(
+        tmp_path / "lists",
+        features,
+        windows=pooled.tolist(),
+        window_std=std.tolist(),
+        window_times=[list(pair) for pair in window_pairs],
+    )
+    bundle = load_bundle(tmp_path / "lists")
+    assert bundle is not None and bundle.windows is not None
+    assert np.allclose(bundle.windows, pooled, atol=1e-6)
+
+
+def test_save_bundle_validation_errors(tmp_path: Path, videos: dict[str, Path]):
+    features, pooled, std, window_pairs = _bundle_inputs(videos)
+    with pytest.raises(DenseVisualError, match="window_std"):
+        save_bundle(tmp_path / "a", features, window_std=std)
+    with pytest.raises(DenseVisualError, match="window_times"):
+        save_bundle(tmp_path / "b", features, windows=pooled)
+    with pytest.raises(DenseVisualError, match="window_times"):
+        save_bundle(tmp_path / "c", features, window_times=window_pairs)
+    with pytest.raises(DenseVisualError, match="维度"):
+        save_bundle(
+            tmp_path / "d",
+            features,
+            windows=pooled[:, :1],
+            window_times=window_pairs,
+        )
+    with pytest.raises(DenseVisualError, match="长度"):
+        save_bundle(
+            tmp_path / "e",
+            features,
+            windows=pooled,
+            window_times=[(0.0, 1.0)],
+        )
+    with pytest.raises(DenseVisualError):
+        save_bundle(
+            tmp_path / "f",
+            features,
+            windows=pooled,
+            window_times=[(2.0, 1.0), (3.0, 6.0)],
+        )
+    negative = np.full_like(std, -1.0)
+    with pytest.raises(DenseVisualError, match="负"):
+        save_bundle(
+            tmp_path / "g",
+            features,
+            windows=pooled,
+            window_std=negative,
+            window_times=window_pairs,
+        )
+    with pytest.raises(DenseVisualError, match="extra"):
+        save_bundle(tmp_path / "h", features, extra={"bad": object()})  # type: ignore[dict-item]
+
+
+def test_load_bundle_legacy_manifest_fallback(tmp_path: Path, videos: dict[str, Path]):
+    features = _extract_small_features(videos)
+    target = tmp_path / "legacy"
+    saved = save_features(features, target)
+    manifest = json.loads(saved["manifest"].read_text(encoding="utf-8"))
+    # 模拟旧版仅帧级 bundle：去掉 v0.4.3 新增字段，manifest 文件名回退
+    for key in ("preprocess", "n_windows", "window_times"):
+        manifest.pop(key, None)
+    manifest["files"] = {
+        "per_frame": DENSE_VISUAL_NPZ_NAME,
+        "manifest": DENSE_VISUAL_LEGACY_MANIFEST_NAME,
+    }
+    legacy_path = target / DENSE_VISUAL_LEGACY_MANIFEST_NAME
+    legacy_path.write_text(json.dumps(manifest), encoding="utf-8")
+    saved["manifest"].unlink()
+
+    bundle = load_bundle(target)
+    assert bundle is not None
+    assert bundle.features.version == features.version
+    assert bundle.features.preprocess == "stretch"
+    assert bundle.windows is None and bundle.window_times is None
+
+
+def test_load_bundle_missing_windows_raises(tmp_path: Path, videos: dict[str, Path]):
+    features, pooled, _std, window_pairs = _bundle_inputs(videos)
+    target = tmp_path / "missing-windows"
+    saved = save_bundle(
+        target, features, windows=pooled, window_times=window_pairs
+    )
+    saved["windows"].unlink()
+    with pytest.raises(DenseVisualError, match="缺少窗口"):
+        load_bundle(target)
+
+
+def test_load_bundle_corrupt_windows_raises(tmp_path: Path, videos: dict[str, Path]):
+    features, pooled, _std, window_pairs = _bundle_inputs(videos)
+    target = tmp_path / "corrupt-windows"
+    saved = save_bundle(
+        target, features, windows=pooled, window_times=window_pairs
+    )
+    np.save(saved["windows"], np.ones((1, 3), dtype=np.float32))
+    with pytest.raises(DenseVisualError, match="窗口"):
+        load_bundle(target)
+
+
+def test_visual_bundle_validation():
+    features = _make_features(_unit([[1, 0], [0, 1]]), fps=1.0, duration_s=2.0)
+    windows = np.asarray([[1.0, 0.0]], dtype=np.float32)
+    with pytest.raises(DenseVisualError, match="window_times"):
+        VisualBundle(features=features, windows=windows)
+    with pytest.raises(DenseVisualError, match="window_times"):
+        VisualBundle(features=features, window_times=((0.0, 1.0),))
+    with pytest.raises(DenseVisualError, match="window_std"):
+        VisualBundle(features=features, window_std=windows)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v0.4.3：预处理对照工具（只读 DB / 纯函数部分）
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _load_module_from_path(path: Path, module_name: str):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_compare_cli_help_runs_offline():
+    proc = subprocess.run(
+        [sys.executable, str(COMPARE_CLI_PATH), "--help"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "预处理对照" in proc.stdout
+    for flag in ("--work-ids", "--encoder", "--max-windows", "--out", "--json"):
+        assert flag in proc.stdout, flag
+
+
+def test_compare_cli_parser_and_encoder_spec():
+    module = _load_module_from_path(COMPARE_CLI_PATH, "dense_preprocess_compare")
+    parser = module.build_parser()
+    args = parser.parse_args(
+        ["--work-ids", "1", "2", "--encoder", "dinov2-small", "--max-windows", "3", "--json"]
+    )
+    assert args.work_ids == [1, 2]
+    assert args.max_windows == 3
+    assert args.json is True
+    assert module.resolve_encoder_id("dinov2-small") == "facebook/dinov2-small"
+
+    config = load_config(REPO_ROOT / "config.yaml")
+    default_model, default_revision = module.resolve_encoder_spec(
+        config, encoder=None, revision=None
+    )
+    assert default_model == config.visual_dense.encoders[0].model
+    assert default_revision == config.visual_dense.encoders[0].revision
+    with pytest.raises(DenseVisualError, match="revision"):
+        module.resolve_encoder_spec(
+            config, encoder="unknown/model-without-revision", revision=None
+        )
+
+
+def test_compare_tool_reads_catalog_read_only(config):
+    module = _load_module_from_path(COMPARE_CLI_PATH, "dense_preprocess_compare")
+    from nebula.db import Catalog
+
+    catalog = Catalog(config.paths.db_path)
+    catalog.initialize()
+    try:
+        first, _ = catalog.upsert_local_work("a.mp4")
+        second, _ = catalog.upsert_local_work("b.mp4")
+        for work_id in (first, second):
+            catalog.begin_attempt(work_id, "encoding")
+            catalog.complete(work_id)
+    finally:
+        catalog.close()
+
+    works = module.load_local_completed_works(config.paths.db_path, limit=1)
+    assert len(works) == 1
+    assert int(works[0]["id"]) == first
+    ordered = module.load_local_completed_works(
+        config.paths.db_path, work_ids=[second, first]
+    )
+    assert [int(item["id"]) for item in ordered] == [second, first]
+    with pytest.raises(NebulaError, match="work_id"):
+        module.load_local_completed_works(config.paths.db_path, work_ids=[999])
+
+
+def test_compare_cosine_stats_and_summarize():
+    module = _load_module_from_path(COMPARE_CLI_PATH, "dense_preprocess_compare")
+    left = _unit([[1, 0], [0, 1]])
+    same = module._cosine_stats(left, left.copy())
+    assert same["mean"] == pytest.approx(1.0)
+    assert same["min"] == pytest.approx(1.0)
+    flipped = _unit([[-1, 0], [0, 1]])
+    mixed = module._cosine_stats(left, flipped)
+    assert mixed["mean"] == pytest.approx(0.0)
+    assert mixed["min"] == pytest.approx(-1.0)
+    assert mixed["max"] == pytest.approx(1.0)
+
+    results = [
+        {
+            "frames_equal": True,
+            "cosine": {"mean": 0.9, "min": 0.8},
+            "timing_ratio": {
+                "letterbox_over_stretch_decode": 1.1,
+                "letterbox_over_stretch_encode": 1.05,
+            },
+            "modes": {
+                "stretch": {"version": "v-stretch"},
+                "letterbox": {"version": "v-letterbox"},
+            },
+        },
+        {
+            "frames_equal": True,
+            "cosine": {"mean": 0.95, "min": 0.9},
+            "timing_ratio": {
+                "letterbox_over_stretch_decode": 1.2,
+                "letterbox_over_stretch_encode": 1.1,
+            },
+            "modes": {
+                "stretch": {"version": "v-stretch"},
+                "letterbox": {"version": "v-letterbox"},
+            },
+        },
+    ]
+    summary = module.summarize(results)
+    assert summary["n_works"] == 2
+    assert summary["window_cosine_mean"] == pytest.approx(0.925)
+    assert summary["window_cosine_min"] == pytest.approx(0.8)
+    assert summary["frames_equal_all"] is True
+    assert summary["mean_decode_ratio_letterbox_over_stretch"] == pytest.approx(1.15)
+    assert summary["versions"]["stretch"] == ["v-stretch"]
+

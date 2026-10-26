@@ -29,14 +29,14 @@ import os
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Protocol, Sequence, runtime_checkable
+from typing import Any, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
 from .errors import NebulaError
-from .util import now_utc_iso
+from .util import now_utc_iso, slugify
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +50,22 @@ DEFAULT_BATCH_SIZE = 16
 """默认每批送入编码器的帧数。"""
 
 DENSE_VISUAL_NPZ_NAME = "dense_visual.npz"
-"""帧级向量 npz 文件名。"""
+"""帧级向量 npz 文件名（per_frame 为 float16）。"""
 
-DENSE_VISUAL_MANIFEST_NAME = "dense_visual_manifest.json"
-"""元数据 manifest 文件名。"""
+WINDOWS_NPY_NAME = "windows.npy"
+"""窗口级池化向量文件名（float32）。"""
+
+WINDOW_STD_NPY_NAME = "window_std.npy"
+"""窗口内逐维加权标准差文件名（float32，可选）。"""
+
+DENSE_VISUAL_MANIFEST_NAME = "manifest.json"
+"""bundle 元数据 manifest 文件名。"""
+
+DENSE_VISUAL_LEGACY_MANIFEST_NAME = "dense_visual_manifest.json"
+"""旧版（仅帧级）bundle 的 manifest 文件名，读取时向后兼容。"""
+
+PREPROCESS_MODES: tuple[str, str] = ("stretch", "letterbox")
+"""支持的预处理方式：拉伸 / 保持比例 + 黑边。"""
 
 _EPS = 1e-12
 _STDERR_TAIL_CHARS = 1000
@@ -119,8 +131,15 @@ def _which(name: str) -> str | None:
     return shutil.which(name)
 
 
-def _probe_duration_s(source: Path, *, ffmpeg: str, timeout_s: float) -> float:
-    """用 ffprobe 读取容器时长（秒）；失败抛 DenseVisualError。"""
+def _probe_media_durations(
+    source: Path, *, ffmpeg: str, timeout_s: float
+) -> tuple[float, float | None]:
+    """用 ffprobe 读取容器时长与视频流时长（秒）；失败抛 DenseVisualError。
+
+    部分 Bilibili/转码文件的音频轨比视频轨长（静音/尾音 padding），此时按容器时长
+    估算视频帧数会误判。返回 (容器时长, 视频流时长或 None)；有视频流时长时优先用
+    它估算期望帧数，容器时长仍用于窗口对齐（与 PE-AV 序列一致）。
+    """
 
     ffprobe = _resolve_ffprobe(ffmpeg)
     command = [
@@ -128,9 +147,9 @@ def _probe_duration_s(source: Path, *, ffmpeg: str, timeout_s: float) -> float:
         "-v",
         "error",
         "-show_entries",
-        "format=duration",
+        "format=duration:stream=codec_type,duration",
         "-of",
-        "default=noprint_wrappers=1:nokey=1",
+        "json",
         str(source),
     ]
     try:
@@ -153,14 +172,38 @@ def _probe_duration_s(source: Path, *, ffmpeg: str, timeout_s: float) -> float:
         tail = _stderr_tail(proc.stderr)
         detail = f"；stderr 摘要: {tail}" if tail else ""
         raise DenseVisualError(f"ffprobe 无法读取视频时长（{source}）{detail}")
-    text = (proc.stdout or "").strip()
     try:
-        duration_s = float(text)
-    except ValueError as exc:
-        raise DenseVisualError(f"ffprobe 时长输出无法解析: {text!r}（{source}）") from exc
-    if not math.isfinite(duration_s) or duration_s <= 0:
-        raise DenseVisualError(f"视频时长非法: {duration_s!r}（{source}）")
-    return duration_s
+        payload = json.loads((proc.stdout or "").strip() or "{}")
+    except json.JSONDecodeError as exc:
+        raise DenseVisualError(f"ffprobe 输出无法解析为 JSON（{source}）") from exc
+    container_raw = (payload.get("format") or {}).get("duration")
+    try:
+        container_s = float(container_raw)
+    except (TypeError, ValueError) as exc:
+        raise DenseVisualError(f"容器时长非法: {container_raw!r}（{source}）") from exc
+    if not math.isfinite(container_s) or container_s <= 0:
+        raise DenseVisualError(f"容器时长非法: {container_s!r}（{source}）")
+    video_s: float | None = None
+    for stream in payload.get("streams") or []:
+        if not isinstance(stream, dict) or stream.get("codec_type") != "video":
+            continue
+        raw = stream.get("duration")
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            video_s = value
+        break
+    return container_s, video_s
+
+
+def _probe_duration_s(source: Path, *, ffmpeg: str, timeout_s: float) -> float:
+    """兼容旧调用：只返回容器时长。"""
+
+    return _probe_media_durations(source, ffmpeg=ffmpeg, timeout_s=timeout_s)[0]
 
 
 def _read_exact(stream: Any, size: int) -> bytes | None:
@@ -182,8 +225,42 @@ def _read_exact(stream: Any, size: int) -> bytes | None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 解码：单条 ffmpeg 流式产出帧批次
+# 预处理 filter 与解码：单条 ffmpeg 流式产出帧批次
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def _validate_preprocess(preprocess: str) -> str:
+    """校验并返回预处理方式（stretch / letterbox）。"""
+
+    if not isinstance(preprocess, str) or preprocess not in PREPROCESS_MODES:
+        raise DenseVisualError(
+            f"preprocess 必须是 {PREPROCESS_MODES} 之一，收到 {preprocess!r}"
+        )
+    return preprocess
+
+
+def build_video_filter(
+    *, fps: float = DEFAULT_FPS, size: int = DEFAULT_SIZE, preprocess: str = "stretch"
+) -> str:
+    """构造 ffmpeg 视频 filter 字符串（纯函数，便于测试）。
+
+    - stretch：直接拉伸到 size x size（旧行为，会破坏宽高比）；
+    - letterbox：先按比例缩小到不超过 size x size，再用黑边补齐成正方形，
+      保持宽高比、不裁剪画面。
+
+    两种模式最后都转 rgb24，供 rawvideo pipe 读取。
+    """
+
+    fps_value = _require_positive_number(fps, what="fps")
+    size_value = _require_positive_int(size, what="size", minimum=2)
+    mode = _validate_preprocess(preprocess)
+    common = f"fps={fps_value:g}"
+    if mode == "stretch":
+        return f"{common},scale={size_value}:{size_value},format=rgb24"
+    return (
+        f"{common},scale={size_value}:{size_value}:force_original_aspect_ratio=decrease,"
+        f"pad={size_value}:{size_value}:(ow-iw)/2:(oh-ih)/2:color=black,format=rgb24"
+    )
 
 
 def iter_frame_batches(
@@ -193,13 +270,15 @@ def iter_frame_batches(
     size: int = DEFAULT_SIZE,
     batch_size: int = DEFAULT_BATCH_SIZE,
     ffmpeg: str = "ffmpeg",
+    preprocess: str = "stretch",
     timeout_s: float = 600.0,
+    expected_duration_s: float | None = None,
 ) -> Iterator[np.ndarray]:
     """按固定帧率流式解码视频，逐批产出 (B,H,W,3) uint8 RGB 帧。
 
-    只发一条 ffmpeg 命令：
-    -vf fps={fps},scale={size}:{size},format=rgb24 -f rawvideo -pix_fmt rgb24 pipe:1。
-    不会把整部视频读进内存；每批最多 batch_size 帧，最后一维为 RGB 三通道。
+    只发一条 ffmpeg 命令：-vf {build_video_filter(...)} -f rawvideo -pix_fmt rgb24
+    pipe:1。不会把整部视频读进内存；每批最多 batch_size 帧，最后一维为 RGB 三通道。
+    preprocess=stretch 时拉伸到正方形；letterbox 时保持比例 + 黑边补齐。
 
     校验：ffprobe 时长可读、ffmpeg 退出码为 0、帧数据完整（非截断）、实际帧数与
     duration*fps 在容差内（防止管道被截断/时基异常）、至少解码出一帧。
@@ -217,6 +296,7 @@ def iter_frame_batches(
     size_value = _require_positive_int(size, what="size", minimum=2)
     batch_value = _require_positive_int(batch_size, what="batch_size")
     timeout = _require_positive_number(timeout_s, what="timeout_s")
+    mode = _validate_preprocess(preprocess)
     duration_s = _probe_duration_s(src, ffmpeg=ffmpeg, timeout_s=timeout)
 
     command = [
@@ -229,7 +309,7 @@ def iter_frame_batches(
         "-an",
         "-sn",
         "-vf",
-        f"fps={fps_value:g},scale={size_value}:{size_value},format=rgb24",
+        build_video_filter(fps=fps_value, size=size_value, preprocess=mode),
         "-f",
         "rawvideo",
         "-pix_fmt",
@@ -248,8 +328,17 @@ def iter_frame_batches(
         raise DenseVisualError(f"无法启动 ffmpeg 解码（{ffmpeg}）：{exc}") from exc
 
     frame_bytes = size_value * size_value * 3
-    expected_frames = max(1, int(round(duration_s * fps_value)))
-    tolerance = max(2, int(math.ceil(fps_value * 0.5)))
+    expectation_s = (
+        duration_s
+        if expected_duration_s is None
+        else _require_positive_number(expected_duration_s, what="expected_duration_s")
+    )
+    expected_frames = max(1, int(round(expectation_s * fps_value)))
+    strict_tolerance = max(2, int(math.ceil(fps_value * 0.5)))
+    # VFR/时间基误差会随时长累积：允许最多 1% 帧数偏差（至少 strict_tolerance），
+    # 超过 strict_tolerance 但在 1% 以内记录 WARNING，便于审计；
+    # 窗口池化会按实际帧边界裁剪（pool_windows 已处理），不会越界。
+    tolerance = max(strict_tolerance, int(math.ceil(expected_frames * 0.01)))
     emitted = 0
     buffer: list[np.ndarray] = []
     stderr = b""
@@ -294,10 +383,19 @@ def iter_frame_batches(
         raise DenseVisualError(f"ffmpeg 解码失败（退出码 {returncode}）：{src}{detail}")
     if emitted == 0:
         raise DenseVisualError(f"没有解码出任何帧: {src}")
-    if abs(emitted - expected_frames) > tolerance:
+    deviation = abs(emitted - expected_frames)
+    if deviation > tolerance:
         raise DenseVisualError(
             f"解码帧数与时长不匹配: {emitted} 帧，预期约 {expected_frames} 帧"
             f"（duration={duration_s:.3f}s, fps={fps_value:g}）: {src}"
+        )
+    if deviation > strict_tolerance:
+        logger.warning(
+            "解码帧数与时长偏差 %d 帧（预期约 %d，%.2f%%），按实际帧继续: %s",
+            emitted - expected_frames,
+            expected_frames,
+            100.0 * deviation / max(expected_frames, 1),
+            src,
         )
 
 
@@ -605,14 +703,35 @@ def _normalize_rows(matrix: Any, *, what: str) -> np.ndarray:
     return np.ascontiguousarray(array / norms[:, None], dtype=np.float32)
 
 
-def compress_version(encoder_version: str, fps: float, size: int) -> str:
-    """compose DenseVisualFeatures.version：编码器版本 + fps + 输入尺寸。"""
+def compress_version(
+    encoder_version: str, fps: float, size: int, preprocess: str = "stretch"
+) -> str:
+    """compose 视觉序列版本号：encoder@revision__fps{fps}_s{size}_{preprocess}。
+
+    按 docs/CONTRACTS_V2.md §10.3：model + revision + fps + size + preprocess 必须
+    全部进入版本身份，任一变化都要新建版本。示例：
+    openai/clip-vit-base-patch16@<sha>__fps8_s224_letterbox
+    （frame/DB 侧原样使用；需要文件系统安全目录名时用 visual_version_slug）。
+    """
 
     if not isinstance(encoder_version, str) or not encoder_version.strip():
         raise DenseVisualError(f"encoder_version 不能为空，收到 {encoder_version!r}")
     fps_value = _require_positive_number(fps, what="fps")
     size_value = _require_positive_int(size, what="size", minimum=2)
-    return f"{encoder_version.strip()}__fps{fps_value:g}_s{size_value}"
+    mode = _validate_preprocess(preprocess)
+    return f"{encoder_version.strip()}__fps{fps_value:g}_s{size_value}_{mode}"
+
+
+def visual_version_slug(version: str) -> str:
+    """把视觉版本号转成文件系统安全标签（"openai/x@sha..." -> "openai-x-sha..."）。
+
+    仅用于可选的目录/文件名场景；DB/报告里的视觉版本号保持 compress_version 的
+    原始格式（CONTRACTS_V2 §10.3）。
+    """
+
+    if not isinstance(version, str) or not version.strip():
+        raise DenseVisualError(f"version 不能为空，收到 {version!r}")
+    return slugify(version)
 
 
 def _as_feature_matrix(
@@ -655,6 +774,7 @@ class DenseVisualFeatures:
     encoder: str = ""
     revision: str | None = None
     size: int = 0
+    preprocess: str = "stretch"
     created_at: str = ""
 
     def __post_init__(self) -> None:
@@ -686,6 +806,7 @@ class DenseVisualFeatures:
             raise DenseVisualError("DenseVisualFeatures.version 不能为空")
         if self.size and (self.size < 2 or self.size % 1 != 0):
             raise DenseVisualError(f"size 非法: {self.size!r}")
+        _validate_preprocess(self.preprocess)
         object.__setattr__(self, "fps", fps_value)
         object.__setattr__(self, "per_frame", per_frame.astype(np.float32, copy=False))
 
@@ -703,12 +824,14 @@ def extract_dense_features(
     size: int = DEFAULT_SIZE,
     batch_size: int = DEFAULT_BATCH_SIZE,
     ffmpeg: str = "ffmpeg",
+    preprocess: str = "stretch",
     timeout_s: float = 600.0,
 ) -> DenseVisualFeatures:
     """整部视频 -> 帧级视觉语义向量序列（流式解码 + 冻结编码器）。
 
     输出 per_frame 逐行 L2 归一化；decode_s 为累计解码（含管道读取）耗时，
     encode_s 为累计编码器前向耗时，model_load_s 取自编码器懒加载耗时。
+    preprocess 同时决定解码 filter 与 version 后缀（stretch / letterbox）。
     """
 
     src = Path(source)
@@ -718,19 +841,24 @@ def extract_dense_features(
     size_value = _require_positive_int(size, what="size", minimum=2)
     batch_value = _require_positive_int(batch_size, what="batch_size")
     timeout = _require_positive_number(timeout_s, what="timeout_s")
+    mode = _validate_preprocess(preprocess)
     if not callable(getattr(encoder, "encode", None)):
         raise DenseVisualError("encoder 缺少可调用的 encode(frames)")
     if not isinstance(getattr(encoder, "version", None), str):
         raise DenseVisualError("encoder 缺少字符串 version 属性")
 
-    duration_s = _probe_duration_s(src, ffmpeg=ffmpeg, timeout_s=timeout)
+    duration_s, video_duration_s = _probe_media_durations(
+        src, ffmpeg=ffmpeg, timeout_s=timeout
+    )
     batches = iter_frame_batches(
         src,
         fps=fps_value,
         size=size_value,
         batch_size=batch_value,
         ffmpeg=ffmpeg,
+        preprocess=mode,
         timeout_s=timeout,
+        expected_duration_s=video_duration_s,
     )
     vectors: list[np.ndarray] = []
     n_frames = 0
@@ -774,7 +902,9 @@ def extract_dense_features(
 
     per_frame = _normalize_rows(np.concatenate(vectors, axis=0), what="帧级向量")
     dim = int(per_frame.shape[1])
-    feature_version = compress_version(str(encoder.version), fps_value, size_value)
+    feature_version = compress_version(
+        str(encoder.version), fps_value, size_value, mode
+    )
     return DenseVisualFeatures(
         per_frame=per_frame,
         fps=fps_value,
@@ -788,6 +918,7 @@ def extract_dense_features(
         encoder=str(encoder.version),
         revision=getattr(encoder, "revision", None),
         size=size_value,
+        preprocess=mode,
         created_at=now_utc_iso(),
     )
 
@@ -921,17 +1052,169 @@ def _atomic_write_bytes(path: Path, writer: Any) -> None:
         tmp_path.unlink(missing_ok=True)
 
 
-def _manifest_payload(features: DenseVisualFeatures) -> dict[str, Any]:
+@dataclass(frozen=True)
+class VisualBundle:
+    """密集视觉 bundle：帧级向量 + 可选窗口级向量/标准差/窗口时间 + manifest。
+
+    windows 为 (T,D) float32 窗口池化向量（与 features.dim 同空间）；
+    window_times 为 (T,2) 窗口时间 [start_s, end_s]；window_std 为可选
+    (T,D) 窗口内逐维加权标准差。manifest 为原始 JSON 内容（含版本/编码器/
+    预处理/帧数/窗口数/created_at 等），便于调用方原样登记或审计。
+    """
+
+    features: DenseVisualFeatures
+    windows: np.ndarray | None = None
+    window_std: np.ndarray | None = None
+    window_times: tuple[tuple[float, float], ...] | None = None
+    manifest: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.features, DenseVisualFeatures):
+            raise DenseVisualError(
+                f"VisualBundle.features 必须是 DenseVisualFeatures，收到 {type(self.features).__name__}"
+            )
+        features = self.features
+        windows = self.windows
+        if windows is not None:
+            array = _as_float32_matrix(
+                windows, what="窗口级向量", expected_rows=None, expected_dim=features.dim
+            )
+            if array.shape[0] < 1:
+                raise DenseVisualError("窗口级向量不能为空")
+            object.__setattr__(self, "windows", array)
+            if self.window_times is None:
+                raise DenseVisualError("提供 windows 时必须提供 window_times")
+            times = _normalize_window_times(
+                self.window_times,
+                expected=array.shape[0],
+                duration_s=features.duration_s,
+                fps=features.fps,
+            )
+            object.__setattr__(self, "window_times", times)
+            if self.window_std is not None:
+                std = _as_float32_matrix(
+                    self.window_std, what="窗口标准差", expected_rows=array.shape[0],
+                    expected_dim=features.dim,
+                )
+                if np.any(std < 0.0):
+                    raise DenseVisualError("窗口标准差不能为负")
+                object.__setattr__(self, "window_std", std)
+        else:
+            if self.window_std is not None:
+                raise DenseVisualError("提供 window_std 时必须同时提供 windows")
+            if self.window_times is not None:
+                raise DenseVisualError("提供 window_times 时必须同时提供 windows")
+
+
+def _as_float32_matrix(
+    value: Any,
+    *,
+    what: str,
+    expected_rows: int | None,
+    expected_dim: int,
+) -> np.ndarray:
+    """校验二维 float32 矩阵（有限值、可选行数/维度约束）。"""
+
+    matrix = np.asarray(value, dtype=np.float32)
+    if matrix.ndim != 2:
+        raise DenseVisualError(f"{what}必须是二维矩阵，收到 {matrix.shape}")
+    if expected_rows is not None and matrix.shape[0] != expected_rows:
+        raise DenseVisualError(
+            f"{what}行数异常: {matrix.shape[0]}（期望 {expected_rows}）"
+        )
+    if matrix.shape[1] != expected_dim:
+        raise DenseVisualError(
+            f"{what}维度异常: {matrix.shape[1]}（期望 {expected_dim}）"
+        )
+    if not np.all(np.isfinite(matrix)):
+        raise DenseVisualError(f"{what}含 NaN/Inf")
+    return np.ascontiguousarray(matrix, dtype=np.float32)
+
+
+def _normalize_window_times(
+    window_times: Any,
+    *,
+    expected: int,
+    duration_s: float,
+    fps: float,
+) -> tuple[tuple[float, float], ...]:
+    """校验并规范化窗口时间序列为 ((start_s, end_s), ...)。"""
+
+    if isinstance(window_times, np.ndarray):
+        if window_times.ndim != 2 or window_times.shape[1] != 2:
+            raise DenseVisualError(
+                f"window_times 数组必须是 (T,2)，收到 {window_times.shape}"
+            )
+        raw_items: Sequence[Any] = window_times.tolist()
+    elif isinstance(window_times, (str, bytes)) or not isinstance(
+        window_times, Sequence
+    ):
+        raise DenseVisualError("window_times 必须是 (start, end) 序列")
+    else:
+        raw_items = window_times
+    entries: list[tuple[float, float]] = []
+    limit = float(duration_s) + 1.0 / float(fps) + 1e-6
+    for index, item in enumerate(raw_items):
+        try:
+            start, end = item
+        except (TypeError, ValueError) as exc:
+            raise DenseVisualError(
+                f"window_times[{index}] 必须是 (start, end) 二元组"
+            ) from exc
+        if isinstance(start, bool) or isinstance(end, bool):
+            raise DenseVisualError(f"window_times[{index}] 的 start/end 必须是数字")
+        try:
+            start_value = float(start)
+            end_value = float(end)
+        except (TypeError, ValueError) as exc:
+            raise DenseVisualError(
+                f"window_times[{index}] 的 start/end 不是数字"
+            ) from exc
+        if not math.isfinite(start_value) or not math.isfinite(end_value):
+            raise DenseVisualError(f"window_times[{index}] 的 start/end 必须有限")
+        if start_value < 0 or end_value <= start_value:
+            raise DenseVisualError(
+                f"window_times[{index}] 非法: start={start_value!r} end={end_value!r}"
+            )
+        if end_value > limit:
+            raise DenseVisualError(
+                f"window_times[{index}] 超出视频时长: end={end_value:.3f}s "
+                f"duration={duration_s:.3f}s"
+            )
+        entries.append((start_value, end_value))
+    if len(entries) != expected:
+        raise DenseVisualError(
+            f"window_times 长度 {len(entries)} 与窗口数 {expected} 不一致"
+        )
+    return tuple(entries)
+
+
+def _manifest_payload(
+    features: DenseVisualFeatures,
+    *,
+    windows: np.ndarray | None = None,
+    window_std: np.ndarray | None = None,
+    window_times: Sequence[tuple[float, float]] | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """组装 bundle manifest（必需键：version/encoder/revision/fps/size/preprocess/
+    duration/n_frames/dim/n_windows/window_times/created_at）。"""
+
     created_at = features.created_at or now_utc_iso()
-    return {
+    payload: dict[str, Any] = {
         "version": features.version,
         "encoder": features.encoder,
         "revision": features.revision,
         "fps": float(features.fps),
         "size": int(features.size),
+        "preprocess": features.preprocess,
         "duration_s": float(features.duration_s),
         "n_frames": int(features.n_frames),
         "dim": int(features.dim),
+        "n_windows": 0 if windows is None else int(windows.shape[0]),
+        "window_times": (
+            [] if window_times is None else [[float(start), float(end)] for start, end in window_times]
+        ),
         "created_at": created_at,
         "dtype": "float16",
         "decode_s": float(features.decode_s),
@@ -939,17 +1222,35 @@ def _manifest_payload(features: DenseVisualFeatures) -> dict[str, Any]:
         "model_load_s": float(features.model_load_s),
         "files": {
             "per_frame": DENSE_VISUAL_NPZ_NAME,
+            "windows": WINDOWS_NPY_NAME if windows is not None else None,
+            "window_std": WINDOW_STD_NPY_NAME if window_std is not None else None,
             "manifest": DENSE_VISUAL_MANIFEST_NAME,
         },
     }
+    if extra is not None:
+        payload["extra"] = dict(extra)
+    return payload
 
 
-def save_features(
-    features: DenseVisualFeatures, out_dir: str | Path
+def save_bundle(
+    out_dir: str | Path,
+    features: DenseVisualFeatures,
+    *,
+    windows: Any = None,
+    window_std: Any = None,
+    window_times: Any = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Path]:
-    """把密集视觉序列原子写入 out_dir：dense_visual.npz + dense_visual_manifest.json。
+    """原子保存密集视觉 bundle：帧级 npz + 窗口级 npy + manifest。
 
-    per_frame 以 float16 保存；返回 {"npz": Path, "manifest": Path}。
+    - dense_visual.npz：per_frame float16 + fps/duration/n_frames/dim/version；
+    - windows.npy：窗口级池化向量 (T,D) float32（提供 windows 时）；
+    - window_std.npy：窗口内标准差 (T,D) float32（可选）；
+    - manifest.json：版本/编码器/预处理/帧数/窗口数/窗口时间/created_at 等。
+
+    windows 与 window_times 必须同时提供；window_std 依赖 windows；
+    所有文件先写同目录临时文件再 os.replace，manifest 最后写（完成标志）。
+    返回实际写出的 {"npz": Path, "windows"? , "window_std"?, "manifest": Path}。
     """
 
     data = _validate_features_for_save(features)
@@ -958,6 +1259,47 @@ def save_features(
         target.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise DenseVisualError(f"无法创建输出目录 {target}：{exc}") from exc
+
+    windows_array: np.ndarray | None = None
+    std_array: np.ndarray | None = None
+    times: tuple[tuple[float, float], ...] | None = None
+    if window_std is not None and windows is None:
+        raise DenseVisualError("提供 window_std 时必须同时提供 windows")
+    if windows is not None:
+        if window_times is None:
+            raise DenseVisualError("提供 windows 时必须提供 window_times")
+        windows_array = _as_float32_matrix(
+            windows, what="窗口级向量", expected_rows=None, expected_dim=data.dim
+        )
+        if windows_array.shape[0] < 1:
+            raise DenseVisualError("窗口级向量不能为空")
+        times = _normalize_window_times(
+            window_times,
+            expected=windows_array.shape[0],
+            duration_s=data.duration_s,
+            fps=data.fps,
+        )
+        if window_std is not None:
+            std_array = _as_float32_matrix(
+                window_std,
+                what="窗口标准差",
+                expected_rows=windows_array.shape[0],
+                expected_dim=data.dim,
+            )
+            if np.any(std_array < 0.0):
+                raise DenseVisualError("窗口标准差不能为负")
+    elif window_times is not None:
+        raise DenseVisualError("提供 window_times 时必须同时提供 windows")
+
+    extra_payload: dict[str, Any] | None = None
+    if extra is not None:
+        if not isinstance(extra, Mapping):
+            raise DenseVisualError(f"extra 必须是映射，收到 {type(extra).__name__}")
+        try:
+            json.dumps(dict(extra), ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise DenseVisualError(f"extra 无法 JSON 序列化：{exc}") from exc
+        extra_payload = dict(extra)
 
     arrays = {
         "per_frame": np.asarray(data.per_frame, dtype=np.float16),
@@ -969,25 +1311,68 @@ def save_features(
     }
     npz_path = target / DENSE_VISUAL_NPZ_NAME
     manifest_path = target / DENSE_VISUAL_MANIFEST_NAME
+    saved: dict[str, Path] = {}
 
     def _write_npz(handle: Any) -> None:
         np.savez_compressed(handle, **arrays)
 
     _atomic_write_bytes(npz_path, _write_npz)
+    saved["npz"] = npz_path
+    if windows_array is not None:
+        windows_path = target / WINDOWS_NPY_NAME
+        _atomic_write_bytes(
+            windows_path, lambda handle: np.save(handle, windows_array, allow_pickle=False)
+        )
+        saved["windows"] = windows_path
+    if std_array is not None:
+        std_path = target / WINDOW_STD_NPY_NAME
+        _atomic_write_bytes(
+            std_path, lambda handle: np.save(handle, std_array, allow_pickle=False)
+        )
+        saved["window_std"] = std_path
+
     manifest_text = json.dumps(
-        _manifest_payload(data), ensure_ascii=False, indent=2, sort_keys=True
+        _manifest_payload(
+            data,
+            windows=windows_array,
+            window_std=std_array,
+            window_times=times,
+            extra=extra_payload,
+        ),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
     ) + "\n"
     _atomic_write_bytes(
         manifest_path, lambda handle: handle.write(manifest_text.encode("utf-8"))
     )
+    saved["manifest"] = manifest_path
     logger.info(
-        "密集视觉序列已保存: %s（%d 帧，dim=%d，版本 %s）",
+        "密集视觉 bundle 已保存: %s（%d 帧，%d 窗口，dim=%d，版本 %s）",
         target,
         data.n_frames,
+        0 if windows_array is None else int(windows_array.shape[0]),
         data.dim,
         data.version,
     )
-    return {"npz": npz_path, "manifest": manifest_path}
+    return saved
+
+
+def save_features(
+    features: DenseVisualFeatures, out_dir: str | Path
+) -> dict[str, Path]:
+    """兼容旧接口：只保存帧级向量 bundle（无窗口），返回 {"npz","manifest"}。"""
+
+    saved = save_bundle(out_dir, features)
+    return {"npz": saved["npz"], "manifest": saved["manifest"]}
+
+
+def save_dense_visual(
+    features: DenseVisualFeatures, out_dir: str | Path
+) -> dict[str, Path]:
+    """save_features 的语义化别名（旧接口）。"""
+
+    return save_features(features, out_dir)
 
 
 def _load_manifest(path: Path) -> dict[str, Any]:
@@ -1000,33 +1385,33 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     return payload
 
 
-def save_dense_visual(
-    features: DenseVisualFeatures, out_dir: str | Path
-) -> dict[str, Path]:
-    """save_features 的语义化别名（save/load npz 契约）。"""
+def _resolve_manifest_path(target: Path) -> Path:
+    """优先 manifest.json；旧版仅帧级 bundle 用 dense_visual_manifest.json。"""
 
-    return save_features(features, out_dir)
-
-
-def load_dense_visual(out_dir: str | Path) -> DenseVisualFeatures | None:
-    """load_features 的语义化别名（save/load npz 契约）。"""
-
-    return load_features(out_dir)
+    primary = target / DENSE_VISUAL_MANIFEST_NAME
+    if primary.is_file():
+        return primary
+    legacy = target / DENSE_VISUAL_LEGACY_MANIFEST_NAME
+    if legacy.is_file():
+        return legacy
+    return primary
 
 
-def load_features(out_dir: str | Path) -> DenseVisualFeatures | None:
-    """读取 dense_visual.npz + manifest。
+def load_bundle(out_dir: str | Path) -> VisualBundle | None:
+    """读取密集视觉 bundle（帧级 + 可选窗口级）。
 
-    两个文件任一缺失返回 None；结构损坏 / 版本或尺寸不一致抛 DenseVisualError。
-    per_frame 以 float32 返回（写入时为 float16）。
+    目录/文件缺失返回 None；结构损坏、manifest 与 npz 不一致、窗口文件缺失或
+    形状不符时抛 DenseVisualError。per_frame 以 float32 返回（写入为 float16）。
     """
 
     target = Path(out_dir)
     if not target.is_dir():
         return None
     npz_path = target / DENSE_VISUAL_NPZ_NAME
-    manifest_path = target / DENSE_VISUAL_MANIFEST_NAME
-    if not npz_path.is_file() or not manifest_path.is_file():
+    if not npz_path.is_file():
+        return None
+    manifest_path = _resolve_manifest_path(target)
+    if not manifest_path.is_file():
         return None
     manifest = _load_manifest(manifest_path)
     try:
@@ -1061,8 +1446,11 @@ def load_features(out_dir: str | Path) -> DenseVisualFeatures | None:
     if abs(fps_manifest - fps) > 1e-9:
         raise DenseVisualError("manifest 与 npz 的 fps 不一致")
 
+    preprocess = str(manifest.get("preprocess", "stretch"))
+    if preprocess not in PREPROCESS_MODES:
+        raise DenseVisualError(f"manifest.preprocess 非法: {preprocess!r}")
     try:
-        return DenseVisualFeatures(
+        features = DenseVisualFeatures(
             per_frame=per_frame,
             fps=fps,
             duration_s=duration_s,
@@ -1079,7 +1467,85 @@ def load_features(out_dir: str | Path) -> DenseVisualFeatures | None:
                 else None
             ),
             size=int(manifest.get("size", 0)),
+            preprocess=preprocess,
             created_at=str(manifest.get("created_at", "")),
         )
     except (DenseVisualError, KeyError, TypeError, ValueError) as exc:
         raise DenseVisualError(f"密集视觉 manifest 字段非法（{manifest_path}）：{exc}") from exc
+
+    try:
+        n_windows = int(manifest.get("n_windows", 0))
+    except (TypeError, ValueError) as exc:
+        raise DenseVisualError(f"manifest.n_windows 非法: {exc}") from exc
+    if n_windows < 0:
+        raise DenseVisualError(f"manifest.n_windows 非法: {n_windows}")
+    windows_array: np.ndarray | None = None
+    std_array: np.ndarray | None = None
+    times: tuple[tuple[float, float], ...] | None = None
+    files = manifest.get("files") or {}
+    if not isinstance(files, Mapping):
+        raise DenseVisualError("manifest.files 必须是对象")
+    if n_windows > 0:
+        windows_name = str(files.get("windows") or WINDOWS_NPY_NAME)
+        windows_path = target / windows_name
+        if not windows_path.is_file():
+            raise DenseVisualError(
+                f"manifest 声明 {n_windows} 个窗口，但缺少窗口向量文件: {windows_path}"
+            )
+        try:
+            windows_array = np.asarray(
+                np.load(windows_path, allow_pickle=False), dtype=np.float32
+            )
+        except (OSError, ValueError) as exc:
+            raise DenseVisualError(f"窗口向量读取失败（{windows_path}）：{exc}") from exc
+        windows_array = _as_float32_matrix(
+            windows_array,
+            what="窗口级向量",
+            expected_rows=n_windows,
+            expected_dim=dim,
+        )
+        times = _normalize_window_times(
+            manifest.get("window_times", []),
+            expected=n_windows,
+            duration_s=duration_s,
+            fps=fps,
+        )
+        std_name = str(files.get("window_std") or WINDOW_STD_NPY_NAME)
+        std_path = target / std_name
+        if std_path.is_file():
+            try:
+                std_array = np.asarray(
+                    np.load(std_path, allow_pickle=False), dtype=np.float32
+                )
+            except (OSError, ValueError) as exc:
+                raise DenseVisualError(f"窗口标准差读取失败（{std_path}）：{exc}") from exc
+            std_array = _as_float32_matrix(
+                std_array,
+                what="窗口标准差",
+                expected_rows=n_windows,
+                expected_dim=dim,
+            )
+            if np.any(std_array < 0.0):
+                raise DenseVisualError("窗口标准差不能为负")
+
+    return VisualBundle(
+        features=features,
+        windows=windows_array,
+        window_std=std_array,
+        window_times=times,
+        manifest=manifest,
+    )
+
+
+def load_features(out_dir: str | Path) -> DenseVisualFeatures | None:
+    """兼容旧接口：读取 bundle 并只返回帧级 features（缺失返回 None）。"""
+
+    bundle = load_bundle(out_dir)
+    return None if bundle is None else bundle.features
+
+
+def load_dense_visual(out_dir: str | Path) -> DenseVisualFeatures | None:
+    """load_features 的语义化别名（旧接口）。"""
+
+    return load_features(out_dir)
+

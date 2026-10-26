@@ -4,16 +4,17 @@
 
 1. ruff 静态检查：nebula/、tests/、项目根目录与 tools/ 下的 Python 脚本；
 2. pytest：tests/ 全量测试，默认排除 model / network 标记；
-3. 文档检查：README.md、ARCHITECTURE.md 存在且包含 v0.2.x / v0.4 关键内容；docs/adr/
-   至少 10 篇（含 0005 身份关联 / 0006 筛选地图 / 0007 高维近邻密度 / 0008 音画错位实验 /
+3. 文档检查：README.md、ARCHITECTURE.md 存在且包含 v0.2.x / v0.4 / v0.4.3 关键内容；
+   docs/adr/ 至少 10 篇（含 0005 身份关联 / 0006 筛选地图 / 0007 高维近邻密度 / 0008 音画错位实验 /
    0009 近邻解释 / 0010 全片序列与表征）并包含
    Decision / Why / Options / Chosen / Consequences / How verified 章节；
 4. CLI 入口冒烟：ingest.py、pipeline.py、map.py 及其子命令（map.py variants、
    ingest.py link-local）、tools/clip_stability.py、tools/desync_experiment.py、
    tools/preflight_works.py、tools/build_representation.py、tools/compare_spaces.py、
-   tools/events_probe.py 的 --help 均能成功运行；
+   tools/events_probe.py、tools/visual_pipeline.py、tools/dense_preprocess_compare.py、
+   tools/embedding_diagnostics.py 的 --help 均能成功运行；
 5. 配置有效性：config.yaml 可加载；可据此生成并加载一份临时隔离配置；ffmpeg/ffprobe 可用；
-   v0.4 配置段（sampling/events/temporal 与 representations 目录）有效。
+   v0.4 配置段（sampling/events/temporal 与 representations 目录）与 v0.4.3 visual_dense 段有效。
 
 --full 额外运行带 model / network 标记的测试（需要 PE-AV 权重和网络；
        会为子进程设置 NEBULA_MODEL_TESTS=1 / NEBULA_NETWORK_TESTS=1）。
@@ -59,6 +60,9 @@ CLI_CHECKS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("tools/build_representation.py", ()),
     ("tools/compare_spaces.py", ()),
     ("tools/events_probe.py", ()),
+    ("tools/visual_pipeline.py", ()),
+    ("tools/dense_preprocess_compare.py", ()),
+    ("tools/embedding_diagnostics.py", ()),
 )
 """必须能以 --help 成功运行的 CLI 入口（脚本, 子命令参数）。"""
 
@@ -75,10 +79,14 @@ V02_DOC_KEYWORDS: dict[str, tuple[str, ...]] = {
         "错位",
         "片段级",
         "v0.4",
+        "v0.4.3",
         "full_coverage",
         "representations",
         "表征空间",
         "时间轴",
+        "visual_dense",
+        "密集视觉",
+        "letterbox",
     ),
     "ARCHITECTURE.md": (
         "work_links",
@@ -94,6 +102,12 @@ V02_DOC_KEYWORDS: dict[str, tuple[str, ...]] = {
         "representation_id",
         "events",
         "sequence_states",
+        "v0.4.3",
+        "visual_versions",
+        "visual_sequences",
+        "visual_dense",
+        "dense_visual",
+        "source_kind",
     ),
 }
 """v0.2.x / v0.4 文档必须覆盖的关键内容（存在性检查，不校验具体措辞）。"""
@@ -330,7 +344,7 @@ def check_docs(*, verbose: bool = False) -> CheckResult:
         print(f"  ADR 文件: {[path.name for path in adr_files]}")
     if problems:
         return CheckResult("docs", False, "；".join(problems), duration)
-    detail = f"README/ARCHITECTURE 含 v0.2.x/v0.4 内容，ADR {len(adr_files)} 篇且章节完整"
+    detail = f"README/ARCHITECTURE 含 v0.2.x/v0.4/v0.4.3 内容，ADR {len(adr_files)} 篇且章节完整"
     return CheckResult("docs", True, detail, duration)
 
 
@@ -370,7 +384,9 @@ def check_cli(*, verbose: bool = False) -> CheckResult:
         f"{len(passed)} 个 CLI 入口 --help 均可运行"
         "（含 map.py variants、ingest.py link-local、tools/clip_stability.py、"
         "tools/desync_experiment.py、tools/preflight_works.py、"
-        "tools/build_representation.py、tools/compare_spaces.py、tools/events_probe.py）"
+        "tools/build_representation.py、tools/compare_spaces.py、tools/events_probe.py、"
+        "tools/visual_pipeline.py、tools/dense_preprocess_compare.py、"
+        "tools/embedding_diagnostics.py）"
     )
     return CheckResult("cli", True, detail, duration)
 
@@ -399,6 +415,30 @@ def check_config(*, verbose: bool = False) -> CheckResult:
         problems.append("full_coverage 的 overlap_seconds 必须小于 clip_seconds")
     if not cfg.paths.representations.is_dir():
         problems.append(f"representations 目录不存在: {cfg.paths.representations}")
+    visual = cfg.visual_dense
+    if not 0 < visual.fps <= 120:
+        problems.append(f"visual_dense.fps 非法: {visual.fps}")
+    if visual.size < 32 or visual.size % 2 != 0:
+        problems.append(f"visual_dense.size 必须是 >=32 的偶数: {visual.size}")
+    if visual.preprocess not in ("stretch", "letterbox"):
+        problems.append(f"visual_dense.preprocess 非法: {visual.preprocess!r}")
+    if visual.batch_size < 1:
+        problems.append(f"visual_dense.batch_size 非法: {visual.batch_size}")
+    if visual.subset_fps <= visual.fps:
+        problems.append(
+            f"visual_dense.subset_fps({visual.subset_fps}) 必须大于 fps({visual.fps})"
+        )
+    if not visual.encoders:
+        problems.append("visual_dense.encoders 不能为空")
+    for position, encoder in enumerate(visual.encoders):
+        if not encoder.model.strip():
+            problems.append(f"visual_dense.encoders[{position}].model 为空")
+        if not encoder.revision.strip():
+            problems.append(f"visual_dense.encoders[{position}].revision 为空（必须固定 revision）")
+    if not cfg.paths.visual_dense.is_dir():
+        problems.append(f"visual_dense 目录不存在: {cfg.paths.visual_dense}")
+    if not str(cfg.paths.visual_dense).startswith(str(cfg.paths.data)):
+        problems.append("visual_dense 目录不在 data 目录内")
     if cfg.legacy_embedding_version == cfg.full_sequence_version:
         problems.append("legacy 与 full 的序列版本号不应相同")
     if not str(cfg.paths.db_path).startswith(str(cfg.paths.data)):

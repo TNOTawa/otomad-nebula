@@ -1,23 +1,25 @@
 """v0.4.3 密集视觉语义编码 pilot CLI（不写数据库）。
 
-对一个视频/本地作品，用冻结视觉编码器（CLIP / DINOv2）按指定帧率提取帧级
-语义向量，按全片覆盖窗口（默认 8s）池化，保存 dense_visual.npz + manifest，
-并打印帧数、解码/编码耗时、实际帧率、存储字节、窗口池化 shape。
+对一个视频/本地作品，用冻结视觉编码器（CLIP / DINOv2）按指定帧率与预处理方式
+提取帧级语义向量，按全片覆盖窗口（默认 8s）池化，保存 bundle，并打印帧数、
+解码/编码耗时、实际帧率、存储字节、窗口池化 shape。
 
 用法（项目根目录）::
 
     .\\.venv\\Scripts\\python.exe tools/dense_visual_pilot.py --local-relpath "某作品.mp4"
     .\\.venv\\Scripts\\python.exe tools/dense_visual_pilot.py --source path/to/v.mp4 ^
-        --encoder clip-vit-base-patch16 --fps 8 --limit 5 --out-dir temp/pilot --json
+        --encoder clip-vit-base-patch16 --fps 8 --preprocess letterbox --limit 5 ^
+        --out-dir temp/pilot --save-bundle --json
 
 说明：
 
-- --encoder 支持别名（clip-vit-base-patch16 / clip-vit-base-patch32 / dinov2-small
-  / dinov2-base），也可以直接给 Hugging Face model id；
-- --limit 限制参与窗口池化的窗口数（默认全部），便于快速 pilot；
-- 模型下载缓存由配置 model.cache_dir 指定；镜像/环境变量由调用方设置
-  （本工具不访问网络策略、不写 DB）；
-- 真实模型运行需要 torch/transformers 与权重；默认测试只覆盖 --help 与参数解析。
+- 默认参数取自 config.yaml 的 visual_dense 段（fps/size/preprocess/batch_size/
+  device/dtype/cache_dir）；--encoder 缺省取第一个已登记编码器，revision 必须
+  固定（--revision 或 config.visual_dense.encoders 中的固定值）；
+- --limit 限制参与窗口池化/保存的窗口数（默认全部），便于快速 pilot；
+- 默认只保存帧级 dense_visual.npz；--save-bundle 同时保存 windows.npy /
+  window_std.npy / manifest.json（窗口时间与版本信息在 manifest 中）；
+- 不写数据库；真实模型由调用方下载/缓存（HF_ENDPOINT 等环境变量自行设置）。
 """
 
 from __future__ import annotations
@@ -33,16 +35,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from nebula.config import load_config  # noqa: E402
+from nebula.config import Config, load_config  # noqa: E402
 from nebula.dense_visual import (  # noqa: E402
-    DEFAULT_BATCH_SIZE,
-    DEFAULT_FPS,
-    DEFAULT_SIZE,
     DenseVisualError,
     HFImageEncoder,
     extract_dense_features,
     pool_windows,
+    pool_windows_std,
+    save_bundle,
     save_features,
+    visual_version_slug,
 )
 from nebula.errors import NebulaError  # noqa: E402
 from nebula.log import configure_logging  # noqa: E402
@@ -69,6 +71,28 @@ def resolve_encoder_id(value: str) -> str:
     return ENCODER_ALIASES.get(raw, raw)
 
 
+def resolve_encoder_spec(
+    config: Config, *, encoder: str | None, revision: str | None
+) -> tuple[str, str]:
+    """确定 (model_id, revision)：缺省取配置里第一个编码器，revision 必须固定。"""
+
+    if encoder:
+        model_id = resolve_encoder_id(encoder)
+    else:
+        if not config.visual_dense.encoders:
+            raise DenseVisualError("config.visual_dense.encoders 为空，无法确定默认编码器")
+        model_id = config.visual_dense.encoders[0].model
+    if revision:
+        return model_id, revision
+    for entry in config.visual_dense.encoders:
+        if entry.model == model_id:
+            return model_id, entry.revision
+    raise DenseVisualError(
+        f"编码器 {model_id} 没有固定 revision：请用 --revision 指定，"
+        "或先在 config.visual_dense.encoders 登记 model + revision"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tools/dense_visual_pilot.py",
@@ -82,32 +106,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--encoder",
-        default="clip-vit-base-patch16",
-        help="编码器别名或 Hugging Face model id（默认 clip-vit-base-patch16）",
-    )
-    parser.add_argument("--revision", default=None, help="模型 revision（默认主干）")
-    parser.add_argument(
-        "--fps", type=float, default=DEFAULT_FPS, help=f"帧级采样率（默认 {DEFAULT_FPS:g}）"
+        default=None,
+        help="编码器别名或 Hugging Face model id（默认取 config.visual_dense.encoders[0]）",
     )
     parser.add_argument(
-        "--size", type=int, default=DEFAULT_SIZE, help=f"输入边长（默认 {DEFAULT_SIZE}）"
+        "--revision", default=None, help="模型 revision（默认取配置中该编码器的固定 revision）"
+    )
+    parser.add_argument(
+        "--fps", type=float, default=None, help="帧级采样率（默认 config.visual_dense.fps）"
+    )
+    parser.add_argument(
+        "--size", type=int, default=None, help="输入边长（默认 config.visual_dense.size）"
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=DEFAULT_BATCH_SIZE,
-        help=f"每批编码帧数（默认 {DEFAULT_BATCH_SIZE}）",
+        default=None,
+        help="每批编码帧数（默认 config.visual_dense.batch_size）",
+    )
+    parser.add_argument(
+        "--preprocess",
+        choices=["stretch", "letterbox"],
+        default=None,
+        help="预处理方式（默认 config.visual_dense.preprocess）：stretch 拉伸 / letterbox 保比例+黑边",
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="最多池化多少个窗口（默认全部；仅影响池化与打印，便于快速 pilot）",
+        help="最多池化/保存多少个窗口（默认全部；仅影响池化与打印，便于快速 pilot）",
     )
     parser.add_argument(
         "--out-dir",
         default=None,
         help="输出目录（默认 temp/dense_visual_pilot/<source 名>）",
+    )
+    parser.add_argument(
+        "--save-bundle",
+        action="store_true",
+        help="同时保存窗口级 windows.npy / window_std.npy / manifest.json（默认只存帧级）",
     )
     parser.add_argument("--json", action="store_true", help="只输出 JSON 摘要（便于脚本消费）")
     return parser
@@ -122,7 +159,7 @@ def _resolve_config_path(value: str | None) -> Path:
     return Path.cwd() / "config.yaml"
 
 
-def _resolve_source(config, args: argparse.Namespace) -> tuple[Path, str]:
+def _resolve_source(config: Config, args: argparse.Namespace) -> tuple[Path, str]:
     if args.source:
         path = Path(args.source).expanduser()
         if not path.is_file():
@@ -140,9 +177,11 @@ def _resolve_source(config, args: argparse.Namespace) -> tuple[Path, str]:
 def _summary_payload(
     *,
     source: Path,
-    encoder: HFImageEncoder,
+    model_id: str,
+    revision: str,
     features,
     pooled,
+    window_std,
     window_count: int,
     limit: int | None,
     saved: dict[str, Path],
@@ -151,11 +190,13 @@ def _summary_payload(
     storage_bytes = int(sum(path.stat().st_size for path in saved.values()))
     return {
         "source": str(source),
-        "encoder": encoder.model_id,
-        "encoder_revision": encoder.revision,
+        "encoder": model_id,
+        "encoder_revision": revision,
         "features_version": features.version,
+        "visual_version": visual_version_slug(features.version),
         "fps": float(features.fps),
         "size": int(features.size),
+        "preprocess": features.preprocess,
         "dim": int(features.dim),
         "n_frames": int(features.n_frames),
         "duration_s": round(float(features.duration_s), 3),
@@ -168,6 +209,7 @@ def _summary_payload(
         "n_windows_pooled": int(pooled.shape[0]),
         "limit": limit,
         "window_pool_shape": [int(value) for value in pooled.shape],
+        "window_std_shape": [int(value) for value in window_std.shape],
         "storage_bytes": storage_bytes,
         "files": {name: str(path) for name, path in saved.items()},
     }
@@ -180,9 +222,11 @@ def _print_human(payload: dict[str, object]) -> None:
         f"  编码器: {payload['encoder']}"
         f"（revision={payload['encoder_revision']}，version={payload['features_version']}）"
     )
+    print(f"  视觉版本（DB/目录用 slug）: {payload['visual_version']}")
     print(
         f"  帧: {payload['n_frames']} 帧 / {payload['duration_s']}s"
-        f"（请求 {payload['fps']}fps，实际 {payload['effective_fps']}fps，dim={payload['dim']}）"
+        f"（请求 {payload['fps']}fps，实际 {payload['effective_fps']}fps，"
+        f"size={payload['size']}，preprocess={payload['preprocess']}，dim={payload['dim']}）"
     )
     print(
         f"  耗时: 解码 {payload['decode_s']}s + 编码 {payload['encode_s']}s"
@@ -191,7 +235,7 @@ def _print_human(payload: dict[str, object]) -> None:
     print(
         f"  窗口池化: shape={payload['window_pool_shape']}"
         f"（{payload['n_windows_pooled']}/{payload['n_windows_total']} 个窗口，"
-        f"limit={payload['limit']}）"
+        f"limit={payload['limit']}；std shape={payload['window_std_shape']}）"
     )
     print(f"  存储: {payload['storage_bytes']} 字节")
     for name, value in payload["files"].items():
@@ -211,7 +255,18 @@ def main(argv: list[str] | None = None) -> int:
     encoder: HFImageEncoder | None = None
     try:
         source, source_stem = _resolve_source(config, args)
-        model_id = resolve_encoder_id(args.encoder)
+        model_id, revision = resolve_encoder_spec(
+            config, encoder=args.encoder, revision=args.revision
+        )
+        settings = config.visual_dense
+        fps = float(args.fps if args.fps is not None else settings.fps)
+        size = int(args.size if args.size is not None else settings.size)
+        batch_size = int(
+            args.batch_size if args.batch_size is not None else settings.batch_size
+        )
+        preprocess = str(
+            args.preprocess if args.preprocess is not None else settings.preprocess
+        )
         if args.limit is not None and args.limit < 1:
             raise DenseVisualError(f"--limit 必须 >= 1，收到 {args.limit}")
         out_dir = (
@@ -221,19 +276,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         encoder = HFImageEncoder(
             model_id,
-            revision=args.revision,
-            cache_dir=config.model.cache_dir,
-            device="auto",
-            dtype="auto",
+            revision=revision,
+            cache_dir=settings.cache_dir,
+            device=settings.device,
+            dtype=settings.dtype,
         )
         wall_started = time.perf_counter()
         features = extract_dense_features(
             source,
             encoder,
-            fps=args.fps,
-            size=args.size,
-            batch_size=args.batch_size,
+            fps=fps,
+            size=size,
+            batch_size=batch_size,
             ffmpeg=config.media.ffmpeg,
+            preprocess=preprocess,
             timeout_s=config.media.extract_timeout_seconds,
         )
         windows = plan_full_coverage(
@@ -248,7 +304,23 @@ def main(argv: list[str] | None = None) -> int:
         if not window_pairs:
             raise DenseVisualError("没有可池化的窗口（检查 --limit）")
         pooled = pool_windows(features, window_pairs)
-        saved = save_features(features, out_dir)
+        window_std = pool_windows_std(features, window_pairs)
+        if args.save_bundle:
+            saved = save_bundle(
+                out_dir,
+                features,
+                windows=pooled,
+                window_std=window_std,
+                window_times=window_pairs,
+                extra={
+                    "pilot": True,
+                    "source": str(source),
+                    "encoder_model": model_id,
+                    "encoder_revision": revision,
+                },
+            )
+        else:
+            saved = save_features(out_dir, features)
         wall_s = time.perf_counter() - wall_started
     except NebulaError as exc:
         print(f"密集视觉 pilot 失败: {exc}", file=sys.stderr)
@@ -259,9 +331,11 @@ def main(argv: list[str] | None = None) -> int:
 
     payload = _summary_payload(
         source=source,
-        encoder=encoder,
+        model_id=model_id,
+        revision=revision,
         features=features,
         pooled=pooled,
+        window_std=window_std,
         window_count=len(windows),
         limit=args.limit,
         saved=saved,
