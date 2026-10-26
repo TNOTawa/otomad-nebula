@@ -58,7 +58,10 @@ Bilibili BV 清单 ───┘                                        │
 | 领域层 | `nebula/v05_data.py` | v0.5-alpha token 构建：从 PE-AV 窗口/CLIP+DINOv2 帧/100Hz+30fps 事件生成 0.5s×16bin 局部 token（npz+manifest），不加载模型 | config、db、dense_visual、events、errors、numpy |
 | 领域层 | `nebula/v05_model.py` | v0.5-alpha 研究模型：局部多模态 Transformer + 全曲时序 Transformer + mask/AV/order 三头（4.31M 参数） | torch、numpy |
 | 领域层/编排 | `nebula/v05_train.py` | v0.5-alpha 训练/验证：确定性 90/20 split、变长 mask、三目标、指标/checkpoint/研究向量；不注册 DB/地图 | torch、numpy、config、db、errors |
-| 入口层 | `ingest.py` / `pipeline.py` / `map.py` / `qa.py` / `tools/clip_stability.py` / `tools/desync_experiment.py` / `tools/preflight_works.py` / `tools/build_representation.py` / `tools/compare_spaces.py` / `tools/events_probe.py` / `tools/visual_pipeline.py` / `tools/dense_preprocess_compare.py` / `tools/embedding_diagnostics.py` / `tools/build_v05_tokens.py` / `tools/train_v05.py` | 参数解析、调用库代码、打印结果、返回退出码 | 对应库模块 |
+| 分析层 | `nebula/discovery.py` | v0.4.5 意外关系发现：排名百分位/无向 bar_p/模式 A/B/C；只读高维向量，不写 DB/不加载模型 | config、db、highdim、representations、numpy |
+| 领域层 | `nebula/audio_dense.py` | v0.5-beta 冻结音频编码器（MERT）：ffmpeg 解码/重采样、5s 窗口编码、0.5s bin 聚合、audio.npz+manifest | config、errors、numpy；torch/transformers 懒加载 |
+| 领域层/编排 | `nebula/v05_beta.py` | v0.5-beta 局部音画配对与双塔 InfoNCE 训练/评估/消融；不注册 DB/地图 | torch、numpy、config、db、errors |
+| 入口层 | `ingest.py` / `pipeline.py` / `map.py` / `qa.py` / `tools/clip_stability.py` / `tools/desync_experiment.py` / `tools/preflight_works.py` / `tools/build_representation.py` / `tools/compare_spaces.py` / `tools/events_probe.py` / `tools/visual_pipeline.py` / `tools/dense_preprocess_compare.py` / `tools/embedding_diagnostics.py` / `tools/build_v05_tokens.py` / `tools/train_v05.py` / `tools/explore_relations.py` / `tools/audio_dense.py` / `tools/train_v05beta.py` | 参数解析、调用库代码、打印结果、返回退出码 | 对应库模块 |
 | 入口层 | `ingest.py` / `pipeline.py` / `map.py` / `qa.py` / `tools/clip_stability.py` / `tools/desync_experiment.py` / `tools/preflight_works.py` / `tools/build_representation.py` / `tools/compare_spaces.py` / `tools/events_probe.py` / `tools/visual_pipeline.py` / `tools/dense_preprocess_compare.py` / `tools/embedding_diagnostics.py` | 参数解析、调用库代码、打印结果、返回退出码 | 对应库模块 |
 
 依赖方向只有一条：入口层 → 展示层 / 编排层 → 领域层 → 基础层。
@@ -165,7 +168,14 @@ map_runs.source_kind ∈ {pe_av, visual}；视觉地图的 embedding_version 存
   `data/models/v05_alpha_v2`；指标 `logs/v05_alpha_v1_metrics.json`、
   `logs/v05_alpha_v2_metrics.json`；研究向量
   `data/representations/transformer_alpha_v1/<sequence_version>/vectors.npy`；
-  两次训练 **可行性验证未通过（负结果）**，详见 `docs/reports/v05-alpha-validation.md`。
+  两次训练 **可行性验证未通过（负结果）**，详见 `docs/reports/v05-alpha-validation.md`；
+- v0.4.5：`logs/unexpected_relations.json`（约 297KB）+ CSV（85KB）；6 空间/110 部/
+  skipped=0；模式 A 950 候选、模式 B 864 候选、common 99 对（>=3 空间 70）、visual_vs_peav 19；
+- v0.5-beta：`data/audio_dense/m-a-p-MERT-v1-95M-.../` 110/110 部、约3.87GiB
+  （pilot 20/314.1MiB PASS；严格容器口径 108/110，work50/99 tail-mask 排除）；
+  `data/v05_tokens/v05_beta_v1/` 110 部/4,130 段/0 截断/142.3MiB；
+  `data/models/v05_beta_{42,43,44}/` + `logs/v05_beta_*`（3 seeds，test Top-1 0.301535，
+  weak positive / not passed）。
 
 ### 3.2 文件系统工件
 
@@ -626,6 +636,48 @@ v0.4.3 新增的紧凑视觉通道（§6.6）用冻结 CLIP/DINOv2 提供 8fps �
 - 下一步：补密集音频语义、局部 visual↔audio InfoNCE、相对时间 order、whitening/duration 去偏、
   更多数据/30fps 子集；达标前不注册主表征/地图。
 
+### 6.9 v0.4.5 意外关系发现 / v0.5-beta 密集音频与局部双塔
+
+**v0.4.5 高维意外关系发现**
+
+- 目标：用高维余弦的**排名百分位**发现“多模型下意外关系”（不拿原始余弦跨模型相减）；
+- 空间：full_mean_v1（joint/audio/video）、temporal_stats_v1（joint）、dense_visual_clip_v2、
+  dense_visual_dino_v2；canonical 共同作品按 work_id 对齐；
+- 分数：p=1-(r-1)/(N-2)，r 为不含自身的近邻排名（第 1=1），无向对取 bar_p=(p(i,j)+p(j,i))/2；
+  模式 A joint vs audio/video 平均、模式 B temporal vs full_mean、模式 C PE-AV/CLIP/DINOv2
+  mutual top-k 对比（common/clip_only/dino_only/peav_only/visual_vs_peav）；只用 p 差/组合；
+- 模块：`nebula/discovery.py`、`tools/explore_relations.py` →
+  `logs/unexpected_relations.json` + CSV；界面“意外关系探索”（模式切换、作品对表、
+  选中高亮、Top-k、互邻筛选、CSV 导出）；
+- **真实结果（2026-10-26）**：6 空间 / 110 部 / skipped=0；模式 A 950 候选、模式 B 864 候选；
+  模式 C common 99 对（其中 >=3 空间 70 对）、visual_vs_peav 19 对；百分位公式逐项复核；
+- 边界：染色/标题/外部元数据不进入分数；不写 DB/不建 map/不加载模型/不联网；
+  不改变默认地图/7 空间行为。
+
+**v0.5-beta 密集音频与局部音画双塔**
+
+- 目的：针对 alpha 失败原因补密集音频语义与真正的局部 AV 配对目标；结果不预设为正；
+- 音频：`m-a-p/MERT-v1-95M` @ `12af15fe...`，第 9 层、24kHz、5s ctx/hop、
+  75Hz/768d、0.5s bin、mean_std、l2；版本
+  `...__sr24000_ctx5_hop5_l9_poolmean_std_bin0.5_norml2`；
+  **Pilot 20/20 PASS**（2582.753s、193,179 帧/5,177 bins、RTF 0.00947、显存 1,320.4MB、
+  314.1MiB）；**全量 110/110 ok、failed=0**（32,619.14s、2,439,577 帧/65,291 bins、
+  RTF 0.00812、显存 1,320.4MB、4,158,970,616B≈3.87GiB）；`summary.pass=true`
+  （帧映射 110/110），**strict_container_alignment=false 108/110**：work 50/99 音轨尾部
+  短 1.95s/1.50s、末尾 3 个 0.5s bin mask=False（无伪造值），已从 beta 排除；
+- 局部双塔：`nebula/v05_beta.py` + `tools/train_v05beta.py`；v05_beta_v1 全量 token
+  （110 部/4,130 段、0 截断/142.3MiB）；音频可用 107 部（排除 50/99 tail-mask、122
+  no_anchor_with_negative），按 canonical work_id 划分 **74/21/12**（test 12 部/约 4,822 anchors）；
+  视觉 CLIP + 音频 MERT 双塔 MLP（128d/L2），InfoNCE t=0.07，3 seeds×30 epochs；
+- **真实结果（3 seeds，test）**：Top-1 0.296557/0.302779/0.305268（均值
+  **0.301535±0.003663**）；vs random **+0.03108**、vs frozen **+0.02779**、
+  vs simple_sync **+0.00912**；消融 seed42：normal 0.296557、audio_zero/visual_zero 0.272916、
+  audio_replacement 0.268768、time_shift 0.280796；
+- **结论：weak positive / not passed**——方向一致但相对 simple_sync 仅 +0.91pp、CI 宽、
+  best epoch 1–6，证据不足以宣布学会可靠局部音画对应；产物仅
+  `data/models/v05_beta_<seed>/` 与 `logs/`；**不注册 DB/不建 map、
+  不进入全曲编码、不改 v0.5-alpha 负结果**。
+
 ## 7. 扩展点
 
 - **升级模型**：改 `config.yaml` 的 `model.checkpoint/version/frames`（Base 版本同理）
@@ -677,7 +729,11 @@ v0.4.3 新增的紧凑视觉通道（§6.6）用冻结 CLIP/DINOv2 提供 8fps �
 | `tools/build_consensus_graph.py` | v0.4.4 跨模型互为近邻/共识边与轻量融合评估（只读表征，不写 DB） |
 | `tools/build_v05_tokens.py` | v0.5-alpha 局部音画 token 数据集构建（只读冻结特征，不重新编码） |
 | `tools/train_v05.py` | v0.5-alpha 研究模型训练/验证（checkpoint/metrics/研究向量；不注册 DB/地图） |
+| `tools/explore_relations.py` | v0.4.5 意外关系发现 CLI（排名百分位模式 A/B/C；不写 DB/不建 map） |
+| `tools/audio_dense.py` | v0.5-beta MERT 密集音频特征 pilot（本地作品，不写 DB/不改事件特征） |
+| `tools/train_v05beta.py` | v0.5-beta 局部音画双塔训练/验证/消融（不注册 DB/地图） |
 | `nebula/v05_data.py` / `v05_model.py` / `v05_train.py` | v0.5-alpha token 构建 / 模型 / 训练验证 |
+| `nebula/discovery.py` / `audio_dense.py` / `v05_beta.py` | v0.4.5 发现 / v0.5-beta 音频编码 / 局部双塔 |
 | `tools/dense_preprocess_compare.py` | v0.4.3 宽高比预处理对照（stretch vs letterbox） |
 | `tools/embedding_diagnostics.py` | v0.4.3 PCA/UMAP 低维投影诊断（Top-10 保持率、距离相关） |
 | `tools/bench_ffmpeg.py` / `bench_preprocess.py` / `bench_peav.py` / `verify_peav.py` | 提速/推理基准与真实模型验证证据脚本 |
@@ -744,6 +800,17 @@ v0.4.3 新增的紧凑视觉通道（§6.6）用冻结 CLIP/DINOv2 提供 8fps �
   v2 mask 0.8131/rank 4.66/order 0.10/reverse -0.0048/Top-5 0.0468）；
   研究产物未注册 representations 表、未建 map；v05_data 不 import torch、训练工具不写 DB；
   测试 15+19+15 条 CPU 离线用例；报告保留“未通过”负结论，不改成成功；
+- **v0.4.5 独立验收**：discovery/工具不 import 模型/UMAP/UI、不写 DB/建 map；
+  unexpected_relations JSON/CSV 真实运行（6 空间/110 部/skipped=0）；百分位公式
+  p=1-(r-1)/(N-2) 逐项核对（JSON 6 位小数）；模式 A 950、B 864、common 99（>=3 空间 70）、
+  visual_vs_peav 19；界面“意外关系探索”真实 AppTest 通过（由 t2 覆盖）；
+- **v0.5-beta 独立验收**：MERT pilot 20/20 PASS（2582.753s、193179 帧/5177 bins、RTF 0.00947、
+  显存 1320.4MB、产物 314.1MiB、漂移 0.01898s）；audio_version 隔离（model/revision/sr/ctx/
+  hop/layer/pool/bin/norm）单测；v05_beta_v1 全量 110 部/4130 段、无截断；3 seeds test
+  Top-1 0.296557/0.302779/0.305268（均值 0.301535±0.003663），
+  高于 random(0.270455)/frozen(0.273745)/simple_sync(0.292410) 且消融双模态均掉点，
+  但相对 simple_sync 仅 +0.91pp、CI 宽、best epoch 1–6，**weak positive / not passed**；
+  研究产物不注册 DB/地图；
 - **独立预言机**：E2E 使用 `tests/fixtures/video_factory.py` 现场合成的素材与独立断言，
   不复用实现方测试的断言逻辑；`qa.py` 的入口检查与 pytest 独立失败；
 - **默认离线**：网络/模型测试必须打 marker，默认测试不触网、不加载权重；

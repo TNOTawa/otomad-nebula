@@ -1803,6 +1803,109 @@ def test_v05_alpha_offline_boundaries(repo_root: Path) -> None:
             assert forbidden not in text, f"{path.name} 不应调用正式登记接口: {forbidden}"
 
 
+def test_v045_discovery_offline_boundaries(repo_root: Path) -> None:
+    """v0.4.5 意外关系发现必须离线只读：不加载模型、不写 DB、不建地图。"""
+
+    module = repo_root / "nebula" / "discovery.py"
+    tool = repo_root / "tools" / "explore_relations.py"
+    assert module.is_file(), "nebula/discovery.py 尚未交付"
+    assert tool.is_file(), "tools/explore_relations.py 尚未交付"
+    for path in (module, tool):
+        _assert_no_import(
+            path,
+            ("torch", "transformers", "umap", "streamlit", "plotly", "nebula.embed"),
+        )
+        text = path.read_text(encoding="utf-8")
+        for forbidden in (
+            "register_representation",
+            "create_map_run",
+            "set_representation_status",
+            "register_representation_vector",
+        ):
+            assert forbidden not in text, f"{path.name} 不应调用正式登记接口: {forbidden}"
+    # 输出 JSON/CSV 明确走 logs，不写 data 目录
+    tool_text = tool.read_text(encoding="utf-8")
+    assert "unexpected_relations.json" in tool_text or "logs" in tool_text
+
+
+def test_v05_beta_offline_boundaries_and_no_silent_truncation(repo_root: Path) -> None:
+    """v0.5-beta 研究层：不注册 DB/地图；默认 max_segments=None，长作品不静默截断。"""
+
+    module = repo_root / "nebula" / "v05_beta.py"
+    tool = repo_root / "tools" / "train_v05beta.py"
+    for path in (module, tool):
+        assert path.is_file(), f"v0.5-beta 文件缺失: {path}"
+    _assert_no_import(module, ("streamlit", "plotly", "umap"))
+    _assert_no_import(tool, ("streamlit", "plotly", "umap"))
+    for path in (module, tool):
+        text = path.read_text(encoding="utf-8")
+        for forbidden in (
+            "register_representation",
+            "create_map_run",
+            "set_representation_status",
+            "register_representation_vector",
+        ):
+            assert forbidden not in text, f"{path.name} 不应调用正式登记接口: {forbidden}"
+
+    import importlib
+    from dataclasses import MISSING
+
+    beta = importlib.import_module("nebula.v05_beta")
+    field = beta.BetaConfig.__dataclass_fields__["max_segments"]
+    default = field.default
+    assert default is None, "v0.5-beta 默认必须不截断（max_segments=None）"
+    assert field.default_factory is MISSING or field.default_factory is None
+
+
+def test_audio_dense_version_isolation(repo_root: Path) -> None:
+    """v0.5-beta 音频版本必须包含 model/revision/sr/ctx/hop/layer/pool/bin/norm，参数变化换版本。"""
+
+    module = repo_root / "nebula" / "audio_dense.py"
+    tool = repo_root / "tools" / "audio_dense.py"
+    for path in (module, tool):
+        assert path.is_file(), f"audio_dense 文件缺失: {path}"
+        _assert_no_import(path, ("streamlit", "plotly", "umap", "nebula.embed"))
+        text = path.read_text(encoding="utf-8")
+        for forbidden in (
+            "register_representation",
+            "create_map_run",
+            "set_representation_status",
+            "register_representation_vector",
+        ):
+            assert forbidden not in text, f"{path.name} 不应调用正式登记接口: {forbidden}"
+
+    import importlib
+
+    audio = importlib.import_module("nebula.audio_dense")
+    base = dict(
+        encoder_version="m-a-p/MERT-v1-95M@deadbeef",
+        sample_rate=24000,
+        context_s=5.0,
+        hop_s=5.0,
+        layer=12,
+        pool="mean",
+        bin_seconds=0.5,
+        normalize="l2",
+    )
+    version = audio.compose_audio_version(**base)
+    assert audio.compose_audio_version(**base) == version
+    assert "/" not in version and "@" not in version
+    for key, value in (
+        ("sample_rate", 16000),
+        ("context_s", 10.0),
+        ("hop_s", 2.5),
+        ("layer", 6),
+        ("pool", "mean_std"),
+        ("bin_seconds", 1.0),
+        ("normalize", "none"),
+    ):
+        changed = dict(base)
+        changed[key] = value
+        assert audio.compose_audio_version(**changed) != version, (
+            f"audio_version 未随 {key} 变化"
+        )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 采样规则
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1879,6 +1982,7 @@ def test_gitignore_mentions_runtime_artifacts(repo_root: Path) -> None:
         "data/sources",
         "data/v05_tokens",
         "data/models",
+        "data/audio_dense",
         "data/maps",
         "temp/",
         "logs/",

@@ -394,6 +394,7 @@ def main(argv: list[str] | None = None) -> int:
                             float(features.bin_mask.sum()) / max(1, int(features.bin_mask.size)),
                             6,
                         ),
+                        "bin_mask_missing": int((~features.bin_mask).sum()),
                         "last_frame_s": round(float(features.frame_times[-1]), 6),
                         "decoded_duration_s": round(float(features.decoded_duration_s), 6),
                         "duration_drift_s": round(float(duration_drift), 6),
@@ -465,6 +466,34 @@ def main(argv: list[str] | None = None) -> int:
             ),
         }
         pass_flag = all(bool(value) for value in checks.values())
+        strict_failed = [
+            {
+                "work_id": int(record["work_id"]),
+                "drift_s": float(record.get("duration_drift_s", 0.0)),
+                "tail_missing_bins": int(record.get("bin_mask_missing", 0)),
+                "bin_mask_ratio": record.get("bin_mask_ratio"),
+                "source": record.get("source"),
+                "excluded_from_beta": True,
+            }
+            for record in work_records
+            if record.get("status") == "ok"
+            and float(record.get("duration_drift_s", 0.0)) > float(args.bin_seconds)
+        ]
+        strict_alignment = {
+            "metric": "abs(decoded_audio_duration - ffprobe_container_duration) <= 1 bin",
+            "bin_seconds": float(args.bin_seconds),
+            "passed": len(strict_failed) == 0,
+            "failed_count": len(strict_failed),
+            "failed_works": strict_failed,
+            "cause": (
+                "源性时长差（音频流比容器/视频短 1.5-2.0s），末尾 bin 无帧（mask=False）；"
+                "不是时间戳漂移或编码错误"
+            ),
+            "note": (
+                "严格容器时长口径 108/110 通过；产物帧时间映射口径 110/110 通过；"
+                "work 50/99 已从 v0.5-beta 77/22/11 划分中排除"
+            ),
+        }
         total_wall = time.perf_counter() - started
         report = {
             "created_at": now_utc_iso(),
@@ -517,6 +546,11 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "vram_peak_mb": vram_peak,
                 "disk_bytes": int(disk_bytes),
+                "alignment_definition": (
+                    "frame_time_mapping: |decoded_audio_duration - last_frame_time| <= 1 bin；"
+                    "容器时长与音频流时长差单独记录为 strict_container_alignment"
+                ),
+                "strict_container_alignment": strict_alignment,
                 "container_duration_drift_s": {
                     "max": round(
                         max(

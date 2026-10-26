@@ -13,7 +13,8 @@
    tools/preflight_works.py、tools/build_representation.py、tools/compare_spaces.py、
    tools/events_probe.py、tools/visual_pipeline.py、tools/dense_preprocess_compare.py、
    tools/embedding_diagnostics.py、tools/build_visual_windows.py、tools/build_consensus_graph.py、
-   tools/build_v05_tokens.py、tools/train_v05.py 的 --help 均能成功运行；
+   tools/build_v05_tokens.py、tools/train_v05.py、tools/explore_relations.py、
+   tools/audio_dense.py、tools/train_v05beta.py 的 --help 均能成功运行；
 5. 配置有效性：config.yaml 可加载；可据此生成并加载一份临时隔离配置；ffmpeg/ffprobe 可用；
    v0.4 配置段（sampling/events/temporal 与 representations 目录）与 v0.4.3/v0.4.3.1
    （visual_dense、weight_scheme、visual_window_plan、visual_windows/sources 路径）段有效。
@@ -69,6 +70,9 @@ CLI_CHECKS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("tools/build_consensus_graph.py", ()),
     ("tools/build_v05_tokens.py", ()),
     ("tools/train_v05.py", ()),
+    ("tools/explore_relations.py", ()),
+    ("tools/audio_dense.py", ()),
+    ("tools/train_v05beta.py", ()),
 )
 """必须能以 --help 成功运行的 CLI 入口（脚本, 子命令参数）。"""
 
@@ -104,6 +108,10 @@ V02_DOC_KEYWORDS: dict[str, tuple[str, ...]] = {
         "v05_alpha",
         "validation",
         "v05_tokens",
+        "v0.4.5",
+        "unexpected_relations",
+        "v0.5-beta",
+        "audio_dense",
     ),
     "ARCHITECTURE.md": (
         "work_links",
@@ -138,6 +146,10 @@ V02_DOC_KEYWORDS: dict[str, tuple[str, ...]] = {
         "v05_alpha",
         "validation",
         "v05_tokens",
+        "v0.4.5",
+        "unexpected_relations",
+        "v0.5-beta",
+        "audio_dense",
     ),
 }
 """v0.2.x / v0.4 文档必须覆盖的关键内容（存在性检查，不校验具体措辞）。"""
@@ -375,8 +387,8 @@ def check_docs(*, verbose: bool = False) -> CheckResult:
     if problems:
         return CheckResult("docs", False, "；".join(problems), duration)
     detail = (
-        f"README/ARCHITECTURE 含 v0.2.x/v0.4/v0.4.3/v0.4.3.1/v0.4.4/v0.5-alpha 内容，"
-        f"ADR {len(adr_files)} 篇且章节完整"
+        f"README/ARCHITECTURE 含 v0.2.x/v0.4/v0.4.3/v0.4.3.1/v0.4.4/v0.5-alpha/"
+        f"v0.4.5/v0.5-beta 内容，ADR {len(adr_files)} 篇且章节完整"
     )
     return CheckResult("docs", True, detail, duration)
 
@@ -420,7 +432,8 @@ def check_cli(*, verbose: bool = False) -> CheckResult:
         "tools/build_representation.py、tools/compare_spaces.py、tools/events_probe.py、"
         "tools/visual_pipeline.py、tools/dense_preprocess_compare.py、"
         "tools/embedding_diagnostics.py、tools/build_visual_windows.py、"
-        "tools/build_consensus_graph.py、tools/build_v05_tokens.py、tools/train_v05.py）"
+        "tools/build_consensus_graph.py、tools/build_v05_tokens.py、tools/train_v05.py、"
+        "tools/explore_relations.py、tools/audio_dense.py、tools/train_v05beta.py）"
     )
     return CheckResult("cli", True, detail, duration)
 

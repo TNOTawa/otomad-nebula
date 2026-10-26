@@ -8,7 +8,8 @@
 > temporal/map/compare_spaces）的接口、状态与能力边界见文末 §10（准确命名不是“逐帧语义理解系统”）；
 > v0.4.3 密集视觉通道（visual_versions/visual_sequences、dense_visual、source_kind）见 §10.3；
 > v0.4.3.1 窗口计划层/覆盖权重/源缓存与 v0.4.4 共识契约见 §10.7；
-> v0.5-alpha 研究模型（负结果、不注册 DB/地图）见 §10.8。
+> v0.5-alpha 研究模型（负结果、不注册 DB/地图）见 §10.8；
+> 本轮 v0.4.5 意外关系发现与 v0.5-beta 密集音频/局部双塔见 §10.9。
 
 ## 实现状态（v0.2.x）
 
@@ -305,15 +306,20 @@ def write_report(report: dict, *, json_path, csv_path) -> None
 | v0.4.3.1 权重修复/窗口重建/v2 表征/地图 | ✅ t1/t3/t5 完成 | `coverage_weights`、`window_weights`、`tools/build_visual_windows.py`、v2 表征与地图 | 窗口计划 win8s_ov0__coverage-v1、252/252 completed、9446 窗口、weight_sum 0.999999847..1.000000209；v2 id=6/7（512/384）各 110 向量；map_v015/map_v016=110；v1→v2 余弦 min CLIP 0.999972/DINO 0.999863；Top-5 Jaccard 0.9939/0.9970；报告已回填（`docs/reports/v0431-window-weights-and-versioning.md`） |
 | v0.4.4 共识图/轻量融合/界面连线 | ✅ t5/t2 完成 | `tools/build_consensus_graph.py`、`logs/neighbor_consensus.json/.csv`、界面互为近邻/共识连线 | mutual 61/75/73；共识边 53（全共识 22），覆盖 44/110（40.00%），强度 0.8050；融合 rank Jaccard 0.5331/共识 0.4303，concat 0.5358/0.4106 与 0.5385/0.4121；真实 AppTest 7 空间/互邻/共识通过；报告已回填（`docs/reports/v044-consensus-fusion.md`） |
 | v0.5-alpha 分层时序模型 | ❌ 可行性验证未通过（负结果；研究产物） | `nebula/v05_data.py`/`v05_model.py`/`v05_train.py`、`tools/build_v05_tokens.py`/`train_v05.py`；data/v05_tokens 110 部/PE-AV 窗口 4130（token 截断后 3904 段）/141.1MB；v1/v2 checkpoint+metrics；研究向量未注册 DB、未建 map | v1 mask 0.8149 vs 基线 0.8249/rank 1.03；v2 mask 0.8131/AV 0.40/AUC 0.635/order 0.10/rank 4.66/reverse -0.0048/Top-5 0.0468；报告 `docs/reports/v05-alpha-validation.md`（保留负结论） |
+| v0.4.5 意外关系发现 | ✅ 完成（研究/探索层） | `nebula/discovery.py`、`tools/explore_relations.py`、界面“意外关系探索”；`logs/unexpected_relations.json`+CSV | 6 空间/110 部/skipped=0；模式 A 950 候选、B 864 候选、common 99 对（>=3 空间 70）、visual_vs_peav 19；百分位公式复核；不写 DB/不建 map |
+| v0.5-beta 密集音频 | ✅ 完成（Pilot 20/20 + 全量 110/110） | `nebula/audio_dense.py`、`tools/audio_dense.py`、`data/audio_dense/<audio_version>/` | pilot 20/20、2582.753s、193179 帧/5177 bins、RTF .00947、314.1MiB；全量 110/110 ok、32619.14s、2,439,577 帧/65,291 bins、RTF .00812、4,158,970,616B≈3.87GiB、pass=true；strict_container 108/110（work50/99 tail mask=False，已排除）；不注册 DB/地图 |
+| v0.5-beta 局部双塔 | ✅ 完成真实训练（weak positive / not passed） | `nebula/v05_beta.py`、`tools/train_v05beta.py`、v05_beta_v1 数据、3 seeds checkpoint/metrics | test Top-1 0.296557/0.302779/0.305268（均值 0.301535±0.003663）；vs random +0.03108、vs frozen +0.02779、vs simple_sync +0.00912；test 12 部/约 4,822 anchors、音频 107 部；不注册 DB/地图、不改 alpha 负结论 |
 
-**当前门禁（v0.4.3.1/v0.4.4/v0.5-alpha，默认 sampling.mode=full_coverage）**：仓库内
-`python qa.py --full` = **PASS 5/5**（2026-10-26；ruff 全绿；pytest **951 passed, 1 skipped**
-（model/network 已启用），193.23s；总耗时 201.91s；docs 10 篇 ADR 章节完整且含
-v0.4.3/v0.4.3.1/v0.4.4/v0.5-alpha；CLI **18 个入口** --help（含 build_visual_windows/
-build_consensus_graph/build_v05_tokens/train_v05）；config 含 v0.4/v0.4.3 visual_dense、
-visual_window_plan_version、visual_windows/sources 校验）。
-v0.4.3/v0.4.3.1/v0.4.4 真实数据与真实 AppTest 复核结果见 §10.6/§10.7；v0.5-alpha 负结果见 §10.8；
-t4 最终复核 23/23 报告数字核对通过，负结论未改。
+
+**当前门禁（v0.4.3.1/v0.4.4/v0.5-alpha/v0.4.5/v0.5-beta，默认
+sampling.mode=full_coverage）**：仓库内 `python qa.py --full` = **PASS 5/5**
+（2026-10-26；ruff 全绿；pytest **1019 passed, 1 skipped**（model/network 已启用），231.52s；
+总耗时 241.68s；docs 10 篇 ADR 章节完整且含 v0.4.3/v0.4.3.1/v0.4.4/v0.5-alpha/v0.4.5/v0.5-beta；
+CLI **21 个入口** --help（含 build_visual_windows/build_consensus_graph/build_v05_tokens/
+train_v05/explore_relations/audio_dense/train_v05beta）；
+config 含 v0.4/v0.4.3 visual_dense、visual_window_plan_version、visual_windows/sources 校验）。
+v0.4.3/v0.4.3.1/v0.4.4 真实数据与真实 AppTest 见 §10.6/§10.7；v0.5-alpha 负结果见 §10.8；
+v0.4.5/v0.5-beta 真实结果见 §10.9；t4 真实产物/界面复核 4 PASS/0 FAIL。
 
 
 ### 10.2 版本命名与配置
@@ -590,3 +596,52 @@ python tools/compare_spaces.py --a legacy_5clip_mean --a-seq <sequence_version> 
 - **下一步**：补密集音频语义、局部 visual↔audio InfoNCE、相对时间 order、whitening/duration 去偏、
   更多数据/30fps 子集；达标前不注册主表征/地图；报告
   `docs/reports/v05-alpha-validation.md` 保留“未通过”负结论。
+
+### 10.9 本轮增量契约与结果（v0.4.5 / v0.5-beta，2026-10-26 完成）
+
+#### v0.4.5 意外关系发现
+
+- 新增 `nebula/discovery.py`、`tools/explore_relations.py`；
+- 输入空间：full_mean_v1（joint/audio/video）、temporal_stats_v1（joint）、
+  dense_visual_clip_v2、dense_visual_dino_v2；canonical 共同作品按 work_id 对齐；
+- 分数只用**排名百分位**：p=1-(r-1)/(N-2)，r 为不含自身的余弦近邻排名（第 1=1，N>=3）；
+  无向对 bar_p=(p(i,j)+p(j,i))/2；模式 A/B/C 见设计；**禁止原始余弦跨模型相减**；
+- 输出 `logs/unexpected_relations.json` + CSV（meta/spaces/mode_a/mode_b/mode_c）；
+- 约束：不写 DB、不建 map、不加载模型、不联网；染色/标题/外部元数据不进入分数；
+  默认旧地图与 7 空间行为不变；缺失空间/零向量显式报错或记录，不静默补齐；
+- **真实结果（2026-10-26，t4 复核）**：`logs/unexpected_relations.json`（约 297KB）+
+  CSV（约 85KB）；6 空间 / 110 部 / skipped=0；模式 A 950 候选、模式 B 864 候选、common 99 对
+  （>=3 空间 70 对）、visual_vs_peav 19 对；百分位公式逐项核对（6 位小数）通过；
+  top 示例见 `docs/reports/v045-v05beta-delivery.md`；不写 DB/不建 map。
+
+#### v0.5-beta 密集音频与局部双塔
+
+- 音频数据：`nebula/audio_dense.py` + `tools/audio_dense.py`；
+  `data/audio_dense/<audio_version>/<work_id>/audio.npz` + manifest；
+  audio_version 必须包含 model/revision/sample_rate/context/hop/layer/pool/bin/normalize；
+  只处理本地 canonical（约 20 部 pilot），不下载网络视频、不删除源文件；不覆盖事件特征；
+- pilot：先真实运行并满足 20 部成功、无 NaN/Inf、bin 与时长一致、对齐误差 ≤1 bin、
+  显存 ≤8GB；失败则停止，不做全量；报告 `docs/reports/v05beta-audio-pilot.md`；
+- **真实结果（Pilot+全量）**：`m-a-p/MERT-v1-95M`@12af15fe、第 9 层、24kHz、
+  5s ctx/hop、75Hz/768d、0.5s bin、mean_std、l2；版本
+  `...__sr24000_ctx5_hop5_l9_poolmean_std_bin0.5_norml2`；
+  **pilot 20/20 PASS**（2582.753s、193,179 帧/5,177 bins、RTF 0.00947、显存 1,320.4MB、
+  314.1MiB）；**全量 110/110 ok、failed=0**（32,619.14s、2,439,577 帧/65,291 bins、
+  RTF 0.00812、显存 1,320.4MB、4,158,970,616B≈3.87GiB）；`summary.pass=true`
+  （帧映射 110/110），**strict_container_alignment=false 108/110**：work 50/99 音轨尾部
+  短 1.95s/1.50s、末尾 3 个 0.5s bin mask=False（无伪造值），已从 beta 排除；
+  产物 `data/audio_dense/<audio_version>/` + manifest；不注册 DB/地图；
+- 局部双塔：`nebula/v05_beta.py` + `tools/train_v05beta.py`；视觉优先 CLIP
+  （DINOv2 消融），音频 dense；正样本 (A_t,V_t)，同作品时间偏移负例；不使用 PE-AV joint 作为
+  配对分类输入，不用作品 ID/位置/外部元数据；数据 v05_beta_v1 全量 token（不静默截断）；
+  按 canonical work_id 确定性划分 train/val/test，val 选模型、test 只评一次，至少 3 seeds；
+- 产物 checkpoint/metrics 落 `data/models/v05_beta_<seed>/` 与 `logs/`；
+  **不注册 representations、不建 map、不改 v0.5-alpha 负结果**；
+- **真实结果（3 seeds 42/43/44，2026-10-26）**：v05_beta_v1 数据 110 部/4,130 段/0 截断/
+  142.3MiB；音频可用 107 部（排除 work 50/99 tail-mask、122 no_anchor_with_negative），
+  按 canonical work_id 划分 **74/21/12**（test 12 部/约 4,822 anchors）；test Top-1
+  0.296557/0.302779/0.305268（均值 **0.301535±0.003663**）；vs random +0.03108、
+  vs 冻结投影 +0.02779、vs simple_sync +0.00912；消融 seed42：normal 0.296557、
+  audio_zero/visual_zero 0.272916、audio_replacement 0.268768、time_shift 0.280796；
+  **weak positive / not passed**（相对 simple_sync 仅 +0.91pp、CI 宽、best epoch 1–6）；
+  详见 `docs/reports/v045-v05beta-delivery.md`。
