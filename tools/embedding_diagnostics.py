@@ -43,6 +43,11 @@ if str(REPO_ROOT) not in sys.path:
 from nebula.config import Config, load_config  # noqa: E402
 from nebula.db import Catalog  # noqa: E402
 from nebula.errors import NebulaError  # noqa: E402
+from nebula.highdim import (  # noqa: E402
+    cosine_distance_matrix,
+    normalize_vectors,
+    topk_distance_neighbors,
+)
 from nebula.log import configure_logging  # noqa: E402
 from nebula.representations import (  # noqa: E402
     load_representation_matrix,
@@ -134,21 +139,6 @@ def _validated_names(names: Sequence[str]) -> tuple[str, ...]:
 
 
 # --------------------------------------------------------------------------- 数据空间
-def normalize_vectors(matrix: Any, *, where: str = "向量矩阵") -> np.ndarray:
-    """校验二维矩阵并逐行 L2 归一化（float64）。"""
-
-    values = np.asarray(matrix, dtype=np.float64)
-    if values.ndim != 2 or values.shape[0] < 1 or values.shape[1] < 1:
-        raise NebulaError(f"{where} 形状非法: {values.shape}")
-    if not np.all(np.isfinite(values)):
-        raise NebulaError(f"{where} 包含 NaN/Inf")
-    norms = np.linalg.norm(values, axis=1, keepdims=True)
-    zero_rows = np.where(norms <= _EPS)[0]
-    if zero_rows.size:
-        raise NebulaError(f"{where} 有 {zero_rows.size} 个零向量，无法计算余弦距离")
-    return values / norms
-
-
 @dataclass(frozen=True)
 class SpaceMatrix:
     """一个表征的 canonical 作品矩阵（行 = work_id 升序，列 = 高维特征）。"""
@@ -229,16 +219,8 @@ def load_space(
 
 
 # --------------------------------------------------------------------------- 距离与邻域
-def cosine_distance_matrix(matrix: Any) -> np.ndarray:
-    """1 - 余弦相似度，返回 (n, n) 对称、对角线为 0 的距离矩阵。"""
-
-    normalized = normalize_vectors(matrix, where="余弦距离输入")
-    similarity = normalized @ normalized.T
-    np.clip(similarity, -1.0, 1.0, out=similarity)
-    distance = np.maximum(1.0 - similarity, 0.0)
-    distance = (distance + distance.T) / 2.0
-    np.fill_diagonal(distance, 0.0)
-    return distance
+# 共享实现见 nebula.highdim；本工具旧内部名保留为别名，避免测试/外部脚本失效。
+topk_neighbors = topk_distance_neighbors
 
 
 def euclidean_distance_matrix(points: Any) -> np.ndarray:
@@ -255,25 +237,6 @@ def euclidean_distance_matrix(points: Any) -> np.ndarray:
     distance = (distance + distance.T) / 2.0
     np.fill_diagonal(distance, 0.0)
     return distance
-
-
-def topk_neighbors(distance: Any, k: int) -> np.ndarray:
-    """每行的 Top-k 邻居索引（不含自身；距离升序，并列按索引稳定排序）。"""
-
-    values = np.asarray(distance, dtype=np.float64)
-    if values.ndim != 2 or values.shape[0] != values.shape[1]:
-        raise NebulaError(f"距离矩阵必须是方阵，收到 {values.shape}")
-    if not np.all(np.isfinite(values)):
-        raise NebulaError("距离矩阵包含 NaN/Inf")
-    k_value = _validated_k(k)
-    count = int(values.shape[0])
-    effective = min(k_value, max(count - 1, 0))
-    if effective == 0:
-        return np.zeros((count, 0), dtype=np.int64)
-    work = values.copy()
-    np.fill_diagonal(work, np.inf)
-    order = np.argsort(work, axis=1, kind="stable")
-    return order[:, :effective].astype(np.int64)
 
 
 def _pearson(first: Any, second: Any) -> float:

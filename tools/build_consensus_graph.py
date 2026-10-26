@@ -61,6 +61,11 @@ if str(REPO_ROOT) not in sys.path:
 from nebula.config import Config, load_config  # noqa: E402
 from nebula.db import Catalog  # noqa: E402
 from nebula.errors import NebulaError  # noqa: E402
+from nebula.highdim import (  # noqa: E402
+    cosine_similarity_matrix,
+    normalize_vectors,
+    topk_similarity_neighbors,
+)
 from nebula.log import configure_logging  # noqa: E402
 from nebula.representations import (  # noqa: E402
     load_representation_matrix,
@@ -139,21 +144,6 @@ def _validated_names(names: Sequence[str]) -> tuple[str, ...]:
 
 
 # --------------------------------------------------------------------------- 数据空间
-def normalize_vectors(matrix: Any, *, where: str = "向量矩阵") -> np.ndarray:
-    """校验二维矩阵并逐行 L2 归一化（float64）。"""
-
-    values = np.asarray(matrix, dtype=np.float64)
-    if values.ndim != 2 or values.shape[0] < 1 or values.shape[1] < 1:
-        raise NebulaError(f"{where} 形状非法: {values.shape}")
-    if not np.all(np.isfinite(values)):
-        raise NebulaError(f"{where} 包含 NaN/Inf")
-    norms = np.linalg.norm(values, axis=1, keepdims=True)
-    zero_rows = np.where(norms <= _EPS)[0]
-    if zero_rows.size:
-        raise NebulaError(f"{where} 有 {zero_rows.size} 个零向量")
-    return values / norms
-
-
 @dataclass(frozen=True)
 class SpaceData:
     """一个表征空间的作品矩阵（行 = work_id 升序，列 = 高维特征，逐行 L2）。"""
@@ -282,33 +272,8 @@ def align_spaces(spaces: Sequence[SpaceData]) -> tuple[SpaceData, ...]:
 
 
 # --------------------------------------------------------------------------- 邻接
-def cosine_similarity_matrix(matrix: Any) -> np.ndarray:
-    """逐行归一化后的余弦相似度矩阵（对称、对角线 1）。"""
-
-    normalized = normalize_vectors(matrix, where="余弦相似度输入")
-    similarity = normalized @ normalized.T
-    np.clip(similarity, -1.0, 1.0, out=similarity)
-    np.fill_diagonal(similarity, 1.0)
-    return similarity
-
-
-def topk_neighbors(similarity: Any, k: int) -> np.ndarray:
-    """每行 Top-k 邻居索引（不含自身；相似度降序，并列按索引稳定排序）。"""
-
-    values = np.asarray(similarity, dtype=np.float64)
-    if values.ndim != 2 or values.shape[0] != values.shape[1]:
-        raise NebulaError(f"相似度矩阵必须是方阵，收到 {values.shape}")
-    if not np.all(np.isfinite(values)):
-        raise NebulaError("相似度矩阵包含 NaN/Inf")
-    k_value = _validated_k(k)
-    count = int(values.shape[0])
-    effective = min(k_value, max(count - 1, 0))
-    if effective == 0:
-        return np.zeros((count, 0), dtype=np.int64)
-    work = values.copy()
-    np.fill_diagonal(work, -np.inf)
-    order = np.argsort(-work, axis=1, kind="stable")
-    return order[:, :effective].astype(np.int64)
+# 共享实现见 nebula.highdim；本工具旧内部名保留为别名，避免调用点/外部脚本失效。
+topk_neighbors = topk_similarity_neighbors
 
 
 @dataclass(frozen=True)

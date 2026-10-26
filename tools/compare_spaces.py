@@ -35,7 +35,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import hashlib
 import os
 import sys
 from dataclasses import dataclass
