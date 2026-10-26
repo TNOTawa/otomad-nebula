@@ -36,6 +36,9 @@ LEGACY_NAME = LEGACY_REPRESENTATION_NAME
 FULL_MEAN_V1 = "full_mean_v1"
 TEMPORAL_STATS_V1 = "temporal_stats_v1"
 TRANSFORMER_V1 = "transformer_v1"
+#: 密集视觉语义表征（v0.4.3）：CLIP-only / DINOv2-only 对照空间
+DENSE_VISUAL_CLIP_V1 = "dense_visual_clip_v1"
+DENSE_VISUAL_DINO_V1 = "dense_visual_dino_v1"
 
 #: 界面显示名
 REPRESENTATION_LABELS: dict[str, str] = {
@@ -43,6 +46,8 @@ REPRESENTATION_LABELS: dict[str, str] = {
     FULL_MEAN_V1: "Full Mean（全片平均）",
     TEMPORAL_STATS_V1: "Temporal Stats（时间结构）",
     TRANSFORMER_V1: "Temporal Transformer（v0.5，未开放）",
+    DENSE_VISUAL_CLIP_V1: "Dense Visual·CLIP（密集视觉语义）",
+    DENSE_VISUAL_DINO_V1: "Dense Visual·DINOv2（密集视觉结构）",
 }
 
 #: CLI / 界面上的别名
@@ -58,6 +63,12 @@ _NAME_ALIASES: dict[str, str] = {
     "temporal_stats_v1": TEMPORAL_STATS_V1,
     "transformer": TRANSFORMER_V1,
     "transformer_v1": TRANSFORMER_V1,
+    "dense_visual_clip": DENSE_VISUAL_CLIP_V1,
+    "dense_visual_clip_v1": DENSE_VISUAL_CLIP_V1,
+    "clip_visual": DENSE_VISUAL_CLIP_V1,
+    "dense_visual_dino": DENSE_VISUAL_DINO_V1,
+    "dense_visual_dino_v1": DENSE_VISUAL_DINO_V1,
+    "dino_visual": DENSE_VISUAL_DINO_V1,
 }
 
 #: 表征向量支持的模态（与 DB representation_vectors.kind 一致）

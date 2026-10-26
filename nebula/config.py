@@ -24,6 +24,7 @@ _TOP_LEVEL_KEYS = {
     "sampling",
     "events",
     "temporal",
+    "visual_dense",
     "model",
     "umap",
     "download",
@@ -43,6 +44,7 @@ class PathsConfig:
     db_path: Path
     embeddings: Path
     representations: Path
+    visual_dense: Path
     maps: Path
 
 
@@ -87,6 +89,30 @@ class TemporalConfig:
     """v0.4.2 固定时间结构表征参数。"""
 
     stages: int
+
+
+@dataclass(frozen=True)
+class VisualEncoderConfig:
+    """一个冻结视觉编码器的固定模型版本（model id + revision）。"""
+
+    model: str
+    revision: str
+
+
+@dataclass(frozen=True)
+class VisualDenseConfig:
+    """v0.4.3 密集视觉语义通道参数（CLIP/DINOv2 等冻结编码器）。"""
+
+    fps: float
+    size: int
+    preprocess: str
+    batch_size: int
+    device: str
+    dtype: str
+    cache_dir: Path
+    subset_fps: float
+    subset_count: int
+    encoders: tuple[VisualEncoderConfig, ...]
 
 
 @dataclass(frozen=True)
@@ -153,6 +179,7 @@ class Config:
     sampling: SamplingConfig
     events: EventsConfig
     temporal: TemporalConfig
+    visual_dense: VisualDenseConfig
     model: ModelConfig
     umap: UmapConfig
     download: DownloadConfig
@@ -214,6 +241,7 @@ class Config:
             self.paths.logs,
             self.paths.embeddings,
             self.paths.representations,
+            self.paths.visual_dense,
             self.paths.maps,
             self.model.cache_dir,
         ):
@@ -425,6 +453,65 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
     if not 2 <= stages <= 8:
         _fail("temporal.stages 必须在 2..8")
 
+    visual = _section(data, "visual_dense")
+    _check_keys(
+        visual,
+        {
+            "fps",
+            "size",
+            "preprocess",
+            "batch_size",
+            "device",
+            "dtype",
+            "cache_dir",
+            "subset_fps",
+            "subset_count",
+            "encoders",
+        },
+        "visual_dense",
+    )
+    visual_fps = float(_req(visual, "fps", "visual_dense", (int, float)))
+    visual_size = int(_req(visual, "size", "visual_dense", int))
+    visual_preprocess = _req(visual, "preprocess", "visual_dense", str)
+    visual_batch_size = int(_req(visual, "batch_size", "visual_dense", int))
+    visual_device = _req(visual, "device", "visual_dense", str)
+    visual_dtype = _req(visual, "dtype", "visual_dense", str)
+    visual_subset_fps = float(_req(visual, "subset_fps", "visual_dense", (int, float)))
+    visual_subset_count = int(_req(visual, "subset_count", "visual_dense", int))
+    if visual_fps <= 0 or visual_fps > 120:
+        _fail("visual_dense.fps 必须在 (0, 120]")
+    if visual_size < 32 or visual_size % 2 != 0:
+        _fail("visual_dense.size 必须是 >=32 的偶数")
+    if visual_preprocess not in ("stretch", "letterbox"):
+        _fail("visual_dense.preprocess 必须是 stretch 或 letterbox")
+    if visual_batch_size < 1:
+        _fail("visual_dense.batch_size 必须 >= 1")
+    if visual_device not in ("auto", "cpu", "cuda"):
+        _fail("visual_dense.device 必须是 auto/cpu/cuda")
+    if visual_dtype not in ("auto", "float32", "bfloat16"):
+        _fail("visual_dense.dtype 必须是 auto/float32/bfloat16")
+    if visual_subset_fps <= visual_fps or visual_subset_fps > 120:
+        _fail("visual_dense.subset_fps 必须大于 fps 且 <=120")
+    if not 0 <= visual_subset_count <= 200:
+        _fail("visual_dense.subset_count 必须在 0..200")
+    encoders_raw = _req(visual, "encoders", "visual_dense", list)
+    if not encoders_raw:
+        _fail("visual_dense.encoders 不能为空")
+    visual_encoders: list[VisualEncoderConfig] = []
+    seen_models: set[str] = set()
+    for position, entry in enumerate(encoders_raw):
+        if not isinstance(entry, Mapping):
+            _fail(f"visual_dense.encoders[{position}] 必须是映射")
+        _check_keys(entry, {"model", "revision"}, f"visual_dense.encoders[{position}]")
+        model_id = _req(entry, "model", f"visual_dense.encoders[{position}]", str).strip()
+        revision = _req(entry, "revision", f"visual_dense.encoders[{position}]", str).strip()
+        if not model_id or not revision:
+            _fail(f"visual_dense.encoders[{position}] 的 model/revision 不能为空")
+        if model_id in seen_models:
+            _fail(f"visual_dense.encoders 重复 model: {model_id}")
+        seen_models.add(model_id)
+        visual_encoders.append(VisualEncoderConfig(model=model_id, revision=revision))
+
     model = _section(data, "model")
     _check_keys(
         model,
@@ -524,6 +611,7 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
         db_path=db_path,
         embeddings=(data_dir / "embeddings").resolve(),
         representations=(data_dir / "representations").resolve(),
+        visual_dense=(data_dir / "visual_dense").resolve(),
         maps=(data_dir / "maps").resolve(),
     )
     return Config(
@@ -554,6 +642,18 @@ def load_config(path: str | Path | None = None, *, root: str | Path | None = Non
             version=event_version,
         ),
         temporal=TemporalConfig(stages=stages),
+        visual_dense=VisualDenseConfig(
+            fps=visual_fps,
+            size=visual_size,
+            preprocess=visual_preprocess,
+            batch_size=visual_batch_size,
+            device=visual_device,
+            dtype=visual_dtype,
+            cache_dir=_path(project_root, _req(visual, "cache_dir", "visual_dense", str), "visual_dense.cache_dir"),
+            subset_fps=visual_subset_fps,
+            subset_count=visual_subset_count,
+            encoders=tuple(visual_encoders),
+        ),
         model=ModelConfig(
             checkpoint=str(_req(model, "checkpoint", "model", str)),
             revision=revision,

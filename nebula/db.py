@@ -22,17 +22,18 @@ from . import EMBEDDING_KINDS
 from .errors import DatabaseError
 from .util import normalize_relpath, now_utc_iso
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 STATUSES = ("pending", "downloading", "encoding", "completed", "failed")
 
 #: 旧版“均匀抽 ≤N 段再平均”的表征名；迁移时自动为已有 embedding_versions 补登
 LEGACY_REPRESENTATION_NAME = "legacy_5clip_mean"
 
-REPRESENTATION_KINDS = ("legacy", "full_mean", "temporal_stats", "transformer")
+REPRESENTATION_KINDS = ("legacy", "full_mean", "temporal_stats", "transformer", "visual")
 REPRESENTATION_VECTOR_KINDS = ("joint", "audio", "video")
 REPRESENTATION_STATUSES = ("building", "ready", "failed")
 SEQUENCE_STATUSES = ("in_progress", "assembled", "failed")
+VISUAL_SEQUENCE_STATUSES = ("pending", "in_progress", "completed", "failed")
 
 TRANSITIONS: dict[str, frozenset[str]] = {
     "pending": frozenset({"downloading", "encoding", "failed"}),
@@ -173,13 +174,48 @@ CREATE TABLE IF NOT EXISTS sequence_states (
     PRIMARY KEY (work_id, version)
 );
 
+-- 密集视觉语义通道（v0.4.3）：冻结视觉编码器版本；帧级+窗口级向量
+CREATE TABLE IF NOT EXISTS visual_versions (
+    version TEXT PRIMARY KEY,
+    model_id TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    preprocessing TEXT NOT NULL CHECK (preprocessing IN ('stretch', 'letterbox')),
+    fps REAL NOT NULL,
+    size INTEGER NOT NULL,
+    dim INTEGER,
+    params_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS visual_sequences (
+    work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+    version TEXT NOT NULL REFERENCES visual_versions(version),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')),
+    frames_path TEXT,
+    windows_path TEXT,
+    n_frames INTEGER,
+    n_windows INTEGER,
+    dim INTEGER,
+    error TEXT,
+    decode_s REAL NOT NULL DEFAULT 0,
+    encode_s REAL NOT NULL DEFAULT 0,
+    model_load_s REAL NOT NULL DEFAULT 0,
+    total_s REAL NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (work_id, version)
+);
+CREATE INDEX IF NOT EXISTS ix_visual_sequences_version_status
+    ON visual_sequences(version, status);
+
 -- 表征层（v0.4）：聚合器版本，独立于 PE-AV 编码；binding 到 sequence_version
 CREATE TABLE IF NOT EXISTS representations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     sequence_version TEXT NOT NULL REFERENCES embedding_versions(version),
     kind TEXT NOT NULL
-        CHECK (kind IN ('legacy', 'full_mean', 'temporal_stats', 'transformer')),
+        CHECK (kind IN ('legacy', 'full_mean', 'temporal_stats', 'transformer', 'visual')),
     dim INTEGER NOT NULL DEFAULT 0,
     path_prefix TEXT,
     params_json TEXT NOT NULL,
@@ -347,22 +383,33 @@ class Catalog:
             conn.execute("COMMIT")
 
     def initialize(self) -> None:
-        """建表并校验/迁移 schema 版本；可重复调用。"""
+        """建表并校验/迁移 schema 版本；可重复调用。
+
+        v4 迁移需要重建 representations 表以扩展 kind CHECK 约束；重建期间临时关闭
+        外键检查（SQLite 的 PRAGMA foreign_keys 在事务内无效，因此必须在 BEGIN 之前设置）。
+        """
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = self.conn
         conn.executescript(SCHEMA_SQL)
-        with self.transaction() as tx:
-            row = tx.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
-            if row is None:
-                tx.execute(
-                    "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
-                    (SCHEMA_VERSION,),
-                )
-            else:
-                current = str(row["value"])
-                if current != SCHEMA_VERSION:
+        row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+        current = None if row is None else str(row["value"])
+        needs_migration = current is not None and current != SCHEMA_VERSION
+        fk_disabled = needs_migration and current in ("1", "2", "3")
+        if fk_disabled:
+            conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            with self.transaction() as tx:
+                if row is None:
+                    tx.execute(
+                        "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
+                        (SCHEMA_VERSION,),
+                    )
+                elif current != SCHEMA_VERSION:
                     self._migrate_schema(tx, current)
+        finally:
+            if fk_disabled:
+                conn.execute("PRAGMA foreign_keys = ON")
 
     def _migrate_schema(self, conn: sqlite3.Connection, current: str) -> None:
         """把旧版本数据库原地迁移到当前 schema 版本。只做向后兼容的加表/加列。"""
@@ -375,6 +422,9 @@ class Catalog:
             current = "2"
         if current == "2":
             self._migrate_v2_to_v3(conn)
+            current = "3"
+        if current == "3":
+            self._migrate_v3_to_v4(conn)
             return
         raise DatabaseError(
             f"数据库 schema 版本不兼容: 文件为 {current}, 程序需要 {SCHEMA_VERSION}; "
@@ -456,6 +506,51 @@ class Catalog:
             WHERE representation_id IS NULL
             """
         )
+        conn.execute(
+            "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+            ("3",),
+        )
+
+    def _migrate_v3_to_v4(self, conn: sqlite3.Connection) -> None:
+        """v3 -> v4：新增密集视觉序列表，扩展 representations.kind 支持 visual。
+
+        representations 的 kind 是 CHECK 约束，SQLite 不能直接修改，只能重建表；
+        initialize() 已在迁移前关闭外键检查，这里复制数据后改名。
+        """
+
+        conn.execute(
+            """
+            CREATE TABLE representations_v4 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                sequence_version TEXT NOT NULL REFERENCES embedding_versions(version),
+                kind TEXT NOT NULL
+                    CHECK (kind IN ('legacy', 'full_mean', 'temporal_stats', 'transformer', 'visual')),
+                dim INTEGER NOT NULL DEFAULT 0,
+                path_prefix TEXT,
+                params_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'building'
+                    CHECK (status IN ('building', 'ready', 'failed')),
+                note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (name, sequence_version)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO representations_v4 (
+                id, name, sequence_version, kind, dim, path_prefix, params_json,
+                status, note, created_at, updated_at
+            )
+            SELECT id, name, sequence_version, kind, dim, path_prefix, params_json,
+                   status, note, created_at, updated_at
+            FROM representations
+            """
+        )
+        conn.execute("DROP TABLE representations")
+        conn.execute("ALTER TABLE representations_v4 RENAME TO representations")
         conn.execute(
             "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
             (SCHEMA_VERSION,),
@@ -1287,6 +1382,203 @@ class Catalog:
         ).fetchall()
         return _as_dicts(rows)
 
+    # ------------------------------------------------------------------ 密集视觉序列（v0.4.3）
+    def register_visual_version(
+        self,
+        version: str,
+        *,
+        model_id: str,
+        revision: str,
+        preprocessing: str,
+        fps: float,
+        size: int,
+        dim: int | None = None,
+        params: Mapping[str, Any] | None = None,
+    ) -> None:
+        """登记一个冻结视觉编码器版本；同版本必须参数一致（防静默覆盖）。"""
+
+        display = str(version or "").strip()
+        if not display:
+            raise DatabaseError("视觉序列版本号不能为空")
+        model = str(model_id or "").strip()
+        rev = str(revision or "").strip()
+        if not model or not rev:
+            raise DatabaseError("视觉序列版本必须固定 model_id 与 revision")
+        if preprocessing not in ("stretch", "letterbox"):
+            raise DatabaseError(f"未知预处理方式: {preprocessing}")
+        fps_value = float(fps)
+        size_value = int(size)
+        if not (fps_value > 0):
+            raise DatabaseError(f"帧率非法: {fps}")
+        if size_value < 2:
+            raise DatabaseError(f"输入尺寸非法: {size}")
+        dim_value = None if dim is None else int(dim)
+        if dim_value is not None and dim_value < 1:
+            raise DatabaseError(f"向量维度非法: {dim}")
+        params_json = json.dumps(dict(params or {}), sort_keys=True, ensure_ascii=False)
+        row_values = (model, rev, preprocessing, fps_value, size_value, dim_value, params_json)
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM visual_versions WHERE version = ?", (display,)
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO visual_versions (
+                        version, model_id, revision, preprocessing, fps, size,
+                        dim, params_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (display, *row_values, now_utc_iso()),
+                )
+                return
+            actual = (
+                row["model_id"],
+                row["revision"],
+                row["preprocessing"],
+                float(row["fps"]),
+                int(row["size"]),
+                None if row["dim"] is None else int(row["dim"]),
+                row["params_json"],
+            )
+            if actual != row_values:
+                raise DatabaseError(
+                    f"视觉序列版本 {display} 已存在但参数不同；请使用新版本号而不是覆盖"
+                )
+
+    def get_visual_version(self, version: str) -> dict[str, Any] | None:
+        return _as_dict(
+            self.conn.execute(
+                "SELECT * FROM visual_versions WHERE version = ?", (str(version),)
+            ).fetchone()
+        )
+
+    def list_visual_versions(self) -> list[dict[str, Any]]:
+        return _as_dicts(
+            self.conn.execute(
+                "SELECT * FROM visual_versions ORDER BY created_at, version"
+            ).fetchall()
+        )
+
+    def upsert_visual_sequence(
+        self,
+        work_id: int,
+        *,
+        version: str,
+        status: str = "pending",
+        frames_path: str | None = None,
+        windows_path: str | None = None,
+        n_frames: int | None = None,
+        n_windows: int | None = None,
+        dim: int | None = None,
+        error: str | None = None,
+        decode_s: float = 0.0,
+        encode_s: float = 0.0,
+        model_load_s: float = 0.0,
+        total_s: float = 0.0,
+    ) -> None:
+        """登记/更新一部作品在某个视觉序列版本下的处理状态（断点续跑依据）。"""
+
+        if status not in VISUAL_SEQUENCE_STATUSES:
+            raise DatabaseError(f"未知视觉序列状态: {status}")
+        for name, value in (
+            ("n_frames", n_frames),
+            ("n_windows", n_windows),
+            ("decode_s", decode_s),
+            ("encode_s", encode_s),
+            ("model_load_s", model_load_s),
+            ("total_s", total_s),
+        ):
+            if value is not None and float(value) < 0:
+                raise DatabaseError(f"{name} 不能为负: {value}")
+        if dim is not None and int(dim) < 1:
+            raise DatabaseError(f"dim 非法: {dim}")
+        now = now_utc_iso()
+        with self.transaction() as conn:
+            if conn.execute("SELECT 1 FROM works WHERE id = ?", (int(work_id),)).fetchone() is None:
+                raise DatabaseError(f"作品不存在: {work_id}")
+            if conn.execute(
+                "SELECT 1 FROM visual_versions WHERE version = ?", (str(version),)
+            ).fetchone() is None:
+                raise DatabaseError(f"视觉序列版本未登记: {version}")
+            conn.execute(
+                """
+                INSERT INTO visual_sequences (
+                    work_id, version, status, frames_path, windows_path, n_frames,
+                    n_windows, dim, error, decode_s, encode_s, model_load_s, total_s,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(work_id, version) DO UPDATE SET
+                    status = excluded.status,
+                    frames_path = excluded.frames_path,
+                    windows_path = excluded.windows_path,
+                    n_frames = excluded.n_frames,
+                    n_windows = excluded.n_windows,
+                    dim = excluded.dim,
+                    error = excluded.error,
+                    decode_s = excluded.decode_s,
+                    encode_s = excluded.encode_s,
+                    model_load_s = excluded.model_load_s,
+                    total_s = excluded.total_s,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    int(work_id),
+                    str(version),
+                    status,
+                    frames_path,
+                    windows_path,
+                    None if n_frames is None else int(n_frames),
+                    None if n_windows is None else int(n_windows),
+                    None if dim is None else int(dim),
+                    error,
+                    float(decode_s),
+                    float(encode_s),
+                    float(model_load_s),
+                    float(total_s),
+                    now,
+                    now,
+                ),
+            )
+
+    def get_visual_sequence(self, work_id: int, *, version: str) -> dict[str, Any] | None:
+        return _as_dict(
+            self.conn.execute(
+                "SELECT * FROM visual_sequences WHERE work_id = ? AND version = ?",
+                (int(work_id), str(version)),
+            ).fetchone()
+        )
+
+    def list_visual_sequences(
+        self,
+        *,
+        version: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM visual_sequences WHERE 1 = 1"
+        params: list[Any] = []
+        if version is not None:
+            sql += " AND version = ?"
+            params.append(str(version))
+        if status is not None:
+            if status not in VISUAL_SEQUENCE_STATUSES:
+                raise DatabaseError(f"未知视觉序列状态: {status}")
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY work_id"
+        return _as_dicts(self.conn.execute(sql, params).fetchall())
+
+    def visual_status_summary(self, version: str) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT status, COUNT(*) AS n FROM visual_sequences WHERE version = ? "
+            "GROUP BY status",
+            (str(version),),
+        ).fetchall()
+        summary = {status: 0 for status in VISUAL_SEQUENCE_STATUSES}
+        for row in rows:
+            summary[str(row["status"])] = int(row["n"])
+        return summary
+
     # ------------------------------------------------------------------ 榜单
     def ensure_list(
         self,
@@ -1866,6 +2158,12 @@ class Catalog:
             sequence_rows = self.conn.execute(
                 "SELECT COUNT(*) AS n FROM sequence_states"
             ).fetchone()
+            visual_version_rows = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM visual_versions"
+            ).fetchone()
+            visual_sequence_rows = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM visual_sequences"
+            ).fetchone()
         except sqlite3.OperationalError:
             # 尚未 initialize
             return {"status": status, "tables_ready": False}
@@ -1884,4 +2182,6 @@ class Catalog:
             "timings": int(timing_rows["n"]) if timing_rows else 0,
             "representations": int(representation_rows["n"]) if representation_rows else 0,
             "sequences": int(sequence_rows["n"]) if sequence_rows else 0,
+            "visual_versions": int(visual_version_rows["n"]) if visual_version_rows else 0,
+            "visual_sequences": int(visual_sequence_rows["n"]) if visual_sequence_rows else 0,
         }

@@ -45,6 +45,23 @@ events:
 temporal:
   stages: 4                  # 按相对时间划分的阶段数
 
+# v0.4.3 密集视觉语义通道（冻结视觉编码器；帧级 fp16 + 窗口级向量）
+visual_dense:
+  fps: 8.0                   # 主帧率（先 8fps；30fps 只做小样本对照）
+  size: 224                  # 方形输入边长
+  preprocess: letterbox      # stretch（拉伸）| letterbox（保持比例+黑边）
+  batch_size: 32
+  device: auto
+  dtype: auto
+  cache_dir: .cache/hf
+  subset_fps: 30.0           # 小样本高帧率对照
+  subset_count: 16           # 30fps 对照作品数
+  encoders:                  # 固定 model + revision，禁止浮动版本
+    - model: openai/clip-vit-base-patch16
+      revision: 57c216476eefef5ab752ec549e440a49ae4ae5f3
+    - model: facebook/dinov2-small
+      revision: ed25f3a31f01632728cabb09d1542f84ab7b0056
+
 model:
   checkpoint: facebook/pe-av-small-16-frame
   revision: 9f888eea95c83622212bb742e91bf01d3b46fe96

@@ -1,4 +1,4 @@
-"""v0.4 核心层（配置版本、schema v3、表征/序列登记）的单元测试。"""
+"""v0.4/0.4.3 核心层（配置版本、schema v3/v4、表征/序列/视觉登记）的单元测试。"""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from nebula.db import (
     Catalog,
 )
 from nebula.errors import ConfigError, DatabaseError
+from nebula.representations import DENSE_VISUAL_CLIP_V1, representation_label
 
 
 # --------------------------------------------------------------------- config
@@ -273,3 +274,165 @@ def test_map_bound_to_representation(catalog: Catalog):
         catalog.create_map_run(
             "map_v003", embedding_version="v1", representation_id=9999, params={}, coords=[]
         )
+
+# ---------------------------------------------------------------- v0.4.3 visual
+VISUAL_MODEL = "openai/clip-vit-base-patch16"
+VISUAL_REVISION = "57c216476eefef5ab752ec549e440a49ae4ae5f3"
+VISUAL_VERSION = f"{VISUAL_MODEL}@{VISUAL_REVISION}__fps8_s224_letterbox"
+
+
+def _register_visual_version(catalog: Catalog, version: str = VISUAL_VERSION) -> None:
+    catalog.register_visual_version(
+        version,
+        model_id=VISUAL_MODEL,
+        revision=VISUAL_REVISION,
+        preprocessing="letterbox",
+        fps=8.0,
+        size=224,
+        dim=512,
+        params={"preprocess": "letterbox", "frame_source": "ffmpeg-stream"},
+    )
+
+
+def test_visual_versions_and_sequences_registry(catalog: Catalog):
+    _register_visual_version(catalog)
+    # 幂等
+    _register_visual_version(catalog)
+    row = catalog.get_visual_version(VISUAL_VERSION)
+    assert row is not None
+    assert row["model_id"] == VISUAL_MODEL
+    assert row["revision"] == VISUAL_REVISION
+    assert row["preprocessing"] == "letterbox"
+    assert row["fps"] == pytest.approx(8.0)
+    assert row["size"] == 224
+    assert row["dim"] == 512
+    versions = catalog.list_visual_versions()
+    assert [entry["version"] for entry in versions] == [VISUAL_VERSION]
+
+    # 同版本参数冲突必须报错（不同 revision/preprocess/fps 都应被拒绝）
+    with pytest.raises(DatabaseError):
+        catalog.register_visual_version(
+            VISUAL_VERSION,
+            model_id=VISUAL_MODEL,
+            revision="other-revision",
+            preprocessing="letterbox",
+            fps=8.0,
+            size=224,
+            dim=512,
+            params={"preprocess": "letterbox", "frame_source": "ffmpeg-stream"},
+        )
+    with pytest.raises(DatabaseError):
+        catalog.register_visual_version(
+            VISUAL_VERSION,
+            model_id=VISUAL_MODEL,
+            revision=VISUAL_REVISION,
+            preprocessing="stretch",
+            fps=8.0,
+            size=224,
+            dim=512,
+            params={"preprocess": "letterbox", "frame_source": "ffmpeg-stream"},
+        )
+
+    work_id, _ = catalog.upsert_local_work("visual.mp4")
+    catalog.upsert_visual_sequence(
+        work_id,
+        version=VISUAL_VERSION,
+        status="in_progress",
+        n_frames=100,
+        n_windows=3,
+    )
+    assert catalog.get_visual_sequence(work_id, version=VISUAL_VERSION)["status"] == "in_progress"
+    catalog.upsert_visual_sequence(
+        work_id,
+        version=VISUAL_VERSION,
+        status="completed",
+        frames_path="visual_dense/x/frames.npz",
+        windows_path="visual_dense/x/windows.npy",
+        n_frames=100,
+        n_windows=3,
+        dim=512,
+        decode_s=1.5,
+        encode_s=2.5,
+        model_load_s=0.5,
+        total_s=4.5,
+    )
+    saved = catalog.get_visual_sequence(work_id, version=VISUAL_VERSION)
+    assert saved["status"] == "completed"
+    assert saved["frames_path"] == "visual_dense/x/frames.npz"
+    assert saved["n_windows"] == 3
+    assert catalog.visual_status_summary(VISUAL_VERSION)["completed"] == 1
+    assert catalog.list_visual_sequences(version=VISUAL_VERSION, status="completed")[0]["work_id"] == work_id
+
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_sequence(work_id, version=VISUAL_VERSION, status="done")
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_sequence(work_id, version="missing-version", status="completed")
+    with pytest.raises(DatabaseError):
+        catalog.upsert_visual_sequence(
+            work_id, version=VISUAL_VERSION, status="completed", n_frames=-1
+        )
+
+
+def test_visual_representation_kind_and_map_binding(catalog: Catalog):
+    _register_version(catalog)
+    rep_id = catalog.register_representation(
+        DENSE_VISUAL_CLIP_V1,
+        sequence_version="v1",
+        kind="visual",
+        params={"aggregation": "l2-normalize-mean-l2-normalize"},
+    )
+    assert catalog.get_representation(rep_id)["kind"] == "visual"
+    assert representation_label(DENSE_VISUAL_CLIP_V1).startswith("Dense Visual")
+    work_id, _ = catalog.upsert_local_work("visual.mp4")
+    catalog.register_representation_vector(
+        rep_id, work_id, kind="joint", path="representations/visual/v1/000001/joint.npy", dim=512
+    )
+    catalog.create_map_run(
+        "map_v020",
+        embedding_version="v1",
+        representation_id=rep_id,
+        params={},
+        coords=[(work_id, 0.0, 0.0, 0.0, 0.0, 0.0)],
+    )
+    assert catalog.get_map("map_v020")["representation_id"] == rep_id
+    assert catalog.latest_map(representation_id=rep_id)["version"] == "map_v020"
+    with pytest.raises(DatabaseError):
+        catalog.register_representation(
+            "bad_kind", sequence_version="v1", kind="unknown", params={}
+        )
+
+
+def test_schema_v4_visual_tables_and_migration(tmp_path: Path):
+    db_path = tmp_path / "v4.sqlite"
+    first = Catalog(db_path)
+    first.initialize()
+    tables = {
+        row[0] for row in first.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert {"visual_versions", "visual_sequences"} <= tables
+    version = first.conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+    ).fetchone()["value"]
+    assert version == SCHEMA_VERSION == "4"
+    # 模拟 v3 库重新迁移：v3 -> v4 会重建 representations 并保持既有数据
+    first.conn.execute("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'")
+    first.close()
+    migrated = Catalog(db_path)
+    migrated.initialize()
+    try:
+        assert (
+            migrated.conn.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()["value"]
+            == SCHEMA_VERSION
+        )
+        tables = {
+            row[0]
+            for row in migrated.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert {"visual_versions", "visual_sequences"} <= tables
+        _register_visual_version(migrated)
+        assert migrated.get_visual_version(VISUAL_VERSION) is not None
+    finally:
+        migrated.close()
+

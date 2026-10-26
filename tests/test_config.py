@@ -39,6 +39,7 @@ def test_ensure_directories(config):
         config.paths.temp,
         config.paths.logs,
         config.paths.embeddings,
+        config.paths.visual_dense,
         config.paths.maps,
         config.model.cache_dir,
     ):
@@ -91,3 +92,40 @@ def test_paths_resolve_relative_to_config(tmp_path: Path, repo_root: Path):
     path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
     cfg = load_config(path)
     assert cfg.paths.data == (tmp_path / "rel-data").resolve()
+
+
+# ---------------------------------------------------------------- v0.4.3 visual
+def test_visual_dense_config(config):
+    visual = config.visual_dense
+    assert visual.fps == 8.0
+    assert visual.size == 224
+    assert visual.preprocess == "letterbox"
+    assert visual.batch_size == 32
+    assert visual.subset_fps == 30.0
+    assert visual.subset_count == 16
+    assert len(visual.encoders) == 2
+    models = {entry.model for entry in visual.encoders}
+    assert models == {
+        "openai/clip-vit-base-patch16",
+        "facebook/dinov2-small",
+    }
+    assert all(len(entry.revision) >= 7 for entry in visual.encoders)
+    assert config.paths.visual_dense == (config.paths.data / "visual_dense").resolve()
+
+
+def test_visual_dense_invalid_preprocess_rejected(tmp_path: Path, repo_root: Path):
+    data = yaml.safe_load((repo_root / "config.yaml").read_text(encoding="utf-8"))
+    data["visual_dense"]["preprocess"] = "crop"
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+    with pytest.raises(ConfigError, match="preprocess"):
+        load_config(path)
+
+
+def test_visual_dense_encoder_revision_required(tmp_path: Path, repo_root: Path):
+    data = yaml.safe_load((repo_root / "config.yaml").read_text(encoding="utf-8"))
+    data["visual_dense"]["encoders"][0]["revision"] = ""
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+    with pytest.raises(ConfigError, match="revision"):
+        load_config(path)
