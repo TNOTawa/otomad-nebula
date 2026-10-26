@@ -375,13 +375,17 @@ def test_visual_versions_and_sequences_registry(catalog: Catalog):
 
 def test_visual_representation_kind_and_map_binding(catalog: Catalog):
     _register_version(catalog)
+    _register_visual_version(catalog)
     rep_id = catalog.register_representation(
         DENSE_VISUAL_CLIP_V1,
-        sequence_version="v1",
+        sequence_version=VISUAL_VERSION,
         kind="visual",
+        source_kind="visual",
         params={"aggregation": "l2-normalize-mean-l2-normalize"},
     )
-    assert catalog.get_representation(rep_id)["kind"] == "visual"
+    saved = catalog.get_representation(rep_id)
+    assert saved["kind"] == "visual"
+    assert saved["source_kind"] == "visual"
     assert representation_label(DENSE_VISUAL_CLIP_V1).startswith("Dense Visual")
     work_id, _ = catalog.upsert_local_work("visual.mp4")
     catalog.register_representation_vector(
@@ -389,16 +393,35 @@ def test_visual_representation_kind_and_map_binding(catalog: Catalog):
     )
     catalog.create_map_run(
         "map_v020",
-        embedding_version="v1",
+        embedding_version=VISUAL_VERSION,
         representation_id=rep_id,
         params={},
         coords=[(work_id, 0.0, 0.0, 0.0, 0.0, 0.0)],
     )
-    assert catalog.get_map("map_v020")["representation_id"] == rep_id
+    run = catalog.get_map("map_v020")
+    assert run["representation_id"] == rep_id
+    assert run["source_kind"] == "visual"
+    assert run["embedding_version"] == VISUAL_VERSION
     assert catalog.latest_map(representation_id=rep_id)["version"] == "map_v020"
     with pytest.raises(DatabaseError):
         catalog.register_representation(
             "bad_kind", sequence_version="v1", kind="unknown", params={}
+        )
+    with pytest.raises(DatabaseError):
+        catalog.register_representation(
+            "missing_visual_version",
+            sequence_version="not-registered-visual",
+            kind="visual",
+            source_kind="visual",
+            params={},
+        )
+    with pytest.raises(DatabaseError):
+        catalog.create_map_run(
+            "map_v021",
+            embedding_version="not-registered-visual",
+            representation_id=rep_id,
+            params={},
+            coords=[],
         )
 
 

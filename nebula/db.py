@@ -30,6 +30,7 @@ STATUSES = ("pending", "downloading", "encoding", "completed", "failed")
 LEGACY_REPRESENTATION_NAME = "legacy_5clip_mean"
 
 REPRESENTATION_KINDS = ("legacy", "full_mean", "temporal_stats", "transformer", "visual")
+REPRESENTATION_SOURCE_KINDS = ("pe_av", "visual")
 REPRESENTATION_VECTOR_KINDS = ("joint", "audio", "video")
 REPRESENTATION_STATUSES = ("building", "ready", "failed")
 SEQUENCE_STATUSES = ("in_progress", "assembled", "failed")
@@ -213,9 +214,11 @@ CREATE INDEX IF NOT EXISTS ix_visual_sequences_version_status
 CREATE TABLE IF NOT EXISTS representations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
-    sequence_version TEXT NOT NULL REFERENCES embedding_versions(version),
+    sequence_version TEXT NOT NULL,
     kind TEXT NOT NULL
         CHECK (kind IN ('legacy', 'full_mean', 'temporal_stats', 'transformer', 'visual')),
+    source_kind TEXT NOT NULL DEFAULT 'pe_av'
+        CHECK (source_kind IN ('pe_av', 'visual')),
     dim INTEGER NOT NULL DEFAULT 0,
     path_prefix TEXT,
     params_json TEXT NOT NULL,
@@ -242,8 +245,10 @@ CREATE INDEX IF NOT EXISTS ix_representation_vectors_rep
 
 CREATE TABLE IF NOT EXISTS map_runs (
     version TEXT PRIMARY KEY,
-    embedding_version TEXT NOT NULL REFERENCES embedding_versions(version),
+    embedding_version TEXT NOT NULL,
     representation_id INTEGER REFERENCES representations(id),
+    source_kind TEXT NOT NULL DEFAULT 'pe_av'
+        CHECK (source_kind IN ('pe_av', 'visual')),
     params_json TEXT NOT NULL,
     filter_json TEXT,
     coords_path TEXT,
@@ -512,10 +517,16 @@ class Catalog:
         )
 
     def _migrate_v3_to_v4(self, conn: sqlite3.Connection) -> None:
-        """v3 -> v4：新增密集视觉序列表，扩展 representations.kind 支持 visual。
+        """v3 -> v4：密集视觉序列表 + 表征/地图来源扩展（pe_av | visual）。
 
-        representations 的 kind 是 CHECK 约束，SQLite 不能直接修改，只能重建表；
-        initialize() 已在迁移前关闭外键检查，这里复制数据后改名。
+        - visual_versions / visual_sequences 由 SCHEMA_SQL 在迁移前创建；
+        - representations：kind 扩展 visual，sequence_version 不再强制引用
+          embedding_versions（视觉表征引用 visual_versions），新增 source_kind；
+        - map_runs：embedding_version 不再强制引用 embedding_versions（视觉地图存
+          视觉版本字符串，按 source_kind 解释），新增 source_kind；
+          旧地图回填 source_kind='pe_av'。
+        SQLite 不能直接修改 CHECK / 外键，只能重建表；initialize() 已在 BEGIN 之前
+        关闭外键检查，这里复制数据后改名。
         """
 
         conn.execute(
@@ -523,9 +534,11 @@ class Catalog:
             CREATE TABLE representations_v4 (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                sequence_version TEXT NOT NULL REFERENCES embedding_versions(version),
+                sequence_version TEXT NOT NULL,
                 kind TEXT NOT NULL
                     CHECK (kind IN ('legacy', 'full_mean', 'temporal_stats', 'transformer', 'visual')),
+                source_kind TEXT NOT NULL DEFAULT 'pe_av'
+                    CHECK (source_kind IN ('pe_av', 'visual')),
                 dim INTEGER NOT NULL DEFAULT 0,
                 path_prefix TEXT,
                 params_json TEXT NOT NULL,
@@ -541,16 +554,53 @@ class Catalog:
         conn.execute(
             """
             INSERT INTO representations_v4 (
-                id, name, sequence_version, kind, dim, path_prefix, params_json,
-                status, note, created_at, updated_at
+                id, name, sequence_version, kind, source_kind, dim, path_prefix,
+                params_json, status, note, created_at, updated_at
             )
-            SELECT id, name, sequence_version, kind, dim, path_prefix, params_json,
-                   status, note, created_at, updated_at
+            SELECT id, name, sequence_version, kind, 'pe_av', dim, path_prefix,
+                   params_json, status, note, created_at, updated_at
             FROM representations
             """
         )
         conn.execute("DROP TABLE representations")
         conn.execute("ALTER TABLE representations_v4 RENAME TO representations")
+
+        conn.execute(
+            """
+            CREATE TABLE map_runs_v4 (
+                version TEXT PRIMARY KEY,
+                embedding_version TEXT NOT NULL,
+                representation_id INTEGER REFERENCES representations(id),
+                source_kind TEXT NOT NULL DEFAULT 'pe_av'
+                    CHECK (source_kind IN ('pe_av', 'visual')),
+                params_json TEXT NOT NULL,
+                filter_json TEXT,
+                coords_path TEXT,
+                model_2d_path TEXT,
+                model_3d_path TEXT,
+                n_works INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'building'
+                    CHECK (status IN ('building', 'ready', 'failed')),
+                note TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO map_runs_v4 (
+                version, embedding_version, representation_id, source_kind, params_json,
+                filter_json, coords_path, model_2d_path, model_3d_path, n_works,
+                status, note, created_at
+            )
+            SELECT version, embedding_version, representation_id, 'pe_av', params_json,
+                   filter_json, coords_path, model_2d_path, model_3d_path, n_works,
+                   status, note, created_at
+            FROM map_runs
+            """
+        )
+        conn.execute("DROP TABLE map_runs")
+        conn.execute("ALTER TABLE map_runs_v4 RENAME TO map_runs")
         conn.execute(
             "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
             (SCHEMA_VERSION,),
@@ -1139,23 +1189,34 @@ class Catalog:
         sequence_version: str,
         kind: str,
         params: Mapping[str, Any],
+        source_kind: str = "pe_av",
         path_prefix: str | None = None,
         note: str | None = None,
     ) -> int:
-        """登记表征版本并返回 id；同名 + 同序列已存在时要求 kind/参数一致。"""
+        """登记表征版本并返回 id；同名 + 同序列已存在时要求 kind/参数一致。
+
+        source_kind 表示序列版本来自哪一层：
+        - pe_av：PE-AV sequence version（embedding_versions 表）；
+        - visual：密集视觉序列版本（visual_versions 表）。
+        """
 
         display = str(name or "").strip()
         if not display:
             raise DatabaseError("表征名不能为空")
         if kind not in REPRESENTATION_KINDS:
             raise DatabaseError(f"未知表征类型: {kind}")
+        if source_kind not in REPRESENTATION_SOURCE_KINDS:
+            raise DatabaseError(f"未知表征来源: {source_kind}")
         payload = dict(params or {})
         params_json = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         now = now_utc_iso()
         with self.transaction() as conn:
+            version_table = (
+                "embedding_versions" if source_kind == "pe_av" else "visual_versions"
+            )
             if (
                 conn.execute(
-                    "SELECT 1 FROM embedding_versions WHERE version = ?", (sequence_version,)
+                    f"SELECT 1 FROM {version_table} WHERE version = ?", (sequence_version,)
                 ).fetchone()
                 is None
             ):
@@ -1165,7 +1226,11 @@ class Catalog:
                 (display, sequence_version),
             ).fetchone()
             if row is not None:
-                if row["kind"] != kind or row["params_json"] != params_json:
+                if (
+                    row["kind"] != kind
+                    or row["source_kind"] != source_kind
+                    or row["params_json"] != params_json
+                ):
                     raise DatabaseError(
                         f"表征 {display}@{sequence_version} 已存在但类型/参数不同；"
                         "请使用新表征名，或构建工具 --force 重建"
@@ -1174,11 +1239,21 @@ class Catalog:
             cursor = conn.execute(
                 """
                 INSERT INTO representations (
-                    name, sequence_version, kind, dim, path_prefix, params_json,
-                    status, note, created_at, updated_at
-                ) VALUES (?, ?, ?, 0, ?, ?, 'building', ?, ?, ?)
+                    name, sequence_version, kind, source_kind, dim, path_prefix,
+                    params_json, status, note, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 0, ?, ?, 'building', ?, ?, ?)
                 """,
-                (display, sequence_version, kind, path_prefix, params_json, note, now, now),
+                (
+                    display,
+                    sequence_version,
+                    kind,
+                    source_kind,
+                    path_prefix,
+                    params_json,
+                    note,
+                    now,
+                    now,
+                ),
             )
             return int(cursor.lastrowid)
 
@@ -1703,29 +1778,42 @@ class Catalog:
             ).fetchone()
             if exists is not None:
                 raise DatabaseError(f"星云版本已存在: {version}")
+            source_kind = "pe_av"
             if representation_id is not None:
                 rep = conn.execute(
                     "SELECT * FROM representations WHERE id = ?", (int(representation_id),)
                 ).fetchone()
                 if rep is None:
                     raise DatabaseError(f"表征不存在: {representation_id}")
-                if str(rep["sequence_version"]) != embedding_version:
+                source_kind = str(rep["source_kind"])
+                if str(rep["sequence_version"]) != str(embedding_version):
                     raise DatabaseError(
                         f"地图的向量版本与表征序列不一致: {embedding_version} != "
                         f"{rep['sequence_version']}"
                     )
+            version_table = (
+                "embedding_versions" if source_kind == "pe_av" else "visual_versions"
+            )
+            if (
+                conn.execute(
+                    f"SELECT 1 FROM {version_table} WHERE version = ?", (embedding_version,)
+                ).fetchone()
+                is None
+            ):
+                raise DatabaseError(f"序列版本未登记: {embedding_version}")
             conn.execute(
                 """
                 INSERT INTO map_runs (
-                    version, embedding_version, representation_id, params_json,
-                    filter_json, coords_path, model_2d_path, model_3d_path,
+                    version, embedding_version, representation_id, source_kind,
+                    params_json, filter_json, coords_path, model_2d_path, model_3d_path,
                     n_works, status, note, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
                 """,
                 (
                     version,
                     embedding_version,
                     None if representation_id is None else int(representation_id),
+                    source_kind,
                     json.dumps(dict(params), sort_keys=True, ensure_ascii=False),
                     (
                         json.dumps(dict(filter_spec), sort_keys=True, ensure_ascii=False)
