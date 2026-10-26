@@ -1107,11 +1107,11 @@ def test_app_all_spaces_including_visual(
 
 # --------------------------------------------------------------------------- v0.4.4 邻域连线
 def _seed_three_spaces(
-    catalog: Catalog, config: Config
+    catalog: Catalog, config: Config, *, count: int = 6
 ) -> tuple[list[int], int]:
     """Legacy / Full Mean / Dense Visual 三空间 + 各自地图（默认落 Full Mean）。"""
 
-    work_ids = _seed_app_data(catalog, config)  # map_v001 legacy
+    work_ids = _seed_app_data(catalog, config, count=count)  # map_v001 legacy
     _add_vectors(catalog, config, work_ids)
     full_rep = _add_derived_representation(
         catalog, config, work_ids, sequence_version="full-seq-v1", seed=201
@@ -1332,3 +1332,288 @@ def test_app_diagnostics_hint(
         for markdown in markdowns
     )
     assert len(fresh.get("plotly_chart")) == 1
+
+
+
+# --------------------------------------------------------------------------- v0.4.5 意外关系探索
+def _space_metrics(rank_a: int, rank_b: int, bar_p: float, cos: float) -> dict:
+    return {
+        "rank_a": rank_a,
+        "rank_b": rank_b,
+        "p_a": bar_p,
+        "p_b": bar_p,
+        "bar_p": bar_p,
+        "cos": cos,
+    }
+
+
+def _unexpected_payload(
+    work_ids: list[int],
+    mutual_pair: tuple[int, int],
+    non_mutual_pair: tuple[int, int],
+    third_pair: tuple[int, int],
+) -> dict:
+    a, b = mutual_pair
+    c, d = non_mutual_pair
+    e, f = third_pair
+
+    def mode_a_row(first: int, second: int, score: float) -> dict:
+        return {
+            "work_id_a": first,
+            "work_id_b": second,
+            "score": score,
+            "joint": _space_metrics(1, 2, 0.9, 0.88),
+            "audio": _space_metrics(3, 4, 0.7, 0.6),
+            "video": _space_metrics(5, 6, 0.6, 0.5),
+        }
+
+    def mode_c_row(first: int, second: int, score: float, mutual: bool) -> dict:
+        return {
+            "work_id_a": first,
+            "work_id_b": second,
+            "score": score,
+            "mutual_count": 3 if mutual else 2,
+            "mutual_spaces": ["peav", "clip", "dino"] if mutual else ["clip", "dino"],
+            "peav": {**_space_metrics(1, 1, 0.95, 0.9), "mutual": mutual},
+            "clip": {**_space_metrics(2, 3, 0.85, 0.75), "mutual": True},
+            "dino": {**_space_metrics(4, 2, 0.8, 0.7), "mutual": True},
+        }
+
+    return {
+        "meta": {
+            "tool": "unexpected_relations",
+            "version": "v0.4.5",
+            "definitions": {
+                "mode_a": "joint Top-k 有向边无序并集候选；U = bar_p_joint - ...",
+                "mode_b": "temporal Top-k 候选；U = ...",
+                "mode_c": "PE-AV/CLIP/DINO mutual Top-k 对比；分数全部用 p 差/组合",
+            },
+        },
+        "spaces": [
+            {"key": "full_mean_joint"},
+            {"key": "full_mean_audio"},
+            {"key": "full_mean_video"},
+            {"key": "temporal_joint"},
+            {"key": "clip_joint"},
+            {"key": "dino_joint"},
+        ],
+        "mode_a": {
+            "skipped": False,
+            "top": [
+                mode_a_row(a, b, 0.9),
+                mode_a_row(c, d, 0.8),
+                mode_a_row(e, f, 0.7),
+            ],
+        },
+        "mode_b": {
+            "skipped": False,
+            "top": [
+                {
+                    "work_id_a": a,
+                    "work_id_b": b,
+                    "score": 0.6,
+                    "temporal": _space_metrics(2, 1, 0.8, 0.7),
+                    "full_mean": _space_metrics(8, 9, 0.5, 0.4),
+                }
+            ],
+        },
+        "mode_c": {
+            "skipped": False,
+            "common": [mode_c_row(a, b, 0.95, True)],
+            "visual_vs_peav": [mode_c_row(c, d, 0.3, False)],
+            "counts": {"common_ge2": 1, "visual_vs_peav": 1},
+        },
+    }
+
+
+def _unexpected_pairs_for_app(
+    catalog: Catalog, config: Config, full_rep: int, work_ids: list[int]
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    """用默认空间（Full Mean）的 SimilarityIndex 选一对互邻、两对非互邻。"""
+
+    index = load_similarity_index(catalog, config, representation_id=full_rep)
+    try:
+        neighbor_sets = {
+            work_id: {
+                item.work_id
+                for item in index.neighbors(work_id, kind="work_joint", k=5)
+            }
+            for work_id in work_ids
+        }
+    finally:
+        index.close()
+
+    def is_mutual(first: int, second: int) -> bool:
+        return second in neighbor_sets[first] and first in neighbor_sets[second]
+
+    pairs = [
+        (first, second)
+        for position, first in enumerate(work_ids)
+        for second in work_ids[position + 1 :]
+    ]
+    mutual = [pair for pair in pairs if is_mutual(*pair)]
+    non_mutual = [pair for pair in pairs if not is_mutual(*pair)]
+    assert mutual, "合成数据应有互为近邻对"
+    assert len(non_mutual) >= 2, "合成数据应有两对非互邻"
+    return mutual[0], non_mutual[0], non_mutual[1]
+
+
+def _write_unexpected(config: Config, payload: dict) -> None:
+    config.paths.logs.mkdir(parents=True, exist_ok=True)
+    (config.paths.logs / "unexpected_relations.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _unexpected_table(app_test) -> object:
+    tables = [element.value for element in app_test.dataframe]
+    matches = [table for table in tables if "分数" in table.columns]
+    assert len(matches) == 1, [list(table.columns) for table in tables]
+    return matches[0]
+
+
+def test_app_unexpected_relations_panel_and_modes(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids, full_rep = _seed_three_spaces(catalog, config, count=8)
+    mutual, non_mutual_a, non_mutual_b = _unexpected_pairs_for_app(
+        catalog, config, full_rep, work_ids
+    )
+    _write_unexpected(
+        config, _unexpected_payload(work_ids, mutual, non_mutual_a, non_mutual_b)
+    )
+
+    app_test = _run_app(monkeypatch, repo_root, config)
+    assert not app_test.exception
+    # 默认地图/空间不变（Full Mean map_v002）
+    assert app_test.selectbox(key="map_version").value == "map_v002"
+    mode_select = app_test.selectbox(key="unexpected_mode")
+    assert mode_select.value == "a"
+    assert [str(option) for option in mode_select.options] == ["模式 A", "模式 B", "模式 C"]
+    pair_select = app_test.selectbox(key="unexpected_pair")
+    assert pair_select.value == f"{mutual[0]}:{mutual[1]}"
+    assert app_test.checkbox(key="unexpected_only_mutual").value is False
+
+    # 星图高亮这一对作品
+    spec = _chart_spec(app_test)
+    pair_trace = _chart_trace(spec, "意外关系配对")
+    assert pair_trace is not None
+    assert pair_trace["mode"] == "markers"
+    assert len(_decode_array(pair_trace["x"])) == 2
+    pair_line = _chart_trace(spec, "意外关系连线")
+    assert pair_line is not None and pair_line["mode"] == "lines"
+    assert len(_decode_array(pair_line["x"])) == 4  # 两段 (起点,None) 连线
+
+    # 排序表：模式 A 共 3 行，按分数降序，含各空间统计
+    table = _unexpected_table(app_test)
+    assert len(table) == 3
+    assert set(table.columns) >= {
+        "分数",
+        "A 作品",
+        "A 链接",
+        "B 作品",
+        "B 链接",
+        "类别",
+        "互为近邻",
+        "空间统计",
+    }
+    scores = [float(value) for value in table["分数"]]
+    assert scores == sorted(scores, reverse=True)
+    assert "rank=" in str(table.loc[0, "空间统计"]) or "rA=" in str(table.loc[0, "空间统计"])
+    assert "pct=" in str(table.loc[0, "空间统计"])
+    assert "cos=" in str(table.loc[0, "空间统计"])
+
+    # 两者 Top-k 邻域（当前 Full Mean 空间只有 joint 模态）
+    markdowns = [str(element.value) for element in app_test.markdown]
+    assert any("A 作品 · Top5 邻域" in markdown for markdown in markdowns)
+    assert any("B 作品 · Top5 邻域" in markdown for markdown in markdowns)
+    neighbor_tables = [
+        element.value
+        for element in app_test.dataframe
+        if "余弦相似度" in element.value.columns
+    ]
+    assert len(neighbor_tables) >= 3  # A + B + 既有选中作品面板
+
+    # CSV 下载按钮存在
+    assert len(app_test.get("download_button")) == 1
+
+    # 模式 B：仅 1 行，高亮切到 B 模式的对
+    app_test.selectbox(key="unexpected_mode").set_value("b").run()
+    assert not app_test.exception
+    assert app_test.selectbox(key="unexpected_pair").value == f"{mutual[0]}:{mutual[1]}"
+    assert len(_unexpected_table(app_test)) == 1
+    assert _chart_trace(_chart_spec(app_test), "意外关系配对") is not None
+
+    # 模式 C：2 行，类别列区分 common/visual_vs_peav
+    app_test.selectbox(key="unexpected_mode").set_value("c").run()
+    assert not app_test.exception
+    table_c = _unexpected_table(app_test)
+    assert len(table_c) == 2
+    categories = {str(value) for value in table_c["类别"]}
+    assert categories == {"common", "visual_vs_peav"}
+    assert [float(value) for value in table_c["分数"]] == sorted(
+        [float(value) for value in table_c["分数"]], reverse=True
+    )
+
+    # 只看互为近邻：模式 A 只剩 mutual 一行，高亮只保留该对
+    app_test.selectbox(key="unexpected_mode").set_value("a").run()
+    app_test.checkbox(key="unexpected_only_mutual").set_value(True).run()
+    assert not app_test.exception
+    table_only = _unexpected_table(app_test)
+    assert len(table_only) == 1
+    assert app_test.selectbox(key="unexpected_pair").value == f"{mutual[0]}:{mutual[1]}"
+    pair_trace = _chart_trace(_chart_spec(app_test), "意外关系配对")
+    assert pair_trace is not None
+    assert len(_decode_array(pair_trace["x"])) == 2
+
+    # 染色变化不影响意外关系分数/表
+    before = _unexpected_table(app_test).copy()
+    app_test.selectbox(key="color_field").set_value("duration_s").run()
+    assert not app_test.exception
+    after = _unexpected_table(app_test)
+    assert [float(value) for value in before["分数"]] == [
+        float(value) for value in after["分数"]
+    ]
+    assert before["A 作品"].tolist() == after["A 作品"].tolist()
+
+    # 3D 下配对高亮为 Scatter3d
+    app_test.radio(key="projection").set_value("3d").run()
+    assert not app_test.exception
+    pair_trace = _chart_trace(_chart_spec(app_test), "意外关系配对")
+    assert pair_trace is not None and pair_trace["type"] == "scatter3d"
+
+
+def test_app_unexpected_relations_jump_buttons(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids, full_rep = _seed_three_spaces(catalog, config, count=8)
+    mutual, non_mutual_a, non_mutual_b = _unexpected_pairs_for_app(
+        catalog, config, full_rep, work_ids
+    )
+    _write_unexpected(
+        config, _unexpected_payload(work_ids, mutual, non_mutual_a, non_mutual_b)
+    )
+    app_test = _run_app(monkeypatch, repo_root, config)
+    app_test.button(key="unexpected_jump_a").click().run()
+    assert not app_test.exception
+    assert int(app_test.selectbox(key="manual_work").value) == mutual[0]
+    app_test.button(key="unexpected_jump_b").click().run()
+    assert not app_test.exception
+    assert int(app_test.selectbox(key="manual_work").value) == mutual[1]
+
+
+def test_app_unexpected_relations_missing_file(
+    config: Config, catalog: Catalog, repo_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    work_ids = _seed_app_data(catalog, config)
+    _add_vectors(catalog, config, work_ids)
+    app_test = _run_app(monkeypatch, repo_root, config)
+    assert not app_test.exception
+    captions = [str(element.value) for element in app_test.caption]
+    assert any("未找到意外关系文件" in caption for caption in captions)
+    names = [trace.get("name") for trace in _chart_spec(app_test)["data"]]
+    assert "意外关系配对" not in names
+    # 默认行为不变：旧地图、3 张近邻表、1 张图
+    assert app_test.selectbox(key="map_version").value == "map_v001"
+    assert len(app_test.get("plotly_chart")) == 1
+    assert len(app_test.dataframe) == 3

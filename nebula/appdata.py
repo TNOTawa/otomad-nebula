@@ -1868,3 +1868,582 @@ def diagnostics_artifacts(config: Config) -> dict[str, Any]:
             html_dir.is_dir() or json_path.is_file() or csv_path.is_file()
         ),
     }
+
+
+
+# --------------------------------------------------------------------------- 意外关系探索（v0.4.5）
+UNEXPECTED_RELATIONS_FILE_NAME = "unexpected_relations.json"
+
+_UNEXPECTED_MODE_ALIASES: dict[str, str] = {
+    "a": "a",
+    "mode_a": "a",
+    "mode-a": "a",
+    "modea": "a",
+    "1": "a",
+    "b": "b",
+    "mode_b": "b",
+    "mode-b": "b",
+    "modeb": "b",
+    "2": "b",
+    "c": "c",
+    "mode_c": "c",
+    "mode-c": "c",
+    "modec": "c",
+    "3": "c",
+}
+
+_UNEXPECTED_SPACE_ALIASES: dict[str, str] = {
+    "joint": "joint",
+    "work_joint": "joint",
+    "pe_av_joint": "joint",
+    "full_mean_joint": "joint",
+    "audio": "audio",
+    "work_audio": "audio",
+    "full_mean_audio": "audio",
+    "video": "video",
+    "work_video": "video",
+    "full_mean_video": "video",
+    "temporal": "temporal",
+    "temporal_joint": "temporal",
+    "temporal_stats": "temporal",
+    "temporal_stats_v1": "temporal",
+    "full_mean": "full_mean",
+    "fullmean": "full_mean",
+    "full_mean_v1": "full_mean",
+    "clip": "clip",
+    "visual_clip": "clip",
+    "dense_visual_clip": "clip",
+    "dense_visual_clip_v1": "clip",
+    "dense_visual_clip_v2": "clip",
+    "clip_joint": "clip",
+    "peav": "peav",
+    "pe_av": "peav",
+    "peav_joint": "peav",
+    "dino": "dino",
+    "visual_dino": "dino",
+    "dense_visual_dino": "dino",
+    "dense_visual_dino_v1": "dino",
+    "dense_visual_dino_v2": "dino",
+    "dino_joint": "dino",
+}
+
+_UNEXPECTED_SPACE_ORDER: tuple[str, ...] = (
+    "joint",
+    "audio",
+    "video",
+    "temporal",
+    "full_mean",
+    "peav",
+    "clip",
+    "dino",
+)
+
+_UNEXPECTED_SPACE_LABELS: dict[str, str] = {
+    "joint": "联合",
+    "audio": "音频",
+    "video": "画面",
+    "temporal": "时间结构",
+    "full_mean": "全片平均",
+    "peav": "PE-AV",
+    "clip": "CLIP",
+    "dino": "DINOv2",
+}
+
+_UNEXPECTED_MODE_LABELS: dict[str, str] = {
+    "a": "模式 A",
+    "b": "模式 B",
+    "c": "模式 C",
+}
+
+
+def _unexpected_mode(value: Any) -> str | None:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    return _UNEXPECTED_MODE_ALIASES.get(raw)
+
+
+def _unexpected_space(value: Any) -> str | None:
+    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not raw:
+        return None
+    return _UNEXPECTED_SPACE_ALIASES.get(raw)
+
+
+def _float_or_none(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _unexpected_space_stats(stats: Mapping[str, Any]) -> dict[str, Any]:
+    rank = stats.get("rank")
+    if rank is None:
+        rank = stats.get("rank_min", stats.get("min_rank"))
+    percentile = stats.get("percentile")
+    if percentile is None:
+        percentile = stats.get("bar_p", stats.get("pct", stats.get("percentile_avg")))
+    return {
+        "rank": _int_or_none(rank),
+        "rank_a": _int_or_none(stats.get("rank_a")),
+        "rank_b": _int_or_none(stats.get("rank_b")),
+        "percentile": _float_or_none(percentile),
+        "bar_p": _float_or_none(stats.get("bar_p")),
+        "p_a": _float_or_none(stats.get("p_a")),
+        "p_b": _float_or_none(stats.get("p_b")),
+        "cosine": _float_or_none(
+            stats.get("cosine", stats.get("cos", stats.get("sim", stats.get("similarity"))))
+        ),
+        "mutual": (
+            None if stats.get("mutual") is None else bool(stats.get("mutual"))
+        ),
+    }
+
+
+def _unexpected_per_space(record: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """兼容 discovery 真实字段（per-space dict 直接放在 pair 上）与合成 per_space 容器。"""
+
+    raw = record.get("per_space") or record.get("space_stats")
+    result: dict[str, dict[str, Any]] = {}
+    candidate_sources: list[Mapping[str, Any]] = []
+    if isinstance(raw, Mapping):
+        candidate_sources.append(raw)
+    elif isinstance(record.get("spaces"), Mapping):
+        candidate_sources.append(record["spaces"])
+    candidate_sources.append(record)
+    for source in candidate_sources:
+        for name, stats in source.items():
+            space = _unexpected_space(name)
+            if space is None or not isinstance(stats, Mapping):
+                continue
+            if space not in result:
+                result[space] = _unexpected_space_stats(stats)
+    return result
+
+
+def _unexpected_score(record: Mapping[str, Any]) -> float:
+    for key in ("score", "relation_score", "novelty", "uplift", "value"):
+        number = _float_or_none(record.get(key))
+        if number is not None:
+            return number
+    return 0.0
+
+
+def _unexpected_category(record: Mapping[str, Any]) -> str:
+    for key in ("category", "label", "tag", "kind", "reason", "type"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _unexpected_record_pair(
+    record: Mapping[str, Any],
+    default_mode: str | None,
+    default_category: str = "",
+) -> dict[str, Any] | None:
+    pair = _consensus_pair(record)
+    if pair is None:
+        return None
+    mode = _unexpected_mode(record.get("mode", record.get("mode_id"))) or default_mode
+    a_work_id, b_work_id = sorted(pair)
+    if a_work_id == b_work_id:
+        return None
+    title_a = record.get("title_a", record.get("a_title"))
+    title_b = record.get("title_b", record.get("b_title"))
+    return {
+        "mode": mode or "",
+        "a_work_id": a_work_id,
+        "b_work_id": b_work_id,
+        "score": _unexpected_score(record),
+        "category": _unexpected_category(record) or default_category,
+        "title_a": None if title_a is None else str(title_a),
+        "title_b": None if title_b is None else str(title_b),
+        "per_space": _unexpected_per_space(record),
+    }
+
+
+_UNEXPECTED_PAIR_CONTAINER_KEYS = (
+    "pairs",
+    "relations",
+    "edges",
+    "items",
+    "data",
+    "top",
+)
+_UNEXPECTED_MODE_C_CATEGORIES = (
+    "common",
+    "visual_vs_peav",
+    "peav_only",
+    "clip_only",
+    "dino_only",
+)
+
+
+def _unexpected_container_records(
+    raw: Any,
+) -> list[tuple[Mapping[str, Any], str | None, str]]:
+    """从 JSON 的多种容器布局里取出 (pair 记录, 默认模式, 默认类别) 列表。"""
+
+    records: list[tuple[Mapping[str, Any], str | None, str]] = []
+
+    def add_many(
+        value: Any, default_mode: str | None, default_category: str = ""
+    ) -> None:
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, Mapping):
+                    records.append((item, default_mode, default_category))
+        elif isinstance(value, Mapping):
+            found = False
+            for key in _UNEXPECTED_PAIR_CONTAINER_KEYS:
+                child = value.get(key)
+                if isinstance(child, list):
+                    add_many(child, default_mode, default_category)
+                    found = True
+            for key in _UNEXPECTED_MODE_C_CATEGORIES:
+                child = value.get(key)
+                if isinstance(child, list):
+                    add_many(child, default_mode, key)
+                    found = True
+            if not found and (
+                value.get("a_work_id") is not None
+                or value.get("work_id_a") is not None
+            ):
+                records.append((value, default_mode, default_category))
+
+    if isinstance(raw, list):
+        add_many(raw, None)
+        return records
+    if not isinstance(raw, Mapping):
+        return records
+
+    for key in ("pairs", "relations", "edges", "items"):
+        add_many(raw.get(key), None)
+
+    modes_value = raw.get("modes")
+    if isinstance(modes_value, Mapping):
+        for key, value in modes_value.items():
+            default_mode = _unexpected_mode(key)
+            if isinstance(value, str):
+                continue
+            add_many(value, default_mode)
+    elif isinstance(modes_value, list):
+        for entry in modes_value:
+            if not isinstance(entry, Mapping):
+                continue
+            default_mode = _unexpected_mode(entry.get("mode", entry.get("id")))
+            add_many(entry, default_mode)
+
+    for key, value in raw.items():
+        normalized = str(key).strip().lower()
+        if not (normalized.startswith("mode_") or normalized in ("a", "b", "c")):
+            continue
+        default_mode = _unexpected_mode(normalized)
+        if default_mode is None:
+            continue
+        add_many(value, default_mode)
+    return records
+
+
+def _unexpected_spaces(
+    raw: Mapping[str, Any], pairs: Iterable[Mapping[str, Any]]
+) -> tuple[str, ...]:
+    spaces: list[str] = []
+    raw_spaces = raw.get("spaces")
+    candidates: list[str] = []
+    if isinstance(raw_spaces, Mapping):
+        candidates = [str(key) for key in raw_spaces]
+    elif isinstance(raw_spaces, (list, tuple)):
+        for item in raw_spaces:
+            if isinstance(item, Mapping):
+                key = item.get("key") or item.get("name") or item.get("label")
+                if key:
+                    candidates.append(str(key))
+            else:
+                candidates.append(str(item))
+    for name in candidates:
+        space = _unexpected_space(name)
+        if space is not None and space not in spaces:
+            spaces.append(space)
+    for pair in pairs:
+        for space in pair["per_space"]:
+            if space not in spaces:
+                spaces.append(space)
+    ordered = [space for space in _UNEXPECTED_SPACE_ORDER if space in spaces]
+    ordered.extend(space for space in spaces if space not in _UNEXPECTED_SPACE_ORDER)
+    return tuple(ordered)
+
+
+def load_unexpected_relations(config: Config) -> dict[str, Any] | None:
+    """读取 logs/unexpected_relations.json（t5 discovery 产物）。
+
+    文件不存在/不可解析时返回 None（界面提示，不影响默认星云）。
+    兼容 modes/mode_a/mode_b/mode_c、pairs/relations 列表、work_pair/work_a 等
+    多种字段命名；返回 {path,meta,spaces,pairs,by_mode,n_pairs}，pairs 带
+    mode/a_work_id/b_work_id/score/category/per_space{rank,percentile,cosine}。
+    """
+
+    path = Path(config.paths.logs) / UNEXPECTED_RELATIONS_FILE_NAME
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("读取意外关系文件失败 %s: %s", path, exc)
+        return None
+    records = _unexpected_container_records(raw)
+    pairs: list[dict[str, Any]] = []
+    for record, default_mode, default_category in records:
+        pair = _unexpected_record_pair(record, default_mode, default_category)
+        if pair is not None:
+            pairs.append(pair)
+    counts: dict[str, int] = {}
+    for pair in pairs:
+        mode = str(pair["mode"])
+        if mode:
+            counts[mode] = counts.get(mode, 0) + 1
+    meta = raw.get("meta") if isinstance(raw, Mapping) else None
+    if not isinstance(meta, dict):
+        meta = {}
+    spaces = _unexpected_spaces(raw, pairs) if isinstance(raw, Mapping) else ()
+    return {
+        "path": str(path),
+        "meta": meta,
+        "spaces": spaces,
+        "pairs": pairs,
+        "by_mode": counts,
+        "n_pairs": len(pairs),
+    }
+
+
+def unexpected_modes(relations: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """可用模式列表（id/label/description/count），label 优先取 meta 配置。"""
+
+    meta = relations.get("meta") or {}
+    labels_raw = meta.get("mode_labels") or meta.get("mode_label") or {}
+    labels: dict[str, str] = {}
+    if isinstance(labels_raw, Mapping):
+        for key, value in labels_raw.items():
+            mode = _unexpected_mode(key) or str(key)
+            if value:
+                labels[mode] = str(value)
+    descriptions: dict[str, str] = {}
+    definitions = meta.get("definitions")
+    if isinstance(definitions, Mapping):
+        for mode in ("a", "b", "c"):
+            value = definitions.get(f"mode_{mode}", definitions.get(mode))
+            if value:
+                descriptions[mode] = str(value)
+    desc_raw = meta.get("mode_descriptions") or meta.get("mode_description") or {}
+    if isinstance(desc_raw, Mapping):
+        for key, value in desc_raw.items():
+            mode = _unexpected_mode(key) or str(key)
+            if value:
+                descriptions[mode] = str(value)
+    meta_modes = meta.get("modes")
+    if isinstance(meta_modes, Mapping):
+        for key, value in meta_modes.items():
+            mode = _unexpected_mode(key) or str(key)
+            if isinstance(value, Mapping):
+                if value.get("label"):
+                    labels.setdefault(mode, str(value["label"]))
+                if value.get("description"):
+                    descriptions.setdefault(mode, str(value["description"]))
+    elif isinstance(meta_modes, list):
+        for entry in meta_modes:
+            if not isinstance(entry, Mapping):
+                continue
+            mode = _unexpected_mode(entry.get("mode", entry.get("id")))
+            if mode is None:
+                continue
+            if entry.get("label"):
+                labels.setdefault(mode, str(entry["label"]))
+            if entry.get("description"):
+                descriptions.setdefault(mode, str(entry["description"]))
+
+    by_mode = relations.get("by_mode") or {}
+    ordered = [mode for mode in ("a", "b", "c") if mode in by_mode or mode in labels]
+    ordered.extend(sorted(mode for mode in by_mode if mode not in ordered))
+    result: list[dict[str, Any]] = []
+    for mode in ordered:
+        result.append(
+            {
+                "mode": mode,
+                "label": labels.get(mode)
+                or _UNEXPECTED_MODE_LABELS.get(mode, f"模式 {mode.upper()}"),
+                "description": descriptions.get(mode) or "",
+                "count": int(by_mode.get(mode, 0)),
+            }
+        )
+    return result
+
+
+def _unexpected_mutual(
+    similarity_index: "SimilarityIndex | None",
+    a_work_id: int,
+    b_work_id: int,
+    *,
+    k: int = 5,
+) -> tuple[bool, tuple[str, ...]]:
+    if similarity_index is None:
+        return False, ()
+    kinds: list[str] = []
+    for kind in similarity_index.available_kinds:
+        if not (
+            similarity_index.has_vector(a_work_id, kind)
+            and similarity_index.has_vector(b_work_id, kind)
+        ):
+            continue
+        forward = {
+            int(item.work_id)
+            for item in similarity_index.neighbors(a_work_id, kind=kind, k=int(k))
+        }
+        backward = {
+            int(item.work_id)
+            for item in similarity_index.neighbors(b_work_id, kind=kind, k=int(k))
+        }
+        if b_work_id in forward and a_work_id in backward:
+            kinds.append(kind)
+    return bool(kinds), tuple(kinds)
+
+
+def unexpected_space_summary(
+    per_space: Mapping[str, Mapping[str, Any]], spaces=None
+) -> str:
+    """把每空间 rank/percentile/cosine 压成表格/CSV 用的中文摘要。"""
+
+    order = tuple(spaces) if spaces else _UNEXPECTED_SPACE_ORDER
+    parts: list[str] = []
+    for space in order:
+        stats = per_space.get(space)
+        if not isinstance(stats, Mapping):
+            continue
+        bits: list[str] = []
+        rank = _int_or_none(stats.get("rank"))
+        rank_a = _int_or_none(stats.get("rank_a"))
+        rank_b = _int_or_none(stats.get("rank_b"))
+        percentile = _float_or_none(stats.get("percentile", stats.get("bar_p")))
+        cosine = _float_or_none(stats.get("cosine"))
+        if rank is not None:
+            bits.append(f"rank={rank}")
+        elif rank_a is not None or rank_b is not None:
+            bits.append(f"rA={rank_a}/rB={rank_b}")
+        if percentile is not None:
+            bits.append(f"pct={percentile:.1f}")
+        if cosine is not None:
+            bits.append(f"cos={cosine:.3f}")
+        if bits:
+            label = _UNEXPECTED_SPACE_LABELS.get(space, space)
+            parts.append(f"{label}:" + "/".join(bits))
+    return "；".join(parts)
+
+
+def unexpected_pair_rows(
+    relations: Mapping[str, Any],
+    mode: str,
+    *,
+    frame: pd.DataFrame | None = None,
+    similarity_index: "SimilarityIndex | None" = None,
+    only_mutual: bool = False,
+    k: int = 5,
+) -> list[dict[str, Any]]:
+    """当前模式的作品对展示行（按分数降序）；可只看互为近邻。"""
+
+    normalized_mode = _unexpected_mode(mode) or str(mode)
+    records = _record_lookup(frame) if frame is not None else {}
+    rows: list[dict[str, Any]] = []
+    for pair in relations.get("pairs", ()):  # type: ignore[union-attr]
+        if str(pair["mode"]) != normalized_mode:
+            continue
+        a_work_id = int(pair["a_work_id"])
+        b_work_id = int(pair["b_work_id"])
+        mutual, mutual_kinds = _unexpected_mutual(
+            similarity_index, a_work_id, b_work_id, k=k
+        )
+        if only_mutual and not mutual:
+            continue
+        record_a = records.get(a_work_id)
+        record_b = records.get(b_work_id)
+        title_a = _record_title(record_a, a_work_id)
+        title_b = _record_title(record_b, b_work_id)
+        if record_a is None and pair.get("title_a"):
+            title_a = str(pair["title_a"])
+        if record_b is None and pair.get("title_b"):
+            title_b = str(pair["title_b"])
+        rows.append(
+            {
+                "mode": normalized_mode,
+                "a_work_id": a_work_id,
+                "b_work_id": b_work_id,
+                "a_title": title_a,
+                "b_title": title_b,
+                "a_url": external_url(record_a) if record_a is not None else None,
+                "b_url": external_url(record_b) if record_b is not None else None,
+                "score": float(pair["score"]),
+                "category": str(pair["category"]),
+                "per_space": pair["per_space"],
+                "space_summary": unexpected_space_summary(
+                    pair["per_space"], relations.get("spaces")
+                ),
+                "mutual": bool(mutual),
+                "mutual_kinds": mutual_kinds,
+                "in_map": record_a is not None and record_b is not None,
+            }
+        )
+    rows.sort(key=lambda row: (-row["score"], row["a_work_id"], row["b_work_id"]))
+    return rows
+
+
+def unexpected_rows_csv(rows: Iterable[Mapping[str, Any]]) -> str:
+    """当前意外关系表导出 CSV（低成本文本，不建持久库）。"""
+
+    import csv
+    import io
+
+    buffer = io.StringIO()
+    fieldnames = [
+        "模式",
+        "分数",
+        "A work_id",
+        "A 标题",
+        "B work_id",
+        "B 标题",
+        "类别",
+        "互为近邻",
+        "空间统计",
+        "A 链接",
+        "B 链接",
+    ]
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(
+            {
+                "模式": row.get("mode", ""),
+                "分数": row.get("score", ""),
+                "A work_id": row.get("a_work_id", ""),
+                "A 标题": row.get("a_title", ""),
+                "B work_id": row.get("b_work_id", ""),
+                "B 标题": row.get("b_title", ""),
+                "类别": row.get("category", ""),
+                "互为近邻": "是" if row.get("mutual") else "",
+                "空间统计": row.get("space_summary", ""),
+                "A 链接": row.get("a_url") or "",
+                "B 链接": row.get("b_url") or "",
+            }
+        )
+    return buffer.getvalue()

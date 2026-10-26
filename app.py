@@ -48,11 +48,15 @@ from nebula.appdata import (
     load_nebula_frame,
     load_neighbor_consensus,
     load_representation_options,
+    load_unexpected_relations,
     map_matches_representation,
     mutual_neighbor_edges,
     neighbor_rows,
     pick_mutual_edge_kind,
     search_frame,
+    unexpected_modes,
+    unexpected_pair_rows,
+    unexpected_rows_csv,
 )
 from nebula.config import Config, load_config
 from nebula.db import Catalog
@@ -162,6 +166,12 @@ def _load_timeline_cached(
 def _load_consensus_cached(config_path: str) -> dict[str, Any] | None:
     cfg = load_config(config_path)
     return load_neighbor_consensus(cfg)
+
+
+@st.cache_data(show_spinner=False)
+def _load_unexpected_relations_cached(config_path: str) -> dict[str, Any] | None:
+    cfg = load_config(config_path)
+    return load_unexpected_relations(cfg)
 
 
 @st.cache_resource(show_spinner="正在加载高维近邻索引…")
@@ -309,6 +319,7 @@ def _build_figure(
     mutual_edges: Sequence[Mapping[str, Any]] = (),
     mutual_trace_name: str = _MUTUAL_TRACE_NAME,
     mutual_line_color: str = _MUTUAL_EDGE_COLOR,
+    pair_work_ids: Sequence[int] = (),
 ) -> go.Figure:
     """按投影方式构造 Plotly 散点图。
 
@@ -504,6 +515,72 @@ def _build_figure(
                 traces.append(go.Scatter3d(x=line_x, y=line_y, z=line_z, **line_common))
             else:
                 traces.append(go.Scatter(x=line_x, y=line_y, **line_common))
+
+    # ---------------------------------------------------------------- 意外关系配对高亮
+    if pair_work_ids:
+        pair_positions = [
+            positions[int(work_id)]
+            for work_id in pair_work_ids
+            if int(work_id) in positions
+        ]
+        if pair_positions:
+            pair_labels = [labels[index] for index in pair_positions]
+            pair_marker: dict[str, Any] = {
+                "size": point_size * 2.2,
+                "color": "#00d1b2",
+                "symbol": "diamond",
+                "line": {"width": 1, "color": "#083344"},
+            }
+            if is_3d:
+                traces.append(
+                    go.Scatter3d(  # type: ignore[arg-type]
+                        x=xs[pair_positions],
+                        y=ys[pair_positions],
+                        z=zs[pair_positions],  # type: ignore[index]
+                        mode="markers",
+                        marker=pair_marker,
+                        hovertext=pair_labels,
+                        hovertemplate="%{hovertext}<extra></extra>",
+                        name="意外关系配对",
+                    )
+                )
+            else:
+                traces.append(
+                    go.Scatter(
+                        x=xs[pair_positions],
+                        y=ys[pair_positions],
+                        mode="markers",
+                        marker=pair_marker,
+                        hovertext=pair_labels,
+                        hovertemplate="%{hovertext}<extra></extra>",
+                        name="意外关系配对",
+                    )
+                )
+            if len(pair_positions) >= 2:
+                pair_line_x: list[float | None] = []
+                pair_line_y: list[float | None] = []
+                pair_line_z: list[float | None] = []
+                for position in pair_positions[:2]:
+                    pair_line_x.extend([xs[position], None])
+                    pair_line_y.extend([ys[position], None])
+                    if is_3d:
+                        pair_line_z.extend([zs[position], None])  # type: ignore[index]
+                pair_line_common: dict[str, Any] = {
+                    "mode": "lines",
+                    "line": {"color": "rgba(0, 209, 178, 0.75)", "width": 1.6, "dash": "dash"},
+                    "hoverinfo": "skip",
+                    "name": "意外关系连线",
+                }
+                if is_3d:
+                    traces.append(
+                        go.Scatter3d(
+                            x=pair_line_x, y=pair_line_y, z=pair_line_z, **pair_line_common
+                        )
+                    )
+                else:
+                    traces.append(
+                        go.Scatter(x=pair_line_x, y=pair_line_y, **pair_line_common)
+                    )
 
     figure = go.Figure(data=traces)
     figure.update_layout(
@@ -1162,6 +1239,242 @@ def _render_sidebar_diagnostics(cfg: Config) -> None:
             if artifacts["csv"]:
                 st.code(str(artifacts["csv"]), language="text")
 
+
+# --------------------------------------------------------------------------- 意外关系探索
+_UNEXPECTED_JUMP_A_KEY = "unexpected_jump_a"
+_UNEXPECTED_JUMP_B_KEY = "unexpected_jump_b"
+
+
+def _unexpected_pair_label(row: Mapping[str, Any]) -> str:
+    a_title = str(row.get("a_title") or row.get("a_work_id"))
+    b_title = str(row.get("b_title") or row.get("b_work_id"))
+    if len(a_title) > 24:
+        a_title = a_title[:24] + "…"
+    if len(b_title) > 24:
+        b_title = b_title[:24] + "…"
+    return f"{a_title} ↔ {b_title}｜分数 {float(row.get('score') or 0.0):.4f}"
+
+
+def _render_sidebar_unexpected_relations(
+    relations: Mapping[str, Any] | None,
+    frame: pd.DataFrame,
+    index: SimilarityIndex | None,
+) -> dict[str, Any]:
+    """侧栏“意外关系探索”：模式/作品对选择 + 只看互为近邻。
+
+    返回 {active,mode,mode_label,rows,selected,only_mutual}；
+    文件缺失时显示中文提示且不改变默认星图。
+    """
+
+    state: dict[str, Any] = {
+        "active": False,
+        "mode": "",
+        "mode_label": "",
+        "rows": [],
+        "selected": None,
+        "only_mutual": False,
+    }
+    with st.sidebar, st.expander("意外关系探索（v0.4.5）", expanded=False):
+        if relations is None:
+            st.caption(
+                "未找到意外关系文件（logs/unexpected_relations.json）；"
+                "可先运行 t5 的 discovery 工具生成，默认星云不受影响。"
+            )
+            return state
+        modes = unexpected_modes(relations)
+        if not modes:
+            st.caption("意外关系文件里没有可用的模式/作品对。")
+            return state
+        labels = {str(item["mode"]): str(item["label"]) for item in modes}
+        mode_options = [str(item["mode"]) for item in modes]
+        current_mode = st.session_state.get("unexpected_mode")
+        if current_mode not in mode_options:
+            st.session_state.pop("unexpected_mode", None)
+        mode = st.selectbox(
+            "模式",
+            options=mode_options,
+            index=0,
+            format_func=lambda value: labels.get(value, value),
+            key="unexpected_mode",
+        )
+        mode_info = next(
+            (item for item in modes if str(item["mode"]) == str(mode)), modes[0]
+        )
+        if mode_info.get("description"):
+            st.caption(str(mode_info["description"]))
+        only_mutual = st.checkbox(
+            "只看互为近邻",
+            value=False,
+            key="unexpected_only_mutual",
+            help="在当前表征空间的高维 Top-k 近邻里，两两互为近邻才保留",
+        )
+        rows = unexpected_pair_rows(
+            relations,
+            str(mode),
+            frame=frame,
+            similarity_index=index,
+            only_mutual=bool(only_mutual),
+            k=_NEIGHBOR_K,
+        )
+        state.update(
+            {
+                "active": True,
+                "mode": str(mode),
+                "mode_label": str(mode_info["label"]),
+                "rows": rows,
+                "only_mutual": bool(only_mutual),
+            }
+        )
+        if not rows:
+            st.caption("当前模式/筛选下没有匹配的作品对。")
+            return state
+        pair_keys = [f"{row['a_work_id']}:{row['b_work_id']}" for row in rows]
+        if st.session_state.get("unexpected_pair") not in pair_keys:
+            st.session_state.pop("unexpected_pair", None)
+        selected_key = st.selectbox(
+            "选择作品对",
+            options=pair_keys,
+            index=0,
+            format_func=lambda key: next(
+                (
+                    _unexpected_pair_label(row)
+                    for row in rows
+                    if f"{row['a_work_id']}:{row['b_work_id']}" == key
+                ),
+                key,
+            ),
+            key="unexpected_pair",
+        )
+        selected = next(
+            (
+                row
+                for row in rows
+                if f"{row['a_work_id']}:{row['b_work_id']}" == selected_key
+            ),
+            rows[0],
+        )
+        state["selected"] = selected
+        st.caption(
+            f"共 {len(rows)} 对（记录 {relations.get('n_pairs', 0)} 对）；"
+            "按分数降序，染色只影响星图颜色。"
+        )
+    return state
+
+
+def _render_unexpected_panel(
+    state: Mapping[str, Any],
+    frame: pd.DataFrame,
+    index: SimilarityIndex | None,
+) -> None:
+    """主区“意外关系探索”表格 + CSV + 两者 Top-k 邻域。"""
+
+    if not state.get("active"):
+        return
+    rows = list(state.get("rows") or [])
+    with st.expander(
+        f"意外关系探索 · {state.get('mode_label') or state.get('mode')}"
+        f"（{len(rows)} 对）",
+        expanded=bool(rows),
+    ):
+        if not rows:
+            st.caption("当前模式/筛选下没有作品对。")
+            return
+        table = pd.DataFrame(
+            [
+                {
+                    "分数": f"{float(row['score']):.4f}",
+                    "A 作品": row["a_title"],
+                    "A 链接": row["a_url"],
+                    "B 作品": row["b_title"],
+                    "B 链接": row["b_url"],
+                    "类别": row["category"],
+                    "互为近邻": "是" if row["mutual"] else "",
+                    "空间统计": row["space_summary"],
+                    "在图中": "是" if row["in_map"] else "否",
+                }
+                for row in rows
+            ]
+        )
+        st.dataframe(
+            table,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "A 链接": st.column_config.LinkColumn("A 链接"),
+                "B 链接": st.column_config.LinkColumn("B 链接"),
+            },
+        )
+        csv_text = unexpected_rows_csv(rows)
+        st.download_button(
+            "下载当前表 CSV",
+            data=csv_text.encode("utf-8"),
+            file_name=f"unexpected_relations_mode_{state.get('mode', 'a')}.csv",
+            mime="text/csv",
+            key="unexpected_csv",
+        )
+        selected = state.get("selected")
+        if not isinstance(selected, Mapping):
+            return
+        a_work_id = int(selected["a_work_id"])
+        b_work_id = int(selected["b_work_id"])
+        st.markdown(
+            f"**当前作品对**：{_safe(selected['a_title'])} ↔ "
+            f"{_safe(selected['b_title'])}（分数 {float(selected['score']):.4f}，"
+            f"类别 {_safe(selected['category'] or '—')}）"
+        )
+        st.caption(str(selected.get("space_summary") or ""))
+        jump_a, jump_b = st.columns(2)
+        with jump_a:
+            if st.button(
+                f"跳转到 A：{str(selected['a_title'])[:24]}",
+                key=_UNEXPECTED_JUMP_A_KEY,
+            ):
+                st.session_state["pending_work_id"] = a_work_id
+                st.rerun()
+        with jump_b:
+            if st.button(
+                f"跳转到 B：{str(selected['b_title'])[:24]}",
+                key=_UNEXPECTED_JUMP_B_KEY,
+            ):
+                st.session_state["pending_work_id"] = b_work_id
+                st.rerun()
+        if index is None:
+            st.caption("高维近邻不可用，无法展示两者的 Top-k 邻域。")
+            return
+        for label, work_id in (("A", a_work_id), ("B", b_work_id)):
+            st.markdown(f"#### {label} 作品 · Top{_NEIGHBOR_K} 邻域")
+            for kind in KINDS:
+                if not index.has_vector(work_id, kind):
+                    st.caption(f"该作品无{KIND_LABELS[kind]}模态向量")
+                    continue
+                try:
+                    neighbor_list = neighbor_rows(
+                        frame, index, work_id, kind, _NEIGHBOR_K
+                    )
+                except NebulaError as exc:
+                    st.caption(f"无该模态向量：{exc}")
+                    continue
+                if not neighbor_list:
+                    st.caption("可比较作品不足，暂无近邻")
+                    continue
+                st.markdown(f"**{KIND_LABELS[kind]} Top{_NEIGHBOR_K}**")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "排名": row["rank"],
+                                "作品": row["title"],
+                                "余弦相似度": f"{float(row['similarity']):.4f}",
+                                "全库分位": f"{float(row['pair_percentile']):.1f}%",
+                                "双向": "是" if row["is_mutual"] else "",
+                            }
+                            for row in neighbor_list
+                        ]
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+
 # --------------------------------------------------------------------------- 侧栏
 def _render_sidebar_map_settings(
     spaces: list[dict[str, Any]],
@@ -1458,6 +1771,7 @@ def main() -> None:
             f"模态 {', '.join(KIND_LABELS[kind] for kind in index.available_kinds)}"
         )
     consensus = _load_consensus_cached(config_path)
+    unexpected_relations = _load_unexpected_relations_cached(config_path)
 
     color_field, query, point_size, opacity = _render_sidebar_display_settings(
         frame, cfg, has_similarity=index is not None
@@ -1466,6 +1780,9 @@ def main() -> None:
         st.sidebar.caption(f"高维近邻不可用：{similarity_state.error}")
     _render_sidebar_diagnostics(cfg)
     source, selected_lists, selected_years = _render_sidebar_filters(frame, map_info)
+    unexpected_state = _render_sidebar_unexpected_relations(
+        unexpected_relations, frame, index
+    )
 
     try:
         spec = apply_color(
@@ -1517,6 +1834,14 @@ def main() -> None:
         mutual_edges=edge_overlay["edges"],
         mutual_trace_name=str(edge_overlay["trace_name"]),
         mutual_line_color=str(edge_overlay["line_color"]),
+        pair_work_ids=(
+            [
+                int(unexpected_state["selected"]["a_work_id"]),
+                int(unexpected_state["selected"]["b_work_id"]),
+            ]
+            if unexpected_state.get("selected")
+            else []
+        ),
     )
     event = st.plotly_chart(
         figure,
@@ -1538,6 +1863,7 @@ def main() -> None:
         f"当前显示 {len(view)} / {len(frame)} 部作品；"
         "2D 点击数据点或使用侧栏下拉选择作品，选中后显示三个模态的高维近邻。"
     )
+    _render_unexpected_panel(unexpected_state, frame, index)
 
     selected_row = _lookup_row(frame, selected_id) if selected_id is not None else None
     if selected_row is not None and selected_id is not None:

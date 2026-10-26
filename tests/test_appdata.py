@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 from pathlib import Path
 
@@ -31,11 +33,15 @@ from nebula.appdata import (
     load_nebula_frame,
     load_neighbor_consensus,
     load_representation_options,
+    load_unexpected_relations,
     map_matches_representation,
     mutual_neighbor_edges,
     neighbor_rows,
     pick_mutual_edge_kind,
     search_frame,
+    unexpected_modes,
+    unexpected_pair_rows,
+    unexpected_rows_csv,
 )
 from nebula.config import Config
 from nebula.db import Catalog
@@ -1370,3 +1376,315 @@ def test_diagnostics_artifacts(config: Config):
     assert artifacts["html_dir"] == str(html_dir)
     assert artifacts["json"] == str(json_path)
     assert artifacts["csv"] == str(csv_path)
+
+
+
+# --------------------------------------------------------------------------- v0.4.5 意外关系
+def _write_unexpected(config: Config, payload: object) -> Path:
+    config.paths.logs.mkdir(parents=True, exist_ok=True)
+    path = config.paths.logs / "unexpected_relations.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _real_discovery_payload(work_ids: list[int]) -> dict:
+    a, b, c = work_ids[0], work_ids[1], work_ids[2]
+
+    def metrics(rank_a, rank_b, bar_p, cos):
+        return {
+            "rank_a": rank_a,
+            "rank_b": rank_b,
+            "p_a": bar_p,
+            "p_b": bar_p,
+            "bar_p": bar_p,
+            "cos": cos,
+        }
+
+    return {
+        "meta": {
+            "tool": "unexpected_relations",
+            "version": "v0.4.5",
+            "params": {"top_n": 50, "k": 10, "mode": "all"},
+            "definitions": {
+                "mode_a": "joint Top-k 有向边无序并集候选；U = bar_p_joint - ...",
+                "mode_b": "temporal Top-k 候选；U = ...",
+                "mode_c": "PE-AV/CLIP/DINO mutual Top-k 对比；分数全部用 p 差/组合",
+            },
+        },
+        "spaces": [
+            {"key": "full_mean_joint", "name": "full_mean_v1", "kind": "joint"},
+            {"key": "full_mean_audio", "name": "full_mean_v1", "kind": "audio"},
+            {"key": "full_mean_video", "name": "full_mean_v1", "kind": "video"},
+            {"key": "temporal_joint", "name": "temporal_stats_v1", "kind": "joint"},
+            {"key": "clip_joint", "name": "dense_visual_clip_v2", "kind": "joint"},
+            {"key": "dino_joint", "name": "dense_visual_dino_v2", "kind": "joint"},
+        ],
+        "mode_a": {
+            "skipped": False,
+            "n_candidates": 2,
+            "top": [
+                {
+                    "work_id_a": a,
+                    "work_id_b": b,
+                    "title_a": f"标题 {a}",
+                    "title_b": f"标题 {b}",
+                    "score": 0.9,
+                    "joint": metrics(1, 2, 0.95, 0.88),
+                    "audio": metrics(3, 4, 0.80, 0.72),
+                    "video": metrics(5, 6, 0.70, 0.65),
+                },
+                {
+                    "work_id_a": b,
+                    "work_id_b": c,
+                    "title_a": f"标题 {b}",
+                    "title_b": f"标题 {c}",
+                    "score": 0.5,
+                    "joint": metrics(7, 8, 0.60, 0.5),
+                    "audio": metrics(9, 10, 0.55, 0.45),
+                    "video": metrics(11, 12, 0.50, 0.40),
+                },
+            ],
+        },
+        "mode_b": {
+            "skipped": False,
+            "n_candidates": 1,
+            "top": [
+                {
+                    "work_id_a": a,
+                    "work_id_b": c,
+                    "title_a": f"标题 {a}",
+                    "title_b": f"标题 {c}",
+                    "score": 0.4,
+                    "temporal": metrics(2, 1, 0.85, 0.7),
+                    "full_mean": metrics(8, 9, 0.55, 0.5),
+                }
+            ],
+        },
+        "mode_c": {
+            "skipped": False,
+            "common": [
+                {
+                    "work_id_a": a,
+                    "work_id_b": b,
+                    "title_a": f"标题 {a}",
+                    "title_b": f"标题 {b}",
+                    "score": 0.95,
+                    "mutual_count": 3,
+                    "mutual_spaces": ["peav", "clip", "dino"],
+                    "common_level": "all3",
+                    "peav": {**metrics(1, 1, 0.97, 0.9), "mutual": True},
+                    "clip": {**metrics(2, 3, 0.80, 0.7), "mutual": True},
+                    "dino": {**metrics(4, 2, 0.75, 0.6), "mutual": True},
+                }
+            ],
+            "visual_vs_peav": [
+                {
+                    "work_id_a": b,
+                    "work_id_b": c,
+                    "title_a": f"标题 {b}",
+                    "title_b": f"标题 {c}",
+                    "score": 0.3,
+                    "mutual_count": 2,
+                    "mutual_spaces": ["clip", "dino"],
+                    "peav": {**metrics(9, 9, 0.30, 0.2), "mutual": False},
+                    "clip": {**metrics(1, 2, 0.90, 0.8), "mutual": True},
+                    "dino": {**metrics(2, 1, 0.85, 0.75), "mutual": True},
+                }
+            ],
+            "peav_only": [
+                {
+                    "work_id_a": a,
+                    "work_id_b": c,
+                    "title_a": f"标题 {a}",
+                    "title_b": f"标题 {c}",
+                    "score": 0.2,
+                    "mutual_count": 1,
+                    "mutual_spaces": ["peav"],
+                    "peav": {**metrics(2, 3, 0.88, 0.8), "mutual": True},
+                    "clip": {**metrics(10, 11, 0.20, 0.1), "mutual": False},
+                    "dino": {**metrics(9, 8, 0.25, 0.15), "mutual": False},
+                }
+            ],
+            "counts": {"common_ge2": 1, "visual_vs_peav": 1, "peav_only": 1},
+        },
+    }
+
+
+def test_load_unexpected_relations_real_schema(config: Config):
+    work_ids = list(range(1, 4))
+    _write_unexpected(config, _real_discovery_payload(work_ids))
+    relations = load_unexpected_relations(config)
+    assert relations is not None
+    assert relations["path"].endswith("unexpected_relations.json")
+    assert relations["meta"]["tool"] == "unexpected_relations"
+    assert relations["n_pairs"] == 6  # mode_a 2 + mode_b 1 + mode_c 3 类
+    assert relations["by_mode"] == {"a": 2, "b": 1, "c": 3}
+    assert relations["spaces"] == (
+        "joint",
+        "audio",
+        "video",
+        "temporal",
+        "full_mean",
+        "peav",
+        "clip",
+        "dino",
+    )
+    first = next(
+        pair
+        for pair in relations["pairs"]
+        if pair["mode"] == "a" and pair["a_work_id"] == 1
+    )
+    assert first["a_work_id"] == 1 and first["b_work_id"] == 2
+    assert first["score"] == pytest.approx(0.9)
+    assert first["title_a"] == "标题 1"
+    joint = first["per_space"]["joint"]
+    assert joint["rank_a"] == 1 and joint["rank_b"] == 2
+    assert joint["percentile"] == pytest.approx(0.95)  # bar_p 回填
+    assert joint["cosine"] == pytest.approx(0.88)
+    custom = next(
+        pair
+        for pair in relations["pairs"]
+        if pair["mode"] == "c" and pair["a_work_id"] == 1 and pair["b_work_id"] == 2
+    )
+    assert custom["category"] == "common"
+    assert set(custom["per_space"]) == {"peav", "clip", "dino"}
+    assert custom["per_space"]["peav"]["mutual"] is True
+    assert (
+        next(pair for pair in relations["pairs"] if pair["mode"] == "c" and pair["score"] == 0.3)[
+            "category"
+        ]
+        == "visual_vs_peav"
+    )
+
+    modes = unexpected_modes(relations)
+    assert [mode["mode"] for mode in modes] == ["a", "b", "c"]
+    assert [mode["label"] for mode in modes] == ["模式 A", "模式 B", "模式 C"]
+    assert all(
+        mode["count"] == count for mode, count in zip(modes, [2, 1, 3], strict=True)
+    )
+    assert "joint Top-k" in modes[0]["description"]
+    assert "temporal Top-k" in modes[1]["description"]
+
+
+def test_load_unexpected_relations_compat_formats(config: Config):
+    # 旧/合成契约：mode_a 列表 + mode_b.pairs + 别名字段 + per_space 容器
+    _write_unexpected(
+        config,
+        {
+            "mode_a": [
+                {
+                    "work_pair": [1, 2],
+                    "score": 0.7,
+                    "category": "synthetic",
+                    "per_space": {
+                        "work_joint": {"rank": 3, "percentile": 91.5, "cosine": 0.8},
+                        "dense_visual_clip_v2": {"rank": 2, "pct": 88.0, "cos": 0.75},
+                    },
+                }
+            ],
+            "mode_b": {
+                "pairs": [
+                    {"work_id_a": 2, "work_id_b": 3, "score": 0.6, "full_mean": {"rank_a": 1, "bar_p": 0.9, "cos": 0.85}}
+                ]
+            },
+        },
+    )
+    relations = load_unexpected_relations(config)
+    assert relations is not None
+    assert relations["by_mode"] == {"a": 1, "b": 1}
+    first = relations["pairs"][0]
+    assert first["mode"] == "a"
+    assert first["per_space"]["joint"]["rank"] == 3
+    assert first["per_space"]["clip"]["percentile"] == pytest.approx(88.0)
+    second = relations["pairs"][1]
+    assert second["mode"] == "b"
+    assert second["per_space"]["full_mean"]["rank_a"] == 1
+    assert second["per_space"]["full_mean"]["percentile"] == pytest.approx(0.9)
+
+    # 缺失 / 坏 JSON -> None
+    (config.paths.logs / "unexpected_relations.json").unlink()
+    assert load_unexpected_relations(config) is None
+    (config.paths.logs / "unexpected_relations.json").write_text(
+        "{not json", encoding="utf-8"
+    )
+    assert load_unexpected_relations(config) is None
+
+
+def test_unexpected_pair_rows_and_csv(seeded_with_vectors):
+    config, catalog, work_ids, index = seeded_with_vectors
+    _, frame = load_nebula_frame(catalog, config)
+    neighbor_sets = {
+        work_id: {
+            item.work_id for item in index.neighbors(work_id, kind="work_joint", k=2)
+        }
+        for work_id in work_ids
+    }
+    mutual_pair = next(
+        (a, b)
+        for position, a in enumerate(work_ids)
+        for b in work_ids[position + 1 :]
+        if b in neighbor_sets[a] and a in neighbor_sets[b]
+    )
+    non_mutual_pair = next(
+        (a, b)
+        for position, a in enumerate(work_ids)
+        for b in work_ids[position + 1 :]
+        if not (b in neighbor_sets[a] and a in neighbor_sets[b])
+    )
+    payload = {
+        "meta": {"tool": "unexpected_relations"},
+        "mode_a": [
+            {
+                "work_id_a": mutual_pair[0],
+                "work_id_b": mutual_pair[1],
+                "title_a": "互邻 A",
+                "title_b": "互邻 B",
+                "score": 0.8,
+                "joint": {"rank_a": 1, "rank_b": 2, "bar_p": 0.9, "cos": 0.95},
+                "audio": {"rank_a": 4, "rank_b": 5, "bar_p": 0.6, "cos": 0.5},
+                "video": {"rank_a": 6, "rank_b": 7, "bar_p": 0.5, "cos": 0.4},
+            },
+            {
+                "work_id_a": non_mutual_pair[0],
+                "work_id_b": non_mutual_pair[1],
+                "score": 0.4,
+                "joint": {"rank_a": 9, "rank_b": 8, "bar_p": 0.3, "cos": 0.2},
+                "audio": {"rank_a": 2, "rank_b": 3, "bar_p": 0.7, "cos": 0.6},
+                "video": {"rank_a": 5, "rank_b": 4, "bar_p": 0.55, "cos": 0.45},
+            },
+        ],
+    }
+    _write_unexpected(config, payload)
+    relations = load_unexpected_relations(config)
+    assert relations is not None
+
+    rows = unexpected_pair_rows(
+        relations, "a", frame=frame, similarity_index=index, k=2
+    )
+    assert [row["score"] for row in rows] == [pytest.approx(0.8), pytest.approx(0.4)]
+    by_pair = {(row["a_work_id"], row["b_work_id"]): row for row in rows}
+    assert by_pair[mutual_pair]["mutual"] is True
+    assert by_pair[non_mutual_pair]["mutual"] is False
+    mutual_row = by_pair[mutual_pair]
+    assert mutual_row["a_title"] == str(
+        frame.set_index("work_id").loc[mutual_pair[0], "title"]
+    )
+    assert "rank=" in mutual_row["space_summary"] or "rA=" in mutual_row["space_summary"]
+    assert "pct=" in mutual_row["space_summary"]
+    assert "cos=" in mutual_row["space_summary"]
+    only = unexpected_pair_rows(
+        relations, "a", frame=frame, similarity_index=index, only_mutual=True, k=2
+    )
+    assert [(row["a_work_id"], row["b_work_id"]) for row in only] == [mutual_pair]
+
+    csv_text = unexpected_rows_csv(rows)
+    parsed = list(csv.reader(io.StringIO(csv_text)))
+    assert parsed[0][:4] == ["模式", "分数", "A work_id", "A 标题"]
+    assert len(parsed) == 3
+    assert parsed[1][0] == "a"
+    assert float(parsed[1][1]) == pytest.approx(0.8)
+    assert str(mutual_pair[0]) in parsed[1]
+    assert "rank=" in parsed[1][-3] or "rA=" in parsed[1][-3]
+
+    # 模式过滤：没有 b 模式时不返回行
+    assert unexpected_pair_rows(relations, "b", frame=frame, similarity_index=index) == []
