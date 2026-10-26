@@ -384,10 +384,18 @@ def build_work_tokens(
     sequence_version: str | None = None,
     clip_frame_version: str | None = None,
     dino_frame_version: str | None = None,
+    max_segments: int | None = V05_MAX_SEGMENTS,
 ) -> dict[str, np.ndarray]:
-    """构建一部作品的局部音画 token（不写盘）；缺数据用零向量 + mask=0。"""
+    """构建一部作品的局部音画 token（不写盘）；缺数据用零向量 + mask=0。
+
+    max_segments=None 表示不截断（v0.5-beta 全量 token）；默认保持 alpha 的 128 段上限。
+    """
 
     work_id = int(work_id)
+    if max_segments is not None:
+        max_segments = int(max_segments)
+        if max_segments < 1:
+            raise V05DataError(f"max_segments 必须 >= 1 或 None，收到 {max_segments!r}")
     if work_id < 1:
         raise V05DataError(f"work_id 非法: {work_id}")
     sequence = _safe_component(
@@ -421,14 +429,17 @@ def build_work_tokens(
             raise V05DataError("clip_video 行数与 clip_joint 不一致")
 
     n_segments_original = int(joint.shape[0])
-    n_segments = min(n_segments_original, V05_MAX_SEGMENTS)
+    if max_segments is None:
+        n_segments = n_segments_original
+    else:
+        n_segments = min(n_segments_original, int(max_segments))
     truncated = n_segments < n_segments_original
     if truncated:
         LOGGER.info(
-            "work_id=%s 段数 %d > %d，截断到 %d 段",
+            "work_id=%s 段数 %d > %s，截断到 %d 段",
             work_id,
             n_segments_original,
-            V05_MAX_SEGMENTS,
+            max_segments,
             n_segments,
         )
     duration_s = _segment_duration(config, work_dir, clip_times)
@@ -546,7 +557,11 @@ def build_work_tokens(
 
 
 # --------------------------------------------------------------------------- 保存 / 读取
-def _validated_tokens(tokens: Mapping[str, Any]) -> dict[str, np.ndarray]:
+def _validated_tokens(
+    tokens: Mapping[str, Any],
+    *,
+    max_segments: int | None = V05_MAX_SEGMENTS,
+) -> dict[str, np.ndarray]:
     missing = [key for key in REQUIRED_TOKEN_KEYS if key not in tokens]
     if missing:
         raise V05DataError(f"token 缺少必需数组: {', '.join(missing)}")
@@ -554,8 +569,13 @@ def _validated_tokens(tokens: Mapping[str, Any]) -> dict[str, np.ndarray]:
     if paav.ndim != 3 or paav.shape[1:] != (3, PAAV_DIM):
         raise V05DataError(f"paav 形状应为 (W,3,{PAAV_DIM})，收到 {paav.shape}")
     n_segments = int(paav.shape[0])
-    if n_segments < 1 or n_segments > V05_MAX_SEGMENTS:
-        raise V05DataError(f"段数非法: {n_segments}（1..{V05_MAX_SEGMENTS}）")
+    if n_segments < 1:
+        raise V05DataError(f"段数非法: {n_segments}")
+    if max_segments is not None and n_segments > int(max_segments):
+        raise V05DataError(
+            f"段数 {n_segments} 超过 max_segments={int(max_segments)}；"
+            "全量 token 请传 max_segments=None"
+        )
     expected_shapes = {
         "visual_clip": (n_segments, V05_BINS_PER_SEGMENT, VISUAL_CLIP_DIM),
         "visual_dino": (n_segments, V05_BINS_PER_SEGMENT, VISUAL_DINO_DIM),
@@ -605,10 +625,12 @@ def save_work_tokens(
     version: str,
     work_id: int,
     tokens: Mapping[str, Any],
+    *,
+    max_segments: int | None = V05_MAX_SEGMENTS,
 ) -> Path:
-    """原子保存一部作品的 token npz，返回路径。"""
+    """原子保存一部作品的 token npz，返回路径（max_segments=None 支持全量）。"""
 
-    arrays = _validated_tokens(tokens)
+    arrays = _validated_tokens(tokens, max_segments=max_segments)
     target = token_path(config, version, work_id)
     target.parent.mkdir(parents=True, exist_ok=True)
     handle = None
@@ -750,8 +772,12 @@ def build_dataset(
     force: bool = False,
     limit: int | None = None,
     work_ids: Sequence[int] | None = None,
+    max_segments: int | None = V05_MAX_SEGMENTS,
 ) -> dict[str, Any]:
-    """只处理 canonical + completed 作品，构建 v0.5-alpha token 数据集并汇总结果。"""
+    """只处理 canonical + completed 作品，构建 v0.5 token 数据集并汇总结果。
+
+    max_segments=None 表示全量不截断（v0.5-beta）；默认保持 alpha 的 128 段上限。
+    """
 
     started = now_utc_iso()
     started_monotonic = time.perf_counter()
@@ -803,8 +829,15 @@ def build_dataset(
                 sequence_version=sequence,
                 clip_frame_version=clip_version,
                 dino_frame_version=dino_version,
+                max_segments=max_segments,
             )
-            save_work_tokens(config, dataset_version, work_id, tokens)
+            save_work_tokens(
+                config,
+                dataset_version,
+                work_id,
+                tokens,
+                max_segments=max_segments,
+            )
             n_segments = int(np.asarray(tokens["paav"]).shape[0])
             n_original = int(np.asarray(tokens["n_segments_original"]).item())
             is_truncated = bool(int(np.asarray(tokens["truncated"]).item()))
@@ -845,7 +878,7 @@ def build_dataset(
         "event_version": EVENT_VERSION,
         "bin_seconds": V05_BIN_SECONDS,
         "bins_per_segment": V05_BINS_PER_SEGMENT,
-        "max_segments": V05_MAX_SEGMENTS,
+        "max_segments": max_segments,
         "dims": {
             "paav": [3, PAAV_DIM],
             "visual_clip": [V05_BINS_PER_SEGMENT, VISUAL_CLIP_DIM],
@@ -893,6 +926,7 @@ def build_dataset(
         "sequence_version": sequence,
         "clip_frame_version": clip_version,
         "dino_frame_version": dino_version,
+        "max_segments": max_segments,
         "n_candidates": len(candidates),
         "n_built": len(built),
         "n_existing": len(existing),

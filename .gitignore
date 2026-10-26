@@ -24,6 +24,8 @@ data/v05_tokens/*
 !data/v05_tokens/.gitkeep
 data/models/*
 !data/models/.gitkeep
+data/audio_dense/*
+!data/audio_dense/.gitkeep
 data/maps/*
 !data/maps/.gitkeep
 input/local/*

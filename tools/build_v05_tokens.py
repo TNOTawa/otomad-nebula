@@ -82,7 +82,32 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="只构建指定 work_id（可多值；默认全部 canonical completed）",
     )
+    parser.add_argument(
+        "--max-segments",
+        type=_parse_max_segments,
+        default=v05_data.V05_MAX_SEGMENTS,
+        metavar="N|none",
+        help=(
+            "每部作品最大段数（默认 128，保持 alpha 兼容；传 none/0 表示全量不截断，"
+            "v0.5-beta 用）"
+        ),
+    )
     return parser
+
+
+def _parse_max_segments(value: str) -> int | None:
+    text = str(value).strip().lower()
+    if text in ("none", "null", "0", "all", "full"):
+        return None
+    try:
+        number = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--max-segments 必须是正整数或 none，收到 {value!r}"
+        ) from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"--max-segments 必须 >= 1，收到 {number}")
+    return number
 
 
 def _resolve_config_path(value: str | None) -> Path:
@@ -107,7 +132,7 @@ def _print_summary(summary: dict) -> None:
     )
     print(
         f"  bin={v05_data.V05_BIN_SECONDS:g}s × {v05_data.V05_BINS_PER_SEGMENT}/段"
-        f"  max_segments={v05_data.V05_MAX_SEGMENTS}"
+        f"  max_segments={summary.get('max_segments')}"
     )
     print(
         f"  候选={summary['n_candidates']}  新建={summary['n_built']}"
@@ -153,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             force=bool(args.force),
             limit=args.limit,
             work_ids=args.work_ids,
+            max_segments=args.max_segments,
         )
     except NebulaError as exc:
         print(f"v0.5 token 数据集构建失败: {exc}", file=sys.stderr)
