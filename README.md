@@ -920,11 +920,14 @@ visual↔audio InfoNCE、相对时间 order、whitening/duration 去偏、更多
   test 3,681 anchors/12 部。旧 checkpoint 在新协议下仅比 simple_sync 高 0.4–0.5pp（17.9% vs 17.55%），
   不能宣称显著优于简单基线；K=32 retrieval 旧模型 4.6–4.9% vs chance 3.125%。
 - 局部帧级时序模型：直接读已有 CLIP 8fps + MERT 75Hz 帧特征，3s 上下文/相对时间/边界 mask，
-  temporal 与 cross-attention 两档 128d、单一 InfoNCE；因 CPU 数据抽取成本，采用固定子集
-  （train 441/val 42/test 112/retrieval 112，12 test 部）做最小消融。temporal 3 seeds
-  test Top-1 **26.79±0.73%**、cross **25.00±0.73%**，高于同子集 simple_sync 16.07%/frozen 18.75%，
-  但 old beta 子集均值约 26.2%，且 **audio_zero 反而更高**（28.6–30.4%），说明模型尚未可靠利用音频。
-  **未通过停止条件**：不训练全曲编码器、不注册 DB/地图。
+  temporal 与 cross-attention 两档 128d、单一 InfoNCE；旧子集（train 441/val 42/test 112）
+  的 26.79%/25.00% 是**每部作品前几条 anchor** 的选择偏差，不能外推（子集 test anchor 位置
+  中位数 2.3%，完整 test 50.0%）。
+- **完整 test 诊断（3,681 anchors/12 部，修正消融）**：temporal Top-1 **14.29±0.96%**、
+  cross **13.57±0.46%**，均低于 chance 16.67%、simple_sync 17.55%、旧 beta 17.95%；
+  内容清零/候选内容置换反而提高到 17–18%，真实内容平移/取音窗错位不掉点。按预先固定门槛
+  **0/6 seeds、0/2 arch 通过**；已暂停局部配对路线，不训练全曲编码器、不注册 DB/地图。
+  详见 `docs/reports/v05beta-local-diagnostics.md`。
 - 数据扩展：解析 2022–2024 选票页得 1,858 个新 BV；先导入 12 部（work 123–134）成为独立
   held-out，已完成 PE-AV/事件、CLIP/DINOv2、MERT 特征，不参与训练/调参/表征/地图。
 - 修复 `visual_pipeline.compose_visual_version` 未 slug 化 bug；详见
@@ -1057,6 +1060,9 @@ visual↔audio InfoNCE、相对时间 order、whitening/duration 去偏、更多
   模式切换/表格/选中高亮/Top-k/互邻筛选/CSV/染色不改分数）；
   `tests/test_invariants.py` 加 discovery 不写 DB、audio_version 隔离、beta 默认
   max_segments=None 不静默截断与不注册 DB/地图；
+- v0.5-beta v2 诊断测试覆盖：`tests/test_v05_local.py`（22 条：协议/帧上下文/模型/InfoNCE/
+  评估、修正消融语义、数据集音频取窗错位、诊断门槛通过/失败、CLI smoke）；完整 test 的
+  结果落 `logs/v05_local_diagnostics_full.json`，不写 DB/不建 map；
 - v0.4 全链路 E2E（`tests/test_e2e.py -k v04`）：4 部合成视频 → HashTestEmbedder 全片编码 →
   注入中断 → 只补缺失批 → `tools/build_representation.py full_mean` →
   `map.py build --representation full_mean_v1` → `appdata.load_nebula_frame` →
@@ -1071,14 +1077,14 @@ visual↔audio InfoNCE、相对时间 order、whitening/duration 去偏、更多
   v0.4.3.1/v0.4.4 的 `build_visual_windows.py` / `build_consensus_graph.py` 也纳入；
   v0.5-alpha 的 `build_v05_tokens.py` / `train_v05.py` 也纳入；
   v0.4.5/v0.5-beta 的 `explore_relations.py` / `audio_dense.py` /
-  `train_v05beta.py` 也纳入（共 **21 入口**）；
+  `train_v05beta.py` / `train_v05_local.py` 也纳入（共 **23 入口**）；
 - 最终门禁：`python qa.py --full` = **PASS 5/5**（2026-10-26 v0.4.3.1/v0.4.4/v0.5-alpha/
-  v0.4.5/v0.5-beta；pytest **1019 passed, 1 skipped** 含 model/network，231.52s；
-  ruff 全绿；docs 含 v0.2.x/v0.4/v0.4.3/v0.4.3.1/v0.4.4/v0.5-alpha/v0.4.5/v0.5-beta；
-  CLI **21 个入口** --help；config 含 visual_dense/window plan/sources 校验；
-  总耗时 241.68s；另：v0.4.3.1/v0.4.4 真实数据复核 5 PASS/0 FAIL，v0.5-alpha 报告核对
-  23/23 通过；本轮 discovery JSON/全量 MERT audio/beta 3 seeds/真实 AppTest 界面复核
-  **4 PASS/0 FAIL**；beta 结论 weak positive / not passed，未注册 DB/地图）。
+  v0.4.5/v0.5-beta v2；pytest **1055 passed, 1 skipped** 含 model/network，215.48s；
+  ruff 全绿；docs 含 v0.2.x/v0.4/v0.4.3/v0.4.3.1/v0.4.4/v0.5-alpha/v0.4.5/v0.5-beta/
+  v0.5-beta v2 诊断；CLI **23 个入口** --help；config 含 visual_dense/window plan/sources 校验；
+  总耗时 229.48s；另：v0.4.3.1/v0.4.4 真实数据复核 5 PASS/0 FAIL，v0.5-alpha 报告核对
+  23/23 通过；本轮 v2 完整 test 诊断 6 checkpoints/11 消融/6 个音频错位实际运行，
+  结论 **fail / 暂停局部配对路线**；未注册 DB/地图，旧模型/旧地图未改）。
 
 ## 常见问题
 

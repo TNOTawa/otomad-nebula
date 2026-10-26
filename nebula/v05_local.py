@@ -16,9 +16,11 @@
   * cross-attn：各自 self-attn 后做 视觉->音频 / 音频->视觉 双向 cross-attention，
     再 pooling 与融合，余弦打分；
 - 仅 InfoNCE 一个目标；输出固定 K 候选的 logits/embedding；指标 Top1/Recall@1、
-  K=32 retrieval、按 work bootstrap 95% CI、坍缩/消融（audio_zero/visual_zero/
-  time_shift）；旧 MLP/simple_sync 数字只引用协议 manifest 的 baselines 字段，
-  不在本模块重造协议。
+  micro=anchor 加权与 macro=按作品等权、K=32 retrieval、按 work bootstrap 95% CI、
+  坍缩；消融区分“内容破坏”（audio_zero/audio_mask_only/audio_mean/
+  audio_global_mean/audio_permute_candidates）、“真实内容错位”（audio_roll_*s 与
+  数据集层面 audio_center_shift）与“仅改位置编码”（历史 time_shift）。
+  旧 MLP/simple_sync 数字只引用协议 manifest/logs 的 baselines，不在本模块重造协议。
 - 产物只落 data/models/v05_local_<arch>/ 与 logs/，不注册 DB/地图。
 
 协议 manifest 期望结构（若 t3 最终字段略有差异，只需改 load_protocol 适配）：
@@ -86,6 +88,38 @@ ARCHS = ("temporal", "cross")
 SPLITS = ("train", "val", "test")
 _PROTOCOL_NAMES = ("manifest.json", "protocol.json")
 _RECORD_NAMES = ("records.jsonl", "records.json")
+
+# 真实内容/同步消融。语义必须区分“内容被破坏”与“仅位置编码被改”：
+# - audio_zero: 内容置零，保留音频时间与 mask（可检验只靠位置/视觉是否仍能选对）；
+# - audio_mask_only: 内容与音频时间都置零，只保留 mask；
+# - audio_mean: 每个候选替换为其自身有效 token 均值（保留候选平均能量，去掉时序）；
+# - audio_global_mean: 整个 batch 的音频均值（候选间也不可区分）；
+# - audio_permute_candidates: 每个 anchor 内随机置换候选音频内容，保留目标候选的
+#   time/mask 与标签，正例内容必然被换走（检验是否真的比较音画内容）；
+# - audio_roll_*s: 在 token 轴上把音频内容平移真实秒数，time/mask 不变
+#   （检验内容与画面/时间戳的真实错位，而不是只改位置编码）；
+# - audio_time_zero: 保留音频内容，仅去掉音频相对时间；
+# - visual_zero: 视觉内容置零；
+# - time_shift: 历史消融，仅改 audio_time 位置编码输入，不应解读为真实音画错位。
+AUDIO_ROLL_SECONDS = {
+    "audio_roll_0p5s": 0.5,
+    "audio_roll_1s": 1.0,
+    "audio_roll_2s": 2.0,
+}
+ABLATION_MODES = (
+    "audio_zero",
+    "audio_mask_only",
+    "audio_mean",
+    "audio_global_mean",
+    "audio_permute_candidates",
+    "audio_roll_0p5s",
+    "audio_roll_1s",
+    "audio_roll_2s",
+    "audio_time_zero",
+    "visual_zero",
+    "time_shift",
+)
+DEFAULT_ABLATIONS = ("normal", *ABLATION_MODES)
 
 
 class V05LocalError(NebulaError):
@@ -737,9 +771,15 @@ def downsample_audio_tokens(
     end = float(center_s) + window / 2.0
     n_tokens = max(1, int(round(window * rate)))
     edges = start + (np.arange(n_tokens + 1, dtype=np.float64) * window / n_tokens)
-    order = np.argsort(times, kind="stable")
-    sorted_times = times[order].astype(np.float64)
-    sorted_features = features[order]
+    # 磁盘上的 frame_times 已按时间升序；真实数据每部作品可达 7.5 万帧，
+    # 对每个候选都 argsort 会主导 CPU。仅在乱序时才排序。
+    if times.shape[0] > 1 and bool(np.all(np.diff(times) > 0)):
+        sorted_times = times.astype(np.float64)
+        sorted_features = features
+    else:
+        order = np.argsort(times, kind="stable")
+        sorted_times = times[order].astype(np.float64)
+        sorted_features = features[order]
     token_features = np.zeros((n_tokens, features.shape[1]), dtype=np.float32)
     token_mask = np.zeros((n_tokens,), dtype=bool)
     left = np.searchsorted(sorted_times, edges[:-1], side="left")
@@ -940,16 +980,26 @@ class LocalPairDataset:
         store: "FrameDataStore | Any",
         *,
         bin_seconds: float = 0.5,
+        audio_center_shift_seconds: float = 0.0,
+        cache_items: bool | None = None,
     ) -> None:
         if not records:
             raise V05LocalError("LocalPairDataset 需要至少一条协议记录")
         self.records = tuple(records)
         self.store = store
         self.bin_seconds = float(bin_seconds)
-        # 小协议子集可整条缓存（帧上下文提取是主要 CPU 成本）；全量协议不缓存，
-        # 避免 4 万条记录把内存撑爆。
+        shift = float(audio_center_shift_seconds)
+        if not math.isfinite(shift):
+            raise V05LocalError(f"audio_center_shift_seconds 非法: {audio_center_shift_seconds}")
+        self.audio_center_shift_seconds = shift
+        # 小协议子集可整条缓存（帧上下文提取是主要 CPU 成本）；完整 test 的
+        # 单条缓存约 5GB（3681 anchors × 6 candidates），需由调用方显式开启；
+        # retrieval（×32 candidates）默认绝不缓存。
         self._item_cache: dict[int, LocalCandidateSet] = {}
-        self._cache_items = len(self.records) <= 5000
+        if cache_items is None:
+            self._cache_items = len(self.records) <= 500
+        else:
+            self._cache_items = bool(cache_items)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -968,7 +1018,10 @@ class LocalPairDataset:
         audio_times: list[np.ndarray] = []
         audio_masks: list[np.ndarray] = []
         for candidate_bin in record.candidate_bins:
-            center = bin_center_seconds(candidate_bin, self.bin_seconds)
+            center = (
+                bin_center_seconds(candidate_bin, self.bin_seconds)
+                + self.audio_center_shift_seconds
+            )
             features, times, mask = self.store.audio_tokens(record.work_id, center)
             audio_features.append(features)
             audio_times.append(times)
@@ -1531,45 +1584,173 @@ def _evaluate_batches(
         int(work_id): (int(correct_by_work[work_id][0]), int(correct_by_work[work_id][1]))
         for work_id in correct_by_work
     }
+    per_work = {
+        str(work_id): (
+            float(per_work_correct[work_id]) / float(per_work_total[work_id])
+            if per_work_total[work_id]
+            else None
+        )
+        for work_id in per_work_total
+    }
+    finite_work_values = [float(value) for value in per_work.values() if value is not None]
+    macro_top1 = (
+        float(np.mean(finite_work_values)) if finite_work_values else None
+    )
     return {
         "top1": top1,
+        "macro_top1": macro_top1,
         "recall_at_1": top1,
         "top1_k32": k32,
         "k_retrieval": int(k_retrieval),
         "n_sets": total,
-        "per_work": {
-            str(work_id): (
-                float(per_work_correct[work_id]) / float(per_work_total[work_id])
-                if per_work_total[work_id]
-                else None
-            )
-            for work_id in per_work_total
-        },
+        "n_works": len(per_work_total),
+        "per_work": per_work,
         "bootstrap_ci": _bootstrap_ci_by_work(by_work, bootstrap=bootstrap, seed=bootstrap_seed),
         "collapse": _collapse_metrics(embeddings),
     }
 
 
-def _ablate_batch(batch: Mapping[str, Any], mode: str) -> dict[str, Any]:
+def _ablation_array(value: Any) -> tuple[np.ndarray, Any]:
+    """把 batch 字段转成 numpy，并返回用于恢复原类型的 template。"""
+
+    if isinstance(value, np.ndarray):
+        return np.asarray(value), None
+    if torch is not None and torch.is_tensor(value):
+        return value.detach().cpu().numpy(), value
+    raise V05LocalError(f"消融字段类型不支持: {type(value).__name__}")
+
+
+def _restore_ablation(value: np.ndarray, template: Any) -> Any:
+    if template is None:
+        return value
+    return torch.as_tensor(value, dtype=template.dtype, device=template.device)
+
+
+def _candidate_content_mean(audio: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    weights = mask[..., None].astype(np.float32)
+    counts = weights.sum(axis=2, keepdims=True).clip(min=1.0)
+    mean = (audio * weights).sum(axis=2, keepdims=True) / counts
+    return np.where(mask[..., None], mean, 0.0).astype(audio.dtype, copy=False)
+
+
+def _global_content_mean(audio: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    weights = mask[..., None].astype(np.float32)
+    total = float(weights.sum())
+    if total <= 0.0:
+        return np.zeros_like(audio)
+    mean = (audio * weights).sum(axis=(0, 1, 2), keepdims=True) / total
+    return np.where(mask[..., None], mean, 0.0).astype(audio.dtype, copy=False)
+
+
+def _roll_audio_content(
+    audio: np.ndarray, seconds: float, context_seconds: float
+) -> np.ndarray:
+    """沿 token 轴平移音频内容；timestamps/mask 保持不变（真实内容错位）。"""
+
+    if not math.isfinite(float(seconds)) or float(seconds) == 0.0:
+        raise V05LocalError(f"消融平移秒数非法: {seconds}")
+    if not math.isfinite(float(context_seconds)) or float(context_seconds) <= 0.0:
+        raise V05LocalError(f"context_seconds 非法: {context_seconds}")
+    tokens = int(audio.shape[2])
+    shift = int(round(float(seconds) * tokens / float(context_seconds)))
+    if shift == 0:
+        return np.array(audio, copy=True)
+    output = np.zeros_like(audio)
+    if abs(shift) >= tokens:
+        return output
+    if shift > 0:
+        output[:, :, shift:, :] = audio[:, :, : tokens - shift, :]
+    else:
+        output[:, :, : tokens + shift, :] = audio[:, :, -shift:, :]
+    return output
+
+
+def _permute_candidate_content(
+    audio: np.ndarray, labels: np.ndarray, *, seed: int
+) -> np.ndarray:
+    """每个 anchor 内置换候选音频内容，目标候选的 time/mask 不变。
+
+    正例内容一定被换走（若随机置换恰好保留正例位置，则再做一次交换），
+    因此该消融直接检验模型是否比较了“正确的音画内容”，而不是候选位置。
+    """
+
+    rng = np.random.default_rng(int(seed))
+    batch_size, candidates = int(audio.shape[0]), int(audio.shape[1])
+    output = np.array(audio, copy=True)
+    for row in range(batch_size):
+        permutation = rng.permutation(candidates)
+        positive = int(labels[row]) if row < int(labels.shape[0]) else -1
+        if 0 <= positive < candidates and int(permutation[positive]) == positive:
+            swap = (positive + 1) % candidates
+            permutation[positive], permutation[swap] = (
+                permutation[swap],
+                permutation[positive],
+            )
+        output[row] = audio[row, permutation]
+    return output
+
+
+def _ablate_batch(
+    batch: Mapping[str, Any],
+    mode: str,
+    *,
+    context_seconds: float = DEFAULT_CONTEXT_SECONDS,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """在 batch 上做可预期、可复现的消融；不改变 labels/candidate_mask。
+
+    注意：time_shift 只平移 audio_time 位置编码，保留音频内容；它不能证明
+    模型学到了真实音画同步。真实内容错位请用 audio_roll_* 或数据集层面的
+    audio_center_shift。
+    """
+
     output = dict(batch)
-    if mode == "audio_zero":
-        value = batch["audio"]
-        output["audio"] = (
-            np.zeros_like(value) if isinstance(value, np.ndarray) else torch.zeros_like(value)
-        )
-    elif mode == "visual_zero":
-        value = batch["visual"]
-        output["visual"] = (
-            np.zeros_like(value) if isinstance(value, np.ndarray) else torch.zeros_like(value)
-        )
-    elif mode == "time_shift":
-        times = batch["audio_time"]
-        if isinstance(times, np.ndarray):
-            output["audio_time"] = np.clip(times + 1.0, -1.0, 1.0)
-        else:
-            output["audio_time"] = (times + 1.0).clamp(-1.0, 1.0)
-    elif mode != "normal":
+    if mode == "normal":
+        return output
+    if mode not in ABLATION_MODES:
         raise V05LocalError(f"未知消融模式: {mode!r}")
+
+    if mode in (
+        "audio_zero",
+        "audio_mask_only",
+        "audio_mean",
+        "audio_global_mean",
+        "audio_permute_candidates",
+        *AUDIO_ROLL_SECONDS,
+    ):
+        audio, audio_template = _ablation_array(batch["audio"])
+        mask = np.asarray(batch["audio_mask"], dtype=bool)
+        if mode in ("audio_zero", "audio_mask_only"):
+            changed = np.zeros_like(audio)
+        elif mode == "audio_mean":
+            changed = _candidate_content_mean(audio, mask)
+        elif mode == "audio_global_mean":
+            changed = _global_content_mean(audio, mask)
+        elif mode == "audio_permute_candidates":
+            changed = _permute_candidate_content(
+                audio,
+                np.asarray(batch["labels"], dtype=np.int64),
+                seed=int(seed),
+            )
+        else:
+            changed = _roll_audio_content(
+                audio,
+                AUDIO_ROLL_SECONDS[mode],
+                float(context_seconds),
+            )
+        output["audio"] = _restore_ablation(changed, audio_template)
+
+    if mode in ("audio_mask_only", "audio_time_zero", "time_shift"):
+        times, times_template = _ablation_array(batch["audio_time"])
+        if mode in ("audio_mask_only", "audio_time_zero"):
+            changed_times = np.zeros_like(times)
+        else:  # 历史消融：只改位置编码，不移动内容
+            changed_times = np.clip(times + 1.0, -1.0, 1.0)
+        output["audio_time"] = _restore_ablation(changed_times, times_template)
+
+    if mode == "visual_zero":
+        visual, visual_template = _ablation_array(batch["visual"])
+        output["visual"] = _restore_ablation(np.zeros_like(visual), visual_template)
     return output
 
 
@@ -1581,9 +1762,15 @@ def evaluate_local(
     k_retrieval: int = DEFAULT_K_RETRIEVAL,
     bootstrap: int = 0,
     bootstrap_seed: int = 12345,
-    ablations: Sequence[str] = ("normal", "audio_zero", "visual_zero", "time_shift"),
+    ablations: Sequence[str] = DEFAULT_ABLATIONS,
 ) -> dict[str, Any]:
-    """固定 K 候选评估：Top1/Recall@1、K=32、bootstrap CI、坍缩与消融。"""
+    """固定 K 候选评估：Top1/Recall@1、K=32、bootstrap CI、坍缩与消融。
+
+    消融语义见 ABLATION_MODES；audio_permute_candidates 使用固定 seed
+    保证可复现。批次必须可重复迭代（DataLoader 或 list），因为 normal
+    与每个消融都会重新遍历。
+    """
+
     normal = _evaluate_batches(
         model,
         batches,
@@ -1595,17 +1782,34 @@ def evaluate_local(
     result: dict[str, Any] = {
         "normal": normal,
         "top1": normal["top1"],
+        "macro_top1": normal["macro_top1"],
         "recall_at_1": normal["recall_at_1"],
         "top1_k32": normal["top1_k32"],
+        "n_sets": normal["n_sets"],
+        "n_works": normal["n_works"],
         "bootstrap_ci": normal["bootstrap_ci"],
         "collapse": normal["collapse"],
         "per_work": normal["per_work"],
         "ablations": {},
     }
+    model_config = getattr(model, "config", None)
+    context_seconds = float(
+        getattr(model_config, "context_seconds", DEFAULT_CONTEXT_SECONDS)
+    )
     for mode in ablations:
         if mode == "normal":
             continue
-        modified = (_ablate_batch(batch, mode) for batch in batches)
+        if mode not in ABLATION_MODES:
+            raise V05LocalError(f"未知消融模式: {mode!r}")
+        modified = (
+            _ablate_batch(
+                batch,
+                mode,
+                context_seconds=context_seconds,
+                seed=int(bootstrap_seed) + batch_index,
+            )
+            for batch_index, batch in enumerate(batches)
+        )
         result["ablations"][mode] = _evaluate_batches(
             model,
             modified,
@@ -1614,6 +1818,234 @@ def evaluate_local(
             bootstrap=0,
         )
     return result
+
+
+# 预先固定的诊断门槛（在跑完整 test 之前写入日志）：避免看到结果后再改规则。
+DIAGNOSTIC_CRITERIA = {
+    "min_audio_content_drop": 0.05,
+    "min_sync_drop": 0.05,
+    "min_margin_over_simple_sync": 0.03,
+    "min_margin_over_old_beta": 0.03,
+    "min_work_wins": 7,
+    "min_seeds_pass": 2,
+    "content_ablation_modes": [
+        "audio_zero",
+        "audio_global_mean",
+        "audio_permute_candidates",
+    ],
+    "sync_ablation_modes": ["audio_roll_1s", "audio_roll_2s"],
+}
+
+
+def _mean_or_none(values: Iterable[float | None]) -> float | None:
+    finite = [float(value) for value in values if value is not None]
+    return float(np.mean(finite)) if finite else None
+
+
+def _top1_of(mapping: Mapping[str, Any] | None) -> float | None:
+    if not isinstance(mapping, Mapping):
+        return None
+    value = mapping.get("top1")
+    return float(value) if value is not None else None
+
+
+def _work_win_count(
+    per_work: Mapping[str, Any], reference_per_work: Mapping[str, Any]
+) -> int:
+    wins = 0
+    for work_id, value in per_work.items():
+        if value is None:
+            continue
+        reference = reference_per_work.get(str(work_id))
+        if reference is None:
+            continue
+        if float(value) > float(reference):
+            wins += 1
+    return wins
+
+
+def summarize_local_diagnostics(
+    checkpoints: Sequence[Mapping[str, Any]],
+    *,
+    reference: Mapping[str, Any],
+    criteria: Mapping[str, Any] = DIAGNOSTIC_CRITERIA,
+) -> dict[str, Any]:
+    """按预先固定门槛判断音频内容/同步是否真的被使用。
+
+    checkpoints 的每一项需含 arch/seed/test/audio_center_shift；reference 需含
+    simple_sync 与 old_beta 的 top1/per_work（由协议完整 test 日志构造）。
+    返回每个 checkpoint 的量化差值、逐项布尔检查，以及按 arch 的通过数。
+    """
+
+    if not checkpoints:
+        raise V05LocalError("诊断汇总需要至少一个 checkpoint")
+    simple = reference.get("simple_sync") if isinstance(reference, Mapping) else None
+    old = reference.get("old_beta") if isinstance(reference, Mapping) else None
+    if not isinstance(simple, Mapping) or not isinstance(old, Mapping):
+        raise V05LocalError("诊断参考基线缺少 simple_sync/old_beta")
+
+    simple_top1 = _top1_of(simple)
+    old_top1 = _top1_of(old)
+    simple_macro = (
+        float(simple["macro_top1"]) if simple.get("macro_top1") is not None else None
+    )
+    old_macro = float(old["macro_top1"]) if old.get("macro_top1") is not None else None
+    simple_per_work = simple.get("per_work") or {}
+    old_per_work = old.get("per_work") or {}
+
+    details: list[dict[str, Any]] = []
+    for item in checkpoints:
+        test = item.get("test")
+        if not isinstance(test, Mapping):
+            raise V05LocalError(f"checkpoint {item.get('checkpoint')} 缺少 test 指标")
+        normal = _top1_of(test)
+        macro = test.get("macro_top1")
+        macro = float(macro) if macro is not None else None
+        ablations = test.get("ablations") or {}
+        content_values = [
+            _top1_of(ablations.get(mode))
+            for mode in criteria["content_ablation_modes"]
+        ]
+        content_retention = (
+            max(float(value) for value in content_values if value is not None)
+            if all(value is not None for value in content_values)
+            else None
+        )
+        roll_values = [
+            _top1_of(ablations.get(mode))
+            for mode in criteria["sync_ablation_modes"]
+        ]
+        roll_retention = _mean_or_none(roll_values)
+        shift_values = []
+        for shift_key, metrics in (item.get("audio_center_shift") or {}).items():
+            try:
+                seconds = abs(float(shift_key))
+            except (TypeError, ValueError):
+                continue
+            if seconds in (1.0, 2.0):
+                value = _top1_of(metrics)
+                if value is not None:
+                    shift_values.append(value)
+        center_retention = float(np.mean(shift_values)) if shift_values else None
+        content_drop = (
+            float(normal) - float(content_retention)
+            if normal is not None and content_retention is not None
+            else None
+        )
+        roll_drop = (
+            float(normal) - float(roll_retention)
+            if normal is not None and roll_retention is not None
+            else None
+        )
+        center_drop = (
+            float(normal) - float(center_retention)
+            if normal is not None and center_retention is not None
+            else None
+        )
+        sync_drop = min(
+            value for value in (roll_drop, center_drop) if value is not None
+        ) if (roll_drop is not None and center_drop is not None) else None
+        per_work = test.get("per_work") or {}
+        work_wins_simple = _work_win_count(per_work, simple_per_work)
+        work_wins_old = _work_win_count(per_work, old_per_work)
+        checks = {
+            "audio_content_drop": bool(
+                content_drop is not None
+                and content_drop >= float(criteria["min_audio_content_drop"])
+            ),
+            "sync_drop": bool(
+                sync_drop is not None
+                and sync_drop >= float(criteria["min_sync_drop"])
+            ),
+            "beat_simple_sync": bool(
+                normal is not None
+                and simple_top1 is not None
+                and normal - simple_top1 >= float(criteria["min_margin_over_simple_sync"])
+            ),
+            "beat_old_beta": bool(
+                normal is not None
+                and old_top1 is not None
+                and normal - old_top1 >= float(criteria["min_margin_over_old_beta"])
+            ),
+            "macro_beat_simple_sync": bool(
+                macro is not None
+                and simple_macro is not None
+                and macro - simple_macro >= float(criteria["min_margin_over_simple_sync"])
+            ),
+            "macro_beat_old_beta": bool(
+                macro is not None
+                and old_macro is not None
+                and macro - old_macro >= float(criteria["min_margin_over_old_beta"])
+            ),
+            "work_wins_simple_sync": work_wins_simple >= int(criteria["min_work_wins"]),
+            "work_wins_old_beta": work_wins_old >= int(criteria["min_work_wins"]),
+        }
+        details.append(
+            {
+                "checkpoint": str(item.get("checkpoint")),
+                "arch": str(item.get("arch")),
+                "seed": int(item.get("seed")),
+                "top1": normal,
+                "macro_top1": macro,
+                "audio_content_retention_top1": content_retention,
+                "audio_content_drop": content_drop,
+                "audio_sync_roll_retention_top1": roll_retention,
+                "audio_sync_center_retention_top1": center_retention,
+                "audio_sync_drop": sync_drop,
+                "simple_sync_margin": (
+                    float(normal) - float(simple_top1)
+                    if normal is not None and simple_top1 is not None
+                    else None
+                ),
+                "old_beta_margin": (
+                    float(normal) - float(old_top1)
+                    if normal is not None and old_top1 is not None
+                    else None
+                ),
+                "macro_simple_sync_margin": (
+                    float(macro) - float(simple_macro)
+                    if macro is not None and simple_macro is not None
+                    else None
+                ),
+                "macro_old_beta_margin": (
+                    float(macro) - float(old_macro)
+                    if macro is not None and old_macro is not None
+                    else None
+                ),
+                "work_wins_simple_sync": work_wins_simple,
+                "work_wins_old_beta": work_wins_old,
+                "checks": checks,
+                "seed_pass": all(checks.values()),
+            }
+        )
+
+    by_arch: dict[str, dict[str, Any]] = {}
+    for item in details:
+        arch = str(item["arch"])
+        bucket = by_arch.setdefault(
+            arch, {"seeds": [], "pass_count": 0, "seed_passes": {}}
+        )
+        bucket["seeds"].append(int(item["seed"]))
+        bucket["seed_passes"][str(item["seed"])] = bool(item["seed_pass"])
+        bucket["pass_count"] = int(bucket["pass_count"]) + int(bool(item["seed_pass"]))
+    for bucket in by_arch.values():
+        bucket["arch_pass"] = bool(
+            int(bucket["pass_count"]) >= int(criteria["min_seeds_pass"])
+        )
+    overall = bool(any(bucket["arch_pass"] for bucket in by_arch.values()))
+    return {
+        "criteria": dict(criteria),
+        "reference": {
+            "simple_sync_top1": simple_top1,
+            "old_beta_top1": old_top1,
+            "simple_sync_macro_top1": simple_macro,
+            "old_beta_macro_top1": old_macro,
+        },
+        "checkpoints": details,
+        "arch_summary": by_arch,
+        "overall_pass": overall,
+        "conclusion": "pass" if overall else "fail",
+    }
 
 
 # ============================================================================

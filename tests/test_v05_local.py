@@ -11,6 +11,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Mapping
 
 import numpy as np
 import pytest
@@ -18,7 +19,10 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from nebula.v05_local import (  # noqa: E402
+    ABLATION_MODES,
     ARCHS,
+    DEFAULT_ABLATIONS,
+    DIAGNOSTIC_CRITERIA,
     FrameDataStore,
     LocalModelConfig,
     LocalPairDataset,
@@ -27,6 +31,7 @@ from nebula.v05_local import (  # noqa: E402
     RelativeTimeEncoding,
     TemporalOnlyModel,
     V05LocalError,
+    _ablate_batch,
     _batch_to_device,
     _parse_record,
     bin_center_seconds,
@@ -41,6 +46,7 @@ from nebula.v05_local import (  # noqa: E402
     load_protocol,
     make_synthetic_protocol,
     save_checkpoint,
+    summarize_local_diagnostics,
     train_local_model,
 )
 
@@ -451,13 +457,206 @@ def test_evaluate_metrics_and_bootstrap():
     model = _OracleModel()
     metrics = evaluate_local(model, batches, device="cpu", bootstrap=20)
     assert metrics["top1"] == 1.0
+    assert metrics["macro_top1"] == 1.0
     assert metrics["recall_at_1"] == 1.0
     assert metrics["top1_k32"] == 1.0
     ci = metrics["bootstrap_ci"]
     assert ci["low"] is not None and ci["high"] is not None
     assert 0.0 <= ci["low"] <= ci["high"] <= 1.0
     assert metrics["collapse"]["effective_rank"] is not None
-    assert set(metrics["ablations"]) == {"audio_zero", "visual_zero", "time_shift"}
+    assert set(metrics["ablations"]) == set(DEFAULT_ABLATIONS) - {"normal"}
+    # oracle 忽略输入，因此所有消融仍应 100%——用来验证指标链路而非模型行为
+    for mode, ablation in metrics["ablations"].items():
+        assert ablation["top1"] == 1.0, mode
+
+
+def _copy_batch(batch: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: (value.copy() if isinstance(value, np.ndarray) else value)
+        for key, value in batch.items()
+    }
+
+
+def test_ablate_modes_preserve_contract_and_semantics():
+    batch = _tiny_batches()["test"][0]
+    original = _copy_batch(batch)
+    labels = np.asarray(batch["labels"]).copy()
+    candidate_mask = np.asarray(batch["candidate_mask"]).copy()
+
+    normal = _ablate_batch(batch, "normal")
+    assert all(np.array_equal(normal[key], batch[key]) for key in ("audio", "audio_time", "visual"))
+
+    for mode in ABLATION_MODES:
+        ablated = _ablate_batch(
+            batch, mode, context_seconds=1.0, seed=7
+        )
+        assert np.array_equal(np.asarray(ablated["labels"]), labels), mode
+        assert np.array_equal(np.asarray(ablated["candidate_mask"]), candidate_mask), mode
+        # 原始 batch 不得被原地修改
+        for key in ("audio", "audio_time", "visual", "visual_time"):
+            assert np.array_equal(np.asarray(batch[key]), np.asarray(original[key])), (mode, key)
+
+        if mode in ("audio_zero", "audio_mask_only"):
+            assert not np.asarray(ablated["audio"]).any(), mode
+        if mode in ("audio_mask_only", "audio_time_zero"):
+            assert not np.asarray(ablated["audio_time"]).any(), mode
+        if mode == "audio_mask_only":
+            assert np.array_equal(
+                np.asarray(ablated["audio_mask"]), np.asarray(batch["audio_mask"])
+            )
+        if mode == "audio_mean":
+            audio = np.asarray(ablated["audio"])
+            mask = np.asarray(batch["audio_mask"], dtype=bool)
+            for row in range(audio.shape[0]):
+                for column in range(audio.shape[1]):
+                    valid = audio[row, column][mask[row, column]]
+                    assert valid.shape[0] > 0
+                    assert np.allclose(valid, valid[0], atol=1e-6)
+        if mode == "audio_global_mean":
+            audio = np.asarray(ablated["audio"])
+            mask = np.asarray(batch["audio_mask"], dtype=bool)
+            valid = audio[mask]
+            assert valid.shape[0] > 0
+            assert np.allclose(valid, valid[0], atol=1e-6)
+        if mode == "audio_permute_candidates":
+            out_audio = np.asarray(ablated["audio"])
+            in_audio = np.asarray(batch["audio"])
+            for row, positive in enumerate(labels):
+                assert not np.array_equal(
+                    out_audio[row, int(positive)], in_audio[row, int(positive)]
+                )
+            assert np.array_equal(
+                np.asarray(ablated["audio_time"]), np.asarray(batch["audio_time"])
+            )
+        if mode in ("audio_roll_0p5s", "audio_roll_1s", "audio_roll_2s"):
+            assert not np.array_equal(
+                np.asarray(ablated["audio"]), np.asarray(batch["audio"])
+            )
+            assert np.array_equal(
+                np.asarray(ablated["audio_time"]), np.asarray(batch["audio_time"])
+            )
+            assert np.array_equal(
+                np.asarray(ablated["audio_mask"]), np.asarray(batch["audio_mask"])
+            )
+        if mode == "time_shift":
+            assert np.array_equal(
+                np.asarray(ablated["audio"]), np.asarray(batch["audio"])
+            )
+            expected = np.clip(np.asarray(batch["audio_time"]) + 1.0, -1.0, 1.0)
+            assert np.allclose(np.asarray(ablated["audio_time"]), expected)
+        if mode == "visual_zero":
+            assert not np.asarray(ablated["visual"]).any()
+            assert np.array_equal(
+                np.asarray(ablated["audio"]), np.asarray(batch["audio"])
+            )
+
+
+def test_dataset_audio_center_shift_changes_only_audio(tmp_path: Path):
+    visual_root = tmp_path / "visual_dense" / "clip__fps8"
+    audio_root = tmp_path / "audio_dense" / "fake_audio"
+    _write_fake_work(visual_root, audio_root, 1)
+    store = FrameDataStore(
+        visual_root=tmp_path / "visual_dense",
+        audio_root=tmp_path / "audio_dense",
+        context_seconds=1.0,
+        audio_hz=25.0,
+        bin_seconds=0.5,
+    )
+    record = _parse_record(
+        {
+            "work_id": 1,
+            "anchor_bin": 4,
+            "candidate_bins": [4, 5, 6],
+            "labels": [1, 0, 0],
+            "split": "test",
+        }
+    )
+    plain = LocalPairDataset((record,), store, bin_seconds=0.5)
+    shifted = LocalPairDataset(
+        (record,), store, bin_seconds=0.5, audio_center_shift_seconds=0.5
+    )
+    left, right = plain[0], shifted[0]
+    assert np.array_equal(left.visual_features, right.visual_features)
+    assert np.array_equal(left.visual_times, right.visual_times)
+    assert any(
+        not np.array_equal(a, b)
+        for a, b in zip(left.audio_features, right.audio_features, strict=True)
+    )
+    # 真正移动的是取音窗口（内容来自不同绝对时间）；相对时间仍以各自窗口中心归一化
+    assert all(
+        np.array_equal(a, b)
+        for a, b in zip(left.audio_times, right.audio_times, strict=True)
+    )
+
+
+def test_summarize_local_diagnostics_pass_and_fail():
+    criteria = {
+        **DIAGNOSTIC_CRITERIA,
+        "min_work_wins": 2,
+        "min_seeds_pass": 2,
+    }
+    per_work = {"1": 0.4, "2": 0.3, "3": 0.5}
+    reference = {
+        "simple_sync": {
+            "top1": 0.20,
+            "macro_top1": 0.20,
+            "per_work": {"1": 0.2, "2": 0.2, "3": 0.2},
+        },
+        "old_beta": {
+            "top1": 0.21,
+            "macro_top1": 0.21,
+            "per_work": {"1": 0.21, "2": 0.21, "3": 0.21},
+        },
+    }
+
+    def _checkpoint(arch: str, seed: int, *, audio_zero_top1: float) -> dict[str, Any]:
+        ablations = {
+            "audio_zero": {"top1": audio_zero_top1},
+            "audio_global_mean": {"top1": 0.22},
+            "audio_permute_candidates": {"top1": 0.23},
+            "audio_roll_1s": {"top1": 0.24},
+            "audio_roll_2s": {"top1": 0.25},
+        }
+        return {
+            "checkpoint": f"{arch}_{seed}.pt",
+            "arch": arch,
+            "seed": seed,
+            "test": {
+                "top1": 0.32,
+                "macro_top1": 0.30,
+                "per_work": per_work,
+                "ablations": ablations,
+            },
+            "audio_center_shift": {
+                "-1.0": {"top1": 0.24},
+                "+1.0": {"top1": 0.24},
+                "-2.0": {"top1": 0.25},
+                "+2.0": {"top1": 0.25},
+            },
+        }
+
+    passing = summarize_local_diagnostics(
+        [_checkpoint("temporal", 42, audio_zero_top1=0.20),
+         _checkpoint("temporal", 43, audio_zero_top1=0.20)],
+        reference=reference,
+        criteria=criteria,
+    )
+    assert passing["overall_pass"] is True
+    assert passing["arch_summary"]["temporal"]["arch_pass"] is True
+    item = passing["checkpoints"][0]
+    assert item["audio_content_drop"] == pytest.approx(0.09)
+    assert item["audio_sync_drop"] == pytest.approx(0.075)
+    assert item["seed_pass"] is True
+
+    failing = summarize_local_diagnostics(
+        [_checkpoint("cross", 42, audio_zero_top1=0.31),
+         _checkpoint("cross", 43, audio_zero_top1=0.31)],
+        reference=reference,
+        criteria=criteria,
+    )
+    assert failing["overall_pass"] is False
+    assert failing["checkpoints"][0]["checks"]["audio_content_drop"] is False
+    assert failing["conclusion"] == "fail"
 
 
 def test_train_smoke_and_checkpoint(tmp_path: Path):
@@ -596,7 +795,15 @@ def test_cli_help_offline():
     )
     assert proc.returncode == 0, proc.stderr
     assert "InfoNCE" in proc.stdout
-    for flag in ("--arch", "--smoke", "--seeds", "--protocol-dir", "--device"):
+    for flag in (
+        "--arch",
+        "--smoke",
+        "--seeds",
+        "--protocol-dir",
+        "--device",
+        "--eval-checkpoints",
+        "--eval-shifts",
+    ):
         assert flag in proc.stdout, flag
 
 

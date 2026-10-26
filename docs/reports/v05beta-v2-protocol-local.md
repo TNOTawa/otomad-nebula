@@ -62,9 +62,19 @@ test 10=112，retrieval 10=112）；test 12 部/112 anchors；所有基线在同
 - **消融红旗**：temporal 3 seeds 的 audio_zero Top1 分别 28.6/29.5/30.4%，
   **高于 normal 27.7/26.8/25.9%**；visual_zero 在部分 seed 也更高；time_shift 降到
   8.0–12.5%。说明模型主要利用时间位置/视觉捷径，而不是稳定的音频-视觉对应。
+- **消融语义更正（2026-10-26）**：上述 time_shift 只执行
+  `output["audio_time"] = (times + 1.0).clamp(-1.0, 1.0)`，即只改了音频 **位置编码输入**，
+  音频内容没有相对画面移动。因此“time_shift 掉到 8–12%”**不能**作为模型学到真实音画
+  同步的证据；它只说明模型对人为改变的位置编码敏感。修正后的真实内容置换、内容平移
+  与数据集层面取音窗口错位见 [v05beta-local-diagnostics.md](v05beta-local-diagnostics.md)。
+- 子集选择为每部作品 anchors.npz 顺序的**前 N 条**，位置严重偏作品开头（subset test
+  median anchor 位置 2.3% vs 完整 test 50.0%；subset 88.4% anchors 在作品前 10%，
+  完整 test 10.6%）；因此子集数字不可外推。完整 3,681 anchors 诊断见上述新报告。
 - 按用户停止条件：**未通过**；不训练全曲 Transformer/不注册表征。
-- 此外，完整 test（3,681 anchors）上的新模型未跑（数据抽取成本）；上面的子集结果不能
-  替代完整协议结论。
+- 完整 test（3,681 anchors）已在 `v05beta-local-diagnostics.md` 中补跑：两个 arch 的
+  normal Top-1 仅 13.0–15.3%，低于 chance（16.67%）、simple_sync（17.55%）与旧 beta
+  （17.95%）；audio_zero/内容置换反而提高到 17–18%，真实内容错位不掉点。按修正后的
+  预设门槛**未通过**，已按止损条件暂停局部配对路线。上面的子集结果不能替代完整协议结论。
 
 ## 4. 作品库扩展（独立 held-out）
 

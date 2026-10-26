@@ -31,6 +31,8 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -41,6 +43,7 @@ from nebula.log import configure_logging  # noqa: E402
 from nebula.util import now_utc_iso  # noqa: E402
 from nebula.v05_local import (  # noqa: E402
     ARCHS,
+    DEFAULT_ABLATIONS,
     DEFAULT_AUDIO_HZ,
     DEFAULT_BATCH_SIZE,
     DEFAULT_BOOTSTRAP,
@@ -57,6 +60,7 @@ from nebula.v05_local import (  # noqa: E402
     DEFAULT_SELF_LAYERS,
     DEFAULT_TEMPERATURE,
     DEFAULT_WEIGHT_DECAY,
+    DIAGNOSTIC_CRITERIA,
     FrameDataStore,
     LocalModelConfig,
     LocalPairDataset,
@@ -66,9 +70,11 @@ from nebula.v05_local import (  # noqa: E402
     build_synthetic_batches,
     collate_local_sets,
     evaluate_local,
+    load_checkpoint,
     load_protocol,
     make_synthetic_protocol,
     save_checkpoint,
+    summarize_local_diagnostics,
     train_local_model,
 )
 
@@ -377,6 +383,284 @@ def _load_reference_baselines(logs_dir: Path | None) -> dict[str, Any]:
     return json.loads(json.dumps(DEFAULT_REFERENCE_BASELINES, ensure_ascii=False))
 
 
+def _average_work_metrics(
+    variants: list[Mapping[str, Any]],
+) -> tuple[dict[str, float], float | None]:
+    per_work_values: dict[str, list[float]] = {}
+    for variant in variants:
+        for work_id, value in (variant.get("per_work_accuracy") or {}).items():
+            if value is not None:
+                per_work_values.setdefault(str(work_id), []).append(float(value))
+    averaged = {
+        work_id: float(np.mean(values))
+        for work_id, values in per_work_values.items()
+        if values
+    }
+    macro = float(np.mean(list(averaged.values()))) if averaged else None
+    return averaged, macro
+
+
+def _load_diagnostic_reference(logs_dir: Path) -> dict[str, Any]:
+    """从协议完整 test 日志构造 simple_sync / old_beta 的 reference（含 per-work）。"""
+
+    path = Path(logs_dir) / "v05_protocol_v2_metrics.json"
+    if not path.is_file():
+        raise V05LocalError(f"诊断需要完整协议基线日志: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise V05LocalError(f"读取协议基线日志失败（{path}）：{exc}") from exc
+    results = payload.get("results") if isinstance(payload, Mapping) else None
+    if not isinstance(results, Mapping):
+        raise V05LocalError(f"协议基线日志缺少 results: {path}")
+    simple_variant = (
+        results.get("simple_sync", {}).get("variants", {}).get("main_k6")
+    )
+    if not isinstance(simple_variant, Mapping):
+        raise V05LocalError("协议基线日志缺少 simple_sync/main_k6")
+    simple_per_work, simple_macro = _average_work_metrics([simple_variant])
+    old_variants = []
+    for seed in (42, 43, 44):
+        variant = (
+            results.get(f"v05_beta_{seed}", {}).get("variants", {}).get("main_k6")
+        )
+        if isinstance(variant, Mapping):
+            old_variants.append(variant)
+    if not old_variants:
+        raise V05LocalError("协议基线日志缺少 v05_beta_42/43/44/main_k6")
+    old_per_work, old_macro = _average_work_metrics(old_variants)
+    old_top1 = float(
+        np.mean([float(variant["top1"]) for variant in old_variants])
+    )
+    return {
+        "source": str(path),
+        "simple_sync": {
+            "top1": float(simple_variant["top1"]),
+            "macro_top1": simple_macro,
+            "per_work": simple_per_work,
+        },
+        "old_beta": {
+            "top1": old_top1,
+            "macro_top1": old_macro,
+            "per_work": old_per_work,
+            "seeds": [42, 43, 44],
+        },
+    }
+
+
+def _make_eval_loader(
+    records: Any,
+    store: FrameDataStore,
+    *,
+    bin_seconds: float,
+    batch_size: int,
+    num_workers: int,
+    audio_center_shift_seconds: float = 0.0,
+    cache_items: bool | None = None,
+) -> Any:
+    from torch.utils.data import DataLoader
+
+    dataset = LocalPairDataset(
+        records,
+        store,
+        bin_seconds=float(bin_seconds),
+        audio_center_shift_seconds=float(audio_center_shift_seconds),
+        cache_items=cache_items,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=max(1, int(batch_size)),
+        shuffle=False,
+        num_workers=max(0, int(num_workers)),
+        collate_fn=collate_local_sets,
+    )
+
+
+def _evaluate_checkpoint(
+    checkpoint_path: Path,
+    *,
+    protocol: Any,
+    app_config: Any,
+    args: argparse.Namespace,
+    device: str,
+) -> dict[str, Any]:
+    model, payload = load_checkpoint(checkpoint_path, device=device)
+    model_config = getattr(model, "config", None)
+    if model_config is None:
+        raise V05LocalError(f"checkpoint 缺少模型配置: {checkpoint_path}")
+    store = FrameDataStore(
+        visual_root=app_config.paths.data / "visual_dense",
+        audio_root=app_config.paths.data / "audio_dense",
+        visual_version=args.visual_version,
+        audio_version=args.audio_version,
+        context_seconds=float(model_config.context_seconds),
+        audio_hz=float(model_config.audio_hz),
+        bin_seconds=float(protocol.bin_seconds),
+        cache_size=max(16, int(args.cache_size)),
+    )
+    if int(store.visual_dim) != int(model_config.visual_dim):
+        raise V05LocalError(
+            f"视觉维度不一致: store={store.visual_dim} model={model_config.visual_dim}"
+        )
+    if int(store.audio_dim) != int(model_config.audio_dim):
+        raise V05LocalError(
+            f"音频维度不一致: store={store.audio_dim} model={model_config.audio_dim}"
+        )
+    test_records = list(protocol.split_records()["test"])
+    if args.limit is not None:
+        test_records = test_records[: int(args.limit)]
+    if not test_records:
+        raise V05LocalError("完整协议 test split 为空")
+    test_loader = _make_eval_loader(
+        test_records,
+        store,
+        bin_seconds=float(protocol.bin_seconds),
+        batch_size=int(args.batch_size),
+        num_workers=int(args.num_workers),
+        cache_items=True,
+    )
+    test_metrics = evaluate_local(
+        model,
+        test_loader,
+        device=device,
+        k_retrieval=int(args.k_retrieval),
+        bootstrap=int(args.bootstrap),
+        bootstrap_seed=int(payload.get("seed", 42)) + 1000,
+        ablations=DEFAULT_ABLATIONS,
+    )
+    retrieval_metrics = None
+    retrieval_records = list(getattr(protocol, "retrieval_records", ()) or ())
+    if args.limit is not None:
+        retrieval_records = retrieval_records[: int(args.limit)]
+    if retrieval_records:
+        retrieval_loader = _make_eval_loader(
+            retrieval_records,
+            store,
+            bin_seconds=float(protocol.bin_seconds),
+            batch_size=max(1, int(args.batch_size) // 2),
+            num_workers=int(args.num_workers),
+            cache_items=False,
+        )
+        retrieval_metrics = evaluate_local(
+            model,
+            retrieval_loader,
+            device=device,
+            k_retrieval=32,
+            bootstrap=int(args.bootstrap),
+            bootstrap_seed=int(payload.get("seed", 42)) + 2000,
+            ablations=("normal",),
+        )
+    shift_metrics: dict[str, Any] = {}
+    for delta in tuple(args.eval_shifts or ()):
+        shift = float(delta)
+        loader = _make_eval_loader(
+            test_records,
+            store,
+            bin_seconds=float(protocol.bin_seconds),
+            batch_size=int(args.batch_size),
+            num_workers=int(args.num_workers),
+            audio_center_shift_seconds=shift,
+            cache_items=False,
+        )
+        shift_metrics[f"{shift:+.1f}"] = evaluate_local(
+            model,
+            loader,
+            device=device,
+            k_retrieval=int(args.k_retrieval),
+            bootstrap=0,
+            bootstrap_seed=int(payload.get("seed", 42)) + 3000,
+            ablations=("normal",),
+        )
+    split_works = {
+        str(work_id): index
+        for index, work_id in enumerate(sorted({int(r.work_id) for r in test_records}))
+    }
+    return {
+        "checkpoint": str(checkpoint_path),
+        "arch": str(payload.get("arch", getattr(model, "arch", "unknown"))),
+        "seed": int(payload.get("seed", -1)),
+        "model_config": model_config.to_dict()
+        if hasattr(model_config, "to_dict")
+        else {},
+        "n_test_anchors": len(test_records),
+        "n_test_works": len(split_works),
+        "test": test_metrics,
+        "retrieval": retrieval_metrics,
+        "audio_center_shift": shift_metrics,
+    }
+
+
+def _print_diagnostics(summary: Mapping[str, Any], *, out_path: Path) -> None:
+    print("v0.5-beta 局部模型诊断（完整 test；不写 DB/不建 map）")
+    for item in summary.get("checkpoints", []):
+        print(
+            f"  {item.get('arch')} seed={item.get('seed')}: "
+            f"top1={item.get('top1')} macro={item.get('macro_top1')} "
+            f"content_drop={item.get('audio_content_drop')} "
+            f"sync_drop={item.get('audio_sync_drop')} "
+            f"pass={item.get('seed_pass')}"
+        )
+    for arch, bucket in (summary.get("arch_summary") or {}).items():
+        print(
+            f"  arch={arch}: pass_count={bucket.get('pass_count')} "
+            f"arch_pass={bucket.get('arch_pass')}"
+        )
+    print(f"  overall: {summary.get('conclusion')} (overall_pass={summary.get('overall_pass')})")
+    print(f"  JSON: {out_path}")
+
+
+def _run_evaluation(
+    args: argparse.Namespace,
+    app_config: Any,
+    *,
+    device: str,
+    protocol_path: Path,
+    logs_dir: Path,
+) -> int:
+    protocol = load_protocol(protocol_path)
+    reference = _load_diagnostic_reference(logs_dir)
+    checkpoints: list[dict[str, Any]] = []
+    for raw_path in args.eval_checkpoints:
+        path = Path(str(raw_path)).expanduser()
+        if not path.is_file():
+            raise V05LocalError(f"checkpoint 不存在: {path}")
+        checkpoints.append(
+            _evaluate_checkpoint(
+                path,
+                protocol=protocol,
+                app_config=app_config,
+                args=args,
+                device=device,
+            )
+        )
+    summary = summarize_local_diagnostics(checkpoints, reference=reference)
+    out_path = (
+        Path(args.eval_out).expanduser()
+        if args.eval_out
+        else Path(logs_dir) / "v05_local_diagnostics_full.json"
+    )
+    payload = {
+        "created_at": now_utc_iso(),
+        "protocol_dir": str(protocol_path),
+        "protocol_version": protocol.metadata.get("protocol_version"),
+        "split": "test",
+        "test_anchor_count": len(protocol.split_records()["test"]),
+        "test_work_ids": list(protocol.split_work_ids()["test"]),
+        "retrieval_anchor_count": len(protocol.retrieval_records),
+        "eval_shifts": [float(value) for value in (args.eval_shifts or ())],
+        "reference": reference,
+        "criteria": DIAGNOSTIC_CRITERIA,
+        "checkpoints": checkpoints,
+        "summary": summary,
+    }
+    _write_json(out_path, payload)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        _print_diagnostics(summary, out_path=out_path)
+    return 0
+
+
 def _print_human(summary: Mapping[str, Any], *, out_dir: Path | None = None) -> None:
     print("v0.5-beta 局部帧级时序模型（单一 InfoNCE；不写 DB/不建 map）")
     for arch in summary.get("archs", {}):
@@ -523,6 +807,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", default=None, help="产物根目录（默认 data/models）")
     parser.add_argument("--logs-dir", default=None, help="logs 目录（默认 config.paths.logs）")
     parser.add_argument("--smoke-seed", type=int, default=7, help="smoke 合成协议 seed")
+    parser.add_argument(
+        "--eval-checkpoints",
+        nargs="+",
+        default=None,
+        help="只评估已训练 checkpoint（不训练）；完整协议 test + 修正消融 + 真实错位",
+    )
+    parser.add_argument(
+        "--eval-out",
+        default=None,
+        help="诊断 JSON 输出（默认 logs/v05_local_diagnostics_full.json）",
+    )
+    parser.add_argument(
+        "--eval-shifts",
+        nargs="*",
+        type=float,
+        default=[-2.0, -1.0, -0.5, 0.5, 1.0, 2.0],
+        help="数据集层面音频相对画面错位秒数（默认 ±0.5/1/2）",
+    )
     parser.add_argument("--json", action="store_true", help="只输出 JSON 摘要")
     return parser
 
@@ -555,6 +857,19 @@ def main(argv: list[str] | None = None) -> int:
             if args.protocol_dir
             else config.paths.data / "v05_protocol" / "v2"
         )
+        if args.eval_checkpoints:
+            logs_dir = (
+                Path(args.logs_dir).expanduser()
+                if args.logs_dir
+                else config.paths.logs
+            )
+            return _run_evaluation(
+                args,
+                config,
+                device=device,
+                protocol_path=protocol_path,
+                logs_dir=logs_dir,
+            )
         protocol = load_protocol(protocol_path)
         store = FrameDataStore(
             visual_root=config.paths.data / "visual_dense",
